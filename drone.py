@@ -6,8 +6,8 @@ class Drone:
     Modular Drone class.
     Handles movement, sensor polling, and internal state.
     """
-    def __init__(self, drone_id, x, y, map_bounds, sensor_size=25, 
-                 gps_noise=0.00, camera_noise=0.00):
+    def __init__(self, drone_id, x, y, map_bounds, sensor_size=100, 
+                 gps_noise=0.00, camera_noise=0.00, true_x0=0.0, true_y0=0.0, true_r0=2.0):
         self.drone_id = drone_id
         self.x = x
         self.y = y
@@ -24,6 +24,14 @@ class Drone:
         # State Machine
         self.mode = "SEARCH" # SEARCH, APPROACH, LOCKED
         self.last_dir = np.array([0.0, 0.0])
+
+        # Different initial r0 for each drone (all different from true value)
+        r0_offsets = [0.8, 0.3, -0.6]  # All different, none is 0
+        r0_offset = r0_offsets[int(drone_id[1])] if int(drone_id[1]) < len(r0_offsets) else np.random.uniform(-1, 1)
+        self.estimate_r0 = true_r0 + r0_offset
+        # Center is known
+        self.estimate_x0 = true_x0
+        self.estimate_y0 = true_y0
 
     def get_gps_pos(self):
         """Returns noisy (x, y) coordinates."""
