@@ -10,13 +10,14 @@ from simulation_engine import SimulationEngine
 from visualization import Visualizer
 
 
-def run_multi_drone_simulation(visualize=False, max_frames=5000, seed=42, show_voronoi=False):
+def run_multi_drone_simulation(visualize=False, max_frames=5000, seed=42, show_voronoi=False, spill_growth=0.035):
     np.random.seed(seed)
     random.seed(seed)
     print(f"Random seed: {seed}")
+    print(f"Spill growth rate: {spill_growth:.6f} radius units/s")
 
     sim_map = SimulationMap(xlim=(-5, 5), ylim=(-5, 5), grid_size=500)
-    spill = CircleOilSpill(x0=0.0, y0=0.0)
+    spill = CircleOilSpill(x0=0.0, y0=0.0, growth_rate=spill_growth)
 
     engine = SimulationEngine(
         sim_map,
@@ -75,7 +76,8 @@ def run_multi_drone_simulation(visualize=False, max_frames=5000, seed=42, show_v
     for drone_id, history in engine.estimates_history.items():
         ax.plot(frames, history["r0_consensus"], label=drone_id, linewidth=2, alpha=0.75)
 
-    ax.axhline(y=spill.r0, color="black", linestyle="--", linewidth=2.5, label="True r0")
+    true_r0_ref = getattr(spill, "initial_r0", spill.r0)
+    ax.axhline(y=true_r0_ref, color="black", linestyle="--", linewidth=2.5, label="Initial true r0")
 
     final_r0 = [engine.estimates_history[f"D{i}"]["r0_post"][-1] for i in range(len(engine.drones))]
     mean_r0 = np.mean(final_r0)
@@ -110,6 +112,7 @@ if __name__ == "__main__":
     parser.add_argument("--frames", type=int, default=5000, help="Total number of simulation frames")
     parser.add_argument("--seed", type=int, default=1, help="Random seed")
     parser.add_argument("--show-voronoi", action="store_true", help="Show real-time Voronoi arc plot")
+    parser.add_argument("--spill-growth", type=float, default=0.001, help="Oil spill radius growth rate (units/s)")
     args = parser.parse_args()
 
     if not args.visualize:
@@ -120,4 +123,5 @@ if __name__ == "__main__":
         max_frames=args.frames,
         seed=args.seed,
         show_voronoi=args.show_voronoi,
+        spill_growth=args.spill_growth,
     )

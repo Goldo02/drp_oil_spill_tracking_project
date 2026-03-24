@@ -15,7 +15,7 @@ class SimulationEngine:
         self.drones = []
         self.frame = 0
 
-        # Static spill parameters (center known, radius unknown)
+        # Spill parameters (center known, radius can be time-varying)
         self.true_x0 = oil_spill.x0
         self.true_y0 = oil_spill.y0
         self.true_r0 = oil_spill.r0
@@ -204,6 +204,12 @@ class SimulationEngine:
         then Voronoi + radial/tangential control law.
         """
         self.frame += 1
+
+        # Update true spill radius over time (if the spill model supports dynamics)
+        if hasattr(self.oil_spill, "update"):
+            self.oil_spill.update(self.dt)
+            self.true_r0 = self.oil_spill.r0
+            self.world_field = self.oil_spill.field(self.sim_map.X, self.sim_map.Y)
 
         # 0) Local measurement update (keep existing measurement logic)
         for d in self.drones:

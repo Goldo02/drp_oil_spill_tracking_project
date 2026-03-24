@@ -6,12 +6,21 @@ class OilSpill:
         raise NotImplementedError
 
 class CircleOilSpill(OilSpill):
-    """Circular oil spill at (x0, y0) with radius r0, now softened with Gaussian."""
-    def __init__(self, x0=0, y0=0, r0=2, sigma=0.5):
+    """Circular oil spill at (x0, y0) with radius r0, optionally growing over time."""
+    def __init__(self, x0=0, y0=0, r0=2, sigma=0.5, growth_rate=0.0, max_r0=None):
         self.x0 = x0
         self.y0 = y0
         self.r0 = r0
+        self.initial_r0 = r0
         self.sigma = sigma
+        self.growth_rate = growth_rate
+        self.max_r0 = max_r0
+
+    def update(self, dt):
+        """Advance spill radius in time with a constant growth rate."""
+        self.r0 += self.growth_rate * dt
+        if self.max_r0 is not None:
+            self.r0 = min(self.r0, self.max_r0)
 
     def field(self, X, Y):
         dist = np.sqrt((X - self.x0)**2 + (Y - self.y0)**2)

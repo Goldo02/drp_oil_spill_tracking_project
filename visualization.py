@@ -51,7 +51,23 @@ class Visualizer:
         self.texts[drone.drone_id] = label
 
     def render(self, drones):
+        # Refresh field to reflect dynamic spill radius over time
+        field_data = self.oil_spill.field(self.sim_map.X, self.sim_map.Y)
+        self.img.set_data(field_data)
+
+        # Recompute contours for updated spill geometry
+        if hasattr(self.contour, 'collections'):
+            for c in self.contour.collections:
+                c.remove()
+        else:
+            self.contour.remove()
+        self.contour = self.ax.contour(
+            self.sim_map.X, self.sim_map.Y, field_data, levels=[0.1, 0.5, 0.9],
+            colors='black', alpha=0.5, linewidths=0.5
+        )
+
         for drone in drones:
             self.update_drone(drone)
-        plt.draw()
+        self.fig.canvas.draw_idle()
+        self.fig.canvas.flush_events()
         plt.pause(0.001)
