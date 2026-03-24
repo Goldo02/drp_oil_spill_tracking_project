@@ -7,7 +7,7 @@ class Drone:
     Handles movement, sensor polling, and internal state.
     """
     def __init__(self, drone_id, x, y, map_bounds, sensor_size=100, 
-                 gps_noise=0.00, camera_noise=0.00, true_x0=0.0, true_y0=0.0, true_r0=2.0):
+                 gps_noise=0.05, camera_noise=0.05, true_x0=0.0, true_y0=0.0, true_r0=2.0):
         self.drone_id = drone_id
         self.x = x
         self.y = y
