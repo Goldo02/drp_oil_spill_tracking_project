@@ -31,6 +31,7 @@ class SimulationEngine:
         self.edge_band = 0.35
         self.min_search_speed = 0.35
         self.max_search_speed = 0.75
+        self.debug_wls = False
 
         # Shared / evolving radius estimate
         self.estimate_r0 = None
@@ -239,6 +240,12 @@ class SimulationEngine:
         # 0) State update + local measurement only near the spill border
         for d in self.drones:
             dist_to_center = np.hypot(d.x - self.true_x0, d.y - self.true_y0)
+            dist_error = abs(dist_to_center - d.estimate_r0)
+            epsilon = 1e-3
+            w_i = 1.0 / (dist_error**2 + epsilon)
+            w_i = np.clip(w_i, 0.01, 100.0)
+            d.weight = float(w_i)
+
             near_edge = abs(dist_to_center - self.true_r0) <= self.edge_band
 
             if near_edge:
@@ -274,16 +281,20 @@ class SimulationEngine:
             self.estimates_history[d.drone_id]["y0"].append(d.estimate_y0)
             self.estimates_history[d.drone_id]["r0_pre"].append(d.estimate_r0)
 
-        # 1) Distributed consensus only among drones close to the border
-        if len(active_drones) > 1:
+        # 1) Distributed weighted least squares consensus on the radius estimate
+        if len(self.drones) > 1:
             alpha = min(self.k_consensus * self.dt, self.k_consensus)
             new_r0 = {}
-            for d in active_drones:
-                neighbors = [n for n in active_drones if n is not d]
-                mean_neighbors = np.mean([n.estimate_r0 for n in neighbors])
-                new_r0[d] = d.estimate_r0 + alpha * (mean_neighbors - d.estimate_r0)
-            for d in active_drones:
+            for d in self.drones:
+                neighbors = self.drones  # include all drones, including self
+                weights = np.array([n.weight for n in neighbors], dtype=float)
+                values = np.array([n.estimate_r0 for n in neighbors], dtype=float)
+                weighted_mean = np.sum(weights * values) / (np.sum(weights) + 1e-6)
+                new_r0[d] = d.estimate_r0 + alpha * (weighted_mean - d.estimate_r0)
+            for d in self.drones:
                 d.estimate_r0 = float(new_r0[d])
+                if self.debug_wls:
+                    print(f"{d.drone_id}: weight={d.weight:.3f}, r0={d.estimate_r0:.3f}")
 
         # Shared radius used by control law this frame
         self.estimate_r0 = float(np.mean([d.estimate_r0 for d in self.drones]))

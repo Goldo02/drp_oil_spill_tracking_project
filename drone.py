@@ -19,6 +19,7 @@ class Drone:
         self.vx = 0.0
         self.vy = 0.0
         self.search_speed = 0.0
+        self.weight = 1.0
 
         # Sensors
         self.gps = GPSSensor(noise_std=gps_noise)
