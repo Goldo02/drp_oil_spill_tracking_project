@@ -28,6 +28,9 @@ class SimulationEngine:
         self.k_consensus = 0.2
         self.k_r = 1.2
         self.k_phi = 0.8
+        self.edge_band = 0.35
+        self.min_search_speed = 0.35
+        self.max_search_speed = 0.75
 
         # Shared / evolving radius estimate
         self.estimate_r0 = None
@@ -53,10 +56,10 @@ class SimulationEngine:
             true_r0=self.true_r0,
         )
 
-        # Random initial search velocity
-        angle = np.random.uniform(0, 2 * np.pi)
-        vx, vy = 0.5 * np.cos(angle), 0.5 * np.sin(angle)
-        drone.set_velocity(vx, vy)
+        # Random search speed with a fixed heading toward the center from the spawn point.
+        search_speed = np.random.uniform(self.min_search_speed, self.max_search_speed)
+        drone.set_search_speed(search_speed)
+        self._set_search_velocity(drone, direction=np.array([self.true_x0 - x, self.true_y0 - y], dtype=float))
 
         self.drones.append(drone)
         self.estimates_history[drone_id] = {
@@ -70,6 +73,25 @@ class SimulationEngine:
     @staticmethod
     def _wrap_to_pi(angle):
         return (angle + np.pi) % (2 * np.pi) - np.pi
+
+    def _set_search_velocity(self, drone, direction=None):
+        if direction is not None:
+            direction = np.asarray(direction, dtype=float)
+            norm = np.linalg.norm(direction)
+            if norm < 1e-8:
+                direction = None
+            else:
+                drone.last_dir = direction / norm
+
+        if np.linalg.norm(drone.last_dir) < 1e-8:
+            to_center = np.array([self.true_x0 - drone.x, self.true_y0 - drone.y], dtype=float)
+            norm = np.linalg.norm(to_center)
+            if norm < 1e-8:
+                drone.set_velocity(0.0, 0.0)
+                return
+            drone.last_dir = to_center / norm
+
+        drone.set_velocity(*(drone.search_speed * drone.last_dir))
 
     def initial_consensus(self, max_iter=100, tolerance=1e-6):
         """Kept for compatibility. Not required when using frame-by-frame consensus."""
@@ -200,8 +222,9 @@ class SimulationEngine:
         """
         Frame-by-frame control step.
 
-        Includes distributed averaging consensus on radius estimate at each frame,
-        then Voronoi + radial/tangential control law.
+        Drones move in SEARCH toward the center with random speed.
+        When they enter the spill-border neighborhood, they switch to APPROACH,
+        start measuring the radius and perform distributed consensus.
         """
         self.frame += 1
 
@@ -211,23 +234,38 @@ class SimulationEngine:
             self.true_r0 = self.oil_spill.r0
             self.world_field = self.oil_spill.field(self.sim_map.X, self.sim_map.Y)
 
-        # 0) Local measurement update (keep existing measurement logic)
-        for d in self.drones:
-            camera_view = d.get_camera_view(self.world_field, self.sim_map.x_coords, self.sim_map.y_coords)
-            h, w = camera_view.shape
-            win = 2
-            center_val = np.mean(camera_view[h // 2 - win : h // 2 + win + 1, w // 2 - win : w // 2 + win + 1])
-            gps_x, gps_y = d.get_gps_pos()
+        active_drones = []
 
-            if center_val > self.c_star:
-                dist_to_center = np.hypot(gps_x - self.true_x0, gps_y - self.true_y0)
-                d_i = abs(dist_to_center - self.true_r0)
-                d_i_noisy = d_i + np.random.normal(0.0, self.sigma_cam)
-                if dist_to_center <= self.true_r0:
-                    r_i = dist_to_center + d_i_noisy
+        # 0) State update + local measurement only near the spill border
+        for d in self.drones:
+            dist_to_center = np.hypot(d.x - self.true_x0, d.y - self.true_y0)
+            near_edge = abs(dist_to_center - self.true_r0) <= self.edge_band
+
+            if near_edge:
+                d.mode = "APPROACH"
+                active_drones.append(d)
+
+                camera_view = d.get_camera_view(self.world_field, self.sim_map.x_coords, self.sim_map.y_coords)
+                h, w = camera_view.shape
+                win = 2
+                center_val = np.mean(camera_view[h // 2 - win : h // 2 + win + 1, w // 2 - win : w // 2 + win + 1])
+                gps_x, gps_y = d.get_gps_pos()
+
+                if center_val > self.c_star:
+                    d_i = abs(dist_to_center - self.true_r0)
+                    d_i_noisy = d_i + np.random.normal(0.0, self.sigma_cam)
+                    gps_dist_to_center = np.hypot(gps_x - self.true_x0, gps_y - self.true_y0)
+                    if gps_dist_to_center <= self.true_r0:
+                        r_i = gps_dist_to_center + d_i_noisy
+                    else:
+                        r_i = gps_dist_to_center - d_i_noisy
+                    d.estimate_r0 = max(0.05, float(r_i))
+            else:
+                if d.mode != "SEARCH":
+                    d.mode = "SEARCH"
+                    self._set_search_velocity(d)
                 else:
-                    r_i = dist_to_center - d_i_noisy
-                d.estimate_r0 = max(0.05, float(r_i))
+                    d.mode = "SEARCH"
 
             d.estimate_x0 = self.true_x0
             d.estimate_y0 = self.true_y0
@@ -236,15 +274,15 @@ class SimulationEngine:
             self.estimates_history[d.drone_id]["y0"].append(d.estimate_y0)
             self.estimates_history[d.drone_id]["r0_pre"].append(d.estimate_r0)
 
-        # 1) Frame-by-frame distributed consensus (small gain for gradual convergence)
-        if len(self.drones) > 1:
+        # 1) Distributed consensus only among drones close to the border
+        if len(active_drones) > 1:
             alpha = min(self.k_consensus * self.dt, self.k_consensus)
             new_r0 = {}
-            for d in self.drones:
-                neighbors = [n for n in self.drones if n is not d]
+            for d in active_drones:
+                neighbors = [n for n in active_drones if n is not d]
                 mean_neighbors = np.mean([n.estimate_r0 for n in neighbors])
                 new_r0[d] = d.estimate_r0 + alpha * (mean_neighbors - d.estimate_r0)
-            for d in self.drones:
+            for d in active_drones:
                 d.estimate_r0 = float(new_r0[d])
 
         # Shared radius used by control law this frame
@@ -254,15 +292,15 @@ class SimulationEngine:
         for d in self.drones:
             self.estimates_history[d.drone_id]["r0_consensus"].append(d.estimate_r0)
 
-        # 2) Voronoi targets + control law (unchanged in spirit)
+        # 2) Voronoi targets + control law only for drones near the border
         voronoi_arcs = []
         phi_targets = []
 
-        if len(self.drones) >= 2:
-            for d in self.drones:
+        if len(active_drones) >= 2:
+            for d in active_drones:
                 d.phi = np.arctan2(d.y - self.true_y0, d.x - self.true_x0) % (2 * np.pi)
 
-            drones_ccw = sorted(self.drones, key=lambda dr: dr.phi)
+            drones_ccw = sorted(active_drones, key=lambda dr: dr.phi)
             n = len(drones_ccw)
 
             for i, d in enumerate(drones_ccw):
@@ -297,6 +335,21 @@ class SimulationEngine:
                 v = v_radial * radial + v_tangential * tangential
 
                 d.set_velocity(float(v[0]), float(v[1]))
+        elif len(active_drones) == 1:
+            d = active_drones[0]
+            dx = d.x - self.true_x0
+            dy = d.y - self.true_y0
+            dist = np.hypot(dx, dy)
+            if dist < 1e-6:
+                dist = 1e-6
+
+            radial = np.array([dx / dist, dy / dist])
+            tangential = np.array([-dy / dist, dx / dist])
+            radial_error = dist - self.estimate_r0
+            v_radial = -self.k_r * radial_error
+            v_tangential = 0.5 * d.search_speed
+            v = v_radial * radial + v_tangential * tangential
+            d.set_velocity(float(v[0]), float(v[1]))
 
         # 3) Optional real-time Voronoi plot in a separate figure
         should_plot_voronoi = self.visualize_voronoi and plt.get_backend().lower() != "agg"

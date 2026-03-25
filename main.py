@@ -28,26 +28,28 @@ def run_multi_drone_simulation(visualize=False, max_frames=5000, seed=42, show_v
         visualize_voronoi=show_voronoi,
     )
 
-    # Random initialization outside circle
+    # Random initialization away from both the map borders and the spill edge.
+    map_margin = 1.0
+    border_band = engine.edge_band
     for i in range(5):
-        angle = np.random.uniform(0, 2 * np.pi)
-        dist = np.random.uniform(spill.r0 + 0.1, spill.r0 + 2.5)
-        x = np.clip(spill.x0 + dist * np.cos(angle), sim_map.xlim[0], sim_map.xlim[1])
-        y = np.clip(spill.y0 + dist * np.sin(angle), sim_map.ylim[0], sim_map.ylim[1])
+        while True:
+            x = np.random.uniform(sim_map.xlim[0] + map_margin, sim_map.xlim[1] - map_margin)
+            y = np.random.uniform(sim_map.ylim[0] + map_margin, sim_map.ylim[1] - map_margin)
+            dist_to_center = np.hypot(x - spill.x0, y - spill.y0)
+            if abs(dist_to_center - spill.r0) > border_band:
+                break
         engine.add_drone(drone_id=f"D{i}", x=x, y=y)
 
     print("Initial drone radius estimates:")
     for d in engine.drones:
         print(f"{d.drone_id}: r0 = {d.estimate_r0:.6f}")
 
-    # NOTE: no one-shot consensus here; consensus runs frame-by-frame in step().
-
     viz = Visualizer(sim_map, spill) if visualize else None
     if not visualize:
         print("Visualization disabled. Headless mode (Agg backend).")
 
     print(f"Starting Multi-Drone Simulation ({max_frames} frames)...")
-    print("Mode: frame-by-frame consensus + Voronoi + continuous control law")
+    print("Mode: SEARCH toward center, then edge measurement + consensus near the spill border")
 
     try:
         for frame in range(max_frames):
@@ -112,7 +114,7 @@ if __name__ == "__main__":
     parser.add_argument("--frames", type=int, default=5000, help="Total number of simulation frames")
     parser.add_argument("--seed", type=int, default=1, help="Random seed")
     parser.add_argument("--show-voronoi", action="store_true", help="Show real-time Voronoi arc plot")
-    parser.add_argument("--spill-growth", type=float, default=0.001, help="Oil spill radius growth rate (units/s)")
+    parser.add_argument("--spill-growth", type=float, default=0.000, help="Oil spill radius growth rate (units/s)")
     args = parser.parse_args()
 
     if not args.visualize:
