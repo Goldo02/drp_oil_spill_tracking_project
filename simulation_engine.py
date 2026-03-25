@@ -240,12 +240,6 @@ class SimulationEngine:
         # 0) State update + local measurement only near the spill border
         for d in self.drones:
             dist_to_center = np.hypot(d.x - self.true_x0, d.y - self.true_y0)
-            dist_error = abs(dist_to_center - d.estimate_r0)
-            epsilon = 1e-3
-            w_i = 1.0 / (dist_error**2 + epsilon)
-            w_i = np.clip(w_i, 0.01, 100.0)
-            d.weight = float(w_i)
-
             near_edge = abs(dist_to_center - self.true_r0) <= self.edge_band
 
             if near_edge:
@@ -256,6 +250,11 @@ class SimulationEngine:
                 h, w = camera_view.shape
                 win = 2
                 center_val = np.mean(camera_view[h // 2 - win : h // 2 + win + 1, w // 2 - win : w // 2 + win + 1])
+                w_i = center_val**2 + 0.01
+                w_i = np.clip(w_i, 0.01, 100.0)
+                d.weight = float(w_i)
+                if self.debug_wls:
+                    print(f"{d.drone_id}: center_val={center_val:.3f}, weight={w_i:.3f}")
                 gps_x, gps_y = d.get_gps_pos()
 
                 if center_val > self.c_star:
@@ -273,6 +272,7 @@ class SimulationEngine:
                     self._set_search_velocity(d)
                 else:
                     d.mode = "SEARCH"
+                d.weight = 0.01
 
             d.estimate_x0 = self.true_x0
             d.estimate_y0 = self.true_y0
@@ -286,7 +286,7 @@ class SimulationEngine:
             alpha = min(self.k_consensus * self.dt, self.k_consensus)
             new_r0 = {}
             for d in self.drones:
-                neighbors = self.drones  # include all drones, including self
+                neighbors = [n for n in self.drones if n.mode == "APPROACH"]
                 weights = np.array([n.weight for n in neighbors], dtype=float)
                 values = np.array([n.estimate_r0 for n in neighbors], dtype=float)
                 weighted_mean = np.sum(weights * values) / (np.sum(weights) + 1e-6)
