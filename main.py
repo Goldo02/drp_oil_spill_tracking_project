@@ -109,52 +109,71 @@ def run_multi_drone_simulation(
     import matplotlib.pyplot as plt
     plt.savefig('final_simulation_state.png')
     
-    # Plot per-frame local and post-consensus estimates.
-    frames = list(range(len(engine.estimates_history[next(iter(engine.estimates_history))]['r0_post'])))
-    fig, ax = plt.subplots(figsize=(12, 6))
+    # Plot convergence by measurement index, including every consensus iteration.
+    measurement_count = len(engine.measurement_consensus_history)
+    fig, ax = plt.subplots(figsize=(13, 6))
+    color_cycle = plt.cm.tab10(np.linspace(0, 1, max(1, len(engine.drones))))
 
-    for drone_id, history in engine.estimates_history.items():
-        ax.plot(frames, history['r0_local'], label=f'{drone_id} local', linewidth=1.5, alpha=0.4)
-        ax.plot(frames, history['r0_post'], label=f'{drone_id} consensus', linewidth=2.0, alpha=0.9)
+    initial_r0_post = [engine.estimates_history[f"D{i}"]["r0_post"][0] for i in range(len(engine.drones))]
+    final_r0_post = [engine.estimates_history[f"D{i}"]["r0_measure_end"][-1] for i in range(len(engine.drones))]
+    all_end_values = []
 
-    # Add true radius line
-    ax.axhline(y=spill.r0, color='black', linestyle='--', linewidth=2.5, label='True r0')
-    
-    # Calculate final statistics
-    final_r0_post = [engine.estimates_history[f'D{i}']['r0_post'][-1] for i in range(len(engine.drones))]
-    initial_r0_local = [engine.estimates_history[f'D{i}']['r0_local'][0] for i in range(len(engine.drones))]
-    initial_r0_post = [engine.estimates_history[f'D{i}']['r0_post'][0] for i in range(len(engine.drones))]
+    for measure_idx, cycle_trace in enumerate(engine.measurement_consensus_history, start=1):
+        x_values = np.linspace(measure_idx - 1.0, measure_idx, len(next(iter(cycle_trace.values()))))
+        for idx, drone in enumerate(engine.drones):
+            drone_id = drone.drone_id
+            y_values = np.asarray(cycle_trace[drone_id], dtype=float)
+            all_end_values.append(y_values[-1])
+            ax.plot(
+                x_values,
+                y_values,
+                color=color_cycle[idx % len(color_cycle)],
+                linewidth=1.8,
+                marker="o",
+                markersize=3,
+                alpha=0.9,
+                label=f"{drone_id}" if measure_idx == 1 else None,
+            )
+
+    ax.axhline(y=spill.r0, color="black", linestyle="--", linewidth=2.5, label="True r0")
+
     mean_r0 = np.mean(final_r0_post)
     std_r0 = np.std(final_r0_post)
-    
-    # Print to console
+
     print("\n=== FINAL CONSENSUS RESULTS ===")
     for i in range(len(engine.drones)):
         print(
-            f"D{i}: initial r0_local={initial_r0_local[i]:.6f}, "
-            f"initial r0_post={initial_r0_post[i]:.6f}, "
+            f"D{i}: initial r0_post={initial_r0_post[i]:.6f}, "
             f"final r0_post={final_r0_post[i]:.6f}"
         )
     print(f"Mean r0: {mean_r0:.6f}")
     print(f"Std Dev: {std_r0:.6f}")
     print(f"True r0: {spill.r0:.6f}")
     print(f"Error from true: {abs(mean_r0 - spill.r0):.6f}")
-    
-    # Add text to plot
-    textstr = f'Mean: {mean_r0:.4f}\nStd: {std_r0:.6f}\nTrue: {spill.r0:.4f}'
-    ax.text(0.02, 0.98, textstr, transform=ax.transAxes, fontsize=10,
-            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-    
-    ax.set_title('Radius Estimates: Local Measurements and Consensus Agreement')
-    ax.set_xlabel('Frame')
-    ax.set_ylabel('Radius r0')
-    ax.legend()
+
+    textstr = f"Mean: {mean_r0:.4f}\nStd: {std_r0:.6f}\nTrue: {spill.r0:.4f}"
+    ax.text(
+        0.02,
+        0.98,
+        textstr,
+        transform=ax.transAxes,
+        fontsize=10,
+        verticalalignment="top",
+        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8),
+    )
+
+    ax.set_title("Consensus Evolution Inside Each Measurement Cycle")
+    ax.set_xlabel("Number of measurements + 1")
+    ax.set_ylabel("Radius r0")
+    ax.set_xlim(0, measurement_count if measurement_count else 1)
+    ax.set_xticks(np.arange(0, measurement_count + 1, 1))
     ax.grid(True, alpha=0.3)
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=True)
 
     plt.tight_layout()
-    plt.savefig('consensus_convergence.png')
+    plt.savefig("consensus_convergence.png", bbox_inches="tight")
     print("Consensus convergence plot saved to 'consensus_convergence.png'")
-    
+
     if visualize:
         print("Closing the window to exit.")
         plt.show()
@@ -172,7 +191,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--communication-radius-cells",
         type=int,
-        default=201,
+        default=205,
         help="Communication radius in grid cells when range-based communication is enabled",
     )
     args = parser.parse_args()

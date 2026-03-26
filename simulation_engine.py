@@ -15,7 +15,7 @@ class SimulationEngine:
         sigma_cam=0.1,
         measure_every=3,
         consensus_iters=10,
-        communication_radius_cells=201,
+        communication_radius_cells=205,
         fully_connected=False,
     ):
         self.sim_map = sim_map
@@ -25,7 +25,6 @@ class SimulationEngine:
         self.sigma_cam = sigma_cam
         self.drones = []
         self.frame = 0
-
         # Center is known in this experiment.
         self.true_x0 = oil_spill.x0
         self.true_y0 = oil_spill.y0
@@ -52,6 +51,8 @@ class SimulationEngine:
 
         # History for plotting local measurements and consensus convergence.
         self.estimates_history = {}
+        self.measurement_consensus_history = []
+        self._current_measure_trace = None
 
     def add_drone(self, drone_id, x, y):
         drone = Drone(
@@ -75,6 +76,8 @@ class SimulationEngine:
             "gradient_peak": [],
             "oil_fraction": [],
             "r0_local": [],
+            "r0_measure_start": [],
+            "r0_measure_end": [],
             "r0_consensus": [],
             "r0_post": [],
         }
@@ -110,6 +113,7 @@ class SimulationEngine:
                 "gradient_magnitude": np.nan,
                 "gradient_peak": np.nan,
                 "oil_fraction": np.nan,
+                "r0_local_raw": np.nan,
                 "r0_local": np.nan,
             }
 
@@ -150,6 +154,7 @@ class SimulationEngine:
                 "gradient_magnitude": np.nan,
                 "gradient_peak": np.nan,
                 "oil_fraction": np.nan,
+                "r0_local_raw": np.nan,
                 "r0_local": np.nan,
             }
 
@@ -171,7 +176,8 @@ class SimulationEngine:
         edge_y = float(np.mean(world_y))
         center_x = float(drone.estimate_x0)
         center_y = float(drone.estimate_y0)
-        r0_local = float(np.mean(np.hypot(world_x - center_x, world_y - center_y)))
+        raw_r0_local = float(np.mean(np.hypot(world_x - center_x, world_y - center_y)))
+        r0_local = raw_r0_local
 
         drone.edge_detected = True
         drone.last_edge_point = nearest_edge_point
@@ -186,6 +192,7 @@ class SimulationEngine:
             "gradient_magnitude": float(np.count_nonzero(edges)),
             "gradient_peak": float(np.count_nonzero(edges)),
             "oil_fraction": float(np.mean(camera_view >= self.oil_cell_threshold)),
+            "r0_local_raw": raw_r0_local,
             "r0_local": r0_local,
         }
 
@@ -198,17 +205,26 @@ class SimulationEngine:
             and getattr(d, "last_oil_fraction", 0.0) >= self.consensus_oil_fraction_threshold
         ]
 
-    def _run_consensus(self):
+    def _run_consensus(self, iteration_index=None, iteration_total=None):
         """
         One distributed averaging consensus step over drones near the edge.
         A single simulation frame corresponds to a single consensus iteration.
         """
         valid_drones = self._select_consensus_drones()
         if not valid_drones:
+            if iteration_index is not None and iteration_total is not None:
+                print(
+                    f"  Consensus iter {iteration_index}/{iteration_total}: "
+                    f"no eligible drones"
+                )
+            if self._current_measure_trace is not None:
+                for drone in self.drones:
+                    self._current_measure_trace[drone.drone_id].append(float(drone.estimate_r0))
             return 0, 0.0
 
         current = {d.drone_id: float(d.estimate_r0) for d in valid_drones}
         new_values = {}
+        neighbor_info = {}
         max_diff = 0.0
 
         for drone in valid_drones:
@@ -221,9 +237,34 @@ class SimulationEngine:
             new_value = current[drone.drone_id] + self.consensus_gain * (mean_estimate - current[drone.drone_id])
             new_values[drone.drone_id] = float(new_value)
             max_diff = max(max_diff, abs(new_value - current[drone.drone_id]))
+            neighbor_info[drone.drone_id] = {
+                "neighbors": [n.drone_id for n in neighbors],
+                "mean": mean_estimate,
+                "old": current[drone.drone_id],
+                "new": float(new_value),
+            }
 
         for drone in valid_drones:
             drone.estimate_r0 = new_values[drone.drone_id]
+
+        if iteration_index is not None and iteration_total is not None:
+            ordered_ids = [d.drone_id for d in valid_drones]
+            details = []
+            for drone_id in ordered_ids:
+                info = neighbor_info[drone_id]
+                neighbor_str = ",".join(info["neighbors"])
+                details.append(
+                    f"{drone_id}:{info['old']:.6f}->{info['new']:.6f} "
+                    f"(mean={info['mean']:.6f}, n=[{neighbor_str}])"
+                )
+            print(
+                f"  Consensus iter {iteration_index}/{iteration_total} | "
+                f"max_diff={max_diff:.2e} | " + " ; ".join(details)
+            )
+
+        if self._current_measure_trace is not None:
+            for drone in self.drones:
+                self._current_measure_trace[drone.drone_id].append(float(drone.estimate_r0))
 
         # The final estimate after the frame is the agreed consensus state for
         # this single iteration. It will be used as the starting point on the
@@ -288,13 +329,14 @@ class SimulationEngine:
                 history["gradient_peak"].append(local_estimate["gradient_peak"])
                 history["oil_fraction"].append(local_estimate["oil_fraction"])
                 history["r0_local"].append(local_estimate["r0_local"])
+                history["r0_measure_start"].append(float(drone.estimate_r0))
 
                 if local_estimate["edge_detected"]:
                     print(
                         f"{drone.drone_id}: edge detected, "
                         f"grad={local_estimate['gradient_magnitude']:.6f}, "
                         f"oil={local_estimate['oil_fraction']:.3f}, "
-                        f"local r0 = {local_estimate['r0_local']:.6f}"
+                        f"raw r0 = {local_estimate['r0_local_raw']:.6f}"
                     )
                 else:
                     print(
@@ -314,6 +356,13 @@ class SimulationEngine:
                 history["r0_local"].append(history["r0_local"][-1] if history["r0_local"] else np.nan)
                 print(f"{drone.drone_id}: sensing skipped, carrying previous measurement")
 
+        if measurement_frame:
+            self._current_measure_trace = {
+                drone.drone_id: [float(drone.estimate_r0)] for drone in self.drones
+            }
+            start_snapshot = ", ".join(f"{d.drone_id}={d.estimate_r0:.6f}" for d in self.drones)
+            print(f"Measurement start radii: {start_snapshot}")
+
         # 2. Consensus over the local estimates.
         consensus_drones = self._select_consensus_drones()
         consensus_ids = ", ".join(d.drone_id for d in consensus_drones) if consensus_drones else "none"
@@ -322,8 +371,8 @@ class SimulationEngine:
             f"{consensus_ids}"
         )
         max_diff = 0.0
-        for _ in range(self.consensus_iters):
-            _, diff = self._run_consensus()
+        for iter_idx in range(self.consensus_iters):
+            _, diff = self._run_consensus(iteration_index=iter_idx + 1, iteration_total=self.consensus_iters)
             max_diff = max(max_diff, diff)
 
         # Record the state after the active consensus step.
@@ -343,8 +392,19 @@ class SimulationEngine:
         print(f"AFTER CONSENSUS ({self.consensus_iters} iters/frame, max_diff={max_diff:.2e}):")
         for drone in self.drones:
             self.estimates_history[drone.drone_id]["r0_post"].append(drone.estimate_r0)
+            if measurement_frame:
+                self.estimates_history[drone.drone_id]["r0_measure_end"].append(float(drone.estimate_r0))
             print(f"{drone.drone_id}: agreed r0 = {drone.estimate_r0:.6f}")
 
         print("FRAME RADIUS ESTIMATES:")
         for drone in self.drones:
             print(f"{drone.drone_id}: r0 = {drone.estimate_r0:.6f}")
+
+        if measurement_frame:
+            if self._current_measure_trace is not None:
+                self.measurement_consensus_history.append(
+                    {drone_id: list(values) for drone_id, values in self._current_measure_trace.items()}
+                )
+                self._current_measure_trace = None
+            end_snapshot = ", ".join(f"{d.drone_id}={d.estimate_r0:.6f}" for d in self.drones)
+            print(f"Measurement end radii: {end_snapshot}")
