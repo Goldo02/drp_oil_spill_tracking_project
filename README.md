@@ -1,326 +1,544 @@
-# Oil Spill Tracking — Drone Simulation
+# Multi-Drone Oil Spill Radius Estimation
 
-## OVERVIEW DEL PROGETTO
+## Technical Report
 
-Questo repository implementa una simulazione di droni che tracciano il bordo di una macchia di olio (oil spill tracking). L'obiettivo è che un gruppo di droni trovi il bordo della macchia, si disponga lungo il perimetro e mantenga un'orbita stabile con una distribuzione angolare uniforme (consensus). Il codice è progettato come ambiente didattico/ricerca: semplice, modulare e leggibile, per studiare controllo radiale + consenso tangenziale su un bordo morfologicamente definito.
+## 1. Executive Summary
 
-- Problema: droni che, usando solo una telecamera locale e propriocezione, devono identificare il bordo di una macchia e mantenervi un'orbita.
-- Obiettivo: orbita (orbiting) stabile alla distanza desiderata $r_0$ e distribuzione uniforme degli angoli $\phi$ dei droni attorno al centro della macchia.
-- Approccio high-level:
-  - Ricerca casuale (`SEARCH`) finché la percezione locale non indica la presenza del bordo.
-  - Quando si vede il bordo: passaggio in `APPROACH`, applicazione di una legge radiale (Matveev-style) per convergere al raggio desiderato e controllo tangenziale con termine di consensus per distribuire i droni uniformemente.
+This project implements a decentralized multi-drone simulation for estimating the radius of an oil spill from local observations. The system is not a navigation controller for moving drones. Instead, each drone is static in the map, senses a local patch of the spill field, extracts boundary evidence with image processing, forms a local radius estimate, and then exchanges that estimate through a consensus process.
 
-## ARCHITETTURA DEL SISTEMA
+The core engineering problem is to estimate the spill boundary, or more precisely the spill radius `r_0`, from noisy partial observations. A multi-drone design is used because no single sensor has a complete view of the spill, and because distributed agreement can reduce the effect of local noise and partial occlusion.
 
-Componenti principali e ruoli:
+The implementation is intentionally compact and educational:
 
-- `SimulationEngine` (`simulation_engine.py`)
-  - Orchestratore principale della simulazione.
-  - Mantiene la mappa (`SimulationMap`), il modello di macchia (`OilSpill`) e la lista di `Drone`.
-  - Esegue il loop `step()` che aggiorna percezione, transizioni di stato e controlli per ciascun drone.
-  - Implementa i parametri di controllo globali: `c_star`, `u_bar`, `v_base`, `k_consensus`.
+- `environment.py` defines the spill and the world grid.
+- `sensors.py` simulates noisy GPS and camera sensing.
+- `edge_detection.py` performs preprocessing and Canny edge extraction.
+- `drone.py` defines the static drone agent and its local state.
+- `simulation_engine.py` orchestrates sensing, local estimation, consensus, and logging.
+- `visualization.py` renders the spill, drones, and detected edge points.
+- `main.py` wires everything together and saves the output figures.
 
-- `Drone` (`drone.py`)
-  - Classe che incapsula stato fisico (posizione, velocità), sensori (`GPSSensor`, `CameraSensor`) e dinamica base (integrazione, rimbalzo ai bordi).
-  - Espone API: `get_camera_view()`, `get_gps_pos()`, `set_velocity()`, `update_position()`.
+## 2. Project Goal
 
-- `oil_spill / field` (`environment.py`)
-  - Modelli di macchia: `CircleOilSpill`, `GaussianOilSpill`.
-  - Fornisce `field(X,Y)` che ritorna valori continui (0..1) sulla griglia del mondo; `CircleOilSpill` implementa una "softened circle" con raggio $r_0$.
+The goal is to estimate the geometry of an oil spill from distributed local observations. In the current codebase, the spill is modeled as either:
 
-- `edge_detection` (`edge_detection.py`)
-  - Funzioni semplici di elaborazione locale:
-    - `identify_centroid(camera_matrix)`: centro di massa dei pixel con valore > 0.5.
-    - `check_geometric_lock(camera_matrix)`: regola "perfect geometric edge": il pixel centrale è olio (>=0.5) e ha almeno un vicino che è acqua (<0.5).
-  - Queste funzioni sono helper per decisioni di stato e per identificare lock geometrici.
+1. a circular spill with a known center and radius, or
+2. a smooth Gaussian field.
 
-Interazione:
-- `SimulationEngine` calcola il campo (`oil_spill.field`) su una griglia (`SimulationMap.X,Y`) e lo passa ai sensori dei droni. Ad ogni `step()`:
-  1. Per ogni drone: legge `camera_view` tramite `Drone.get_camera_view()`.
-  2. Calcola una misura locale (es. media 5x5 al centro) e decide transizione `SEARCH`→`APPROACH`.
-  3. Per i droni in `APPROACH`: applica controllo radiale + tangenziale (consensus) e aggiorna le velocità.
-  4. Integrazione di posizione tramite `Drone.update_position(dt)`.
+The active simulation path in `main.py` uses the circular model:
 
-## MODELLO DEL DRONE
-
-Stato interno (variabili principali):
-- Posizione: `x`, `y`.
-- Velocità: `vx`, `vy`.
-- Orientamento/heading: `theta` è presente in `SimulationEngine` quando impostato per `APPROACH` (non è inizializzato in `Drone.__init__` ma viene attribuito dai chiamanti).
-- Modalità: `mode` in `Drone` → stringa: `"SEARCH"`, `"APPROACH"`, `"LOCKED"`.
-- Sensori: `gps` (GPSSensor) e `camera` (CameraSensor).
-
-Differenza tra modalità:
-- `SEARCH`: comportamento di ricerca (inizializzazione di velocità casuale, guardare in `SimulationEngine.add_drone` e transizione basata su soglia di percezione).
-- `APPROACH`: il drone ha rilevato la macchia vicino al centro della sua camera; segue controllo composto da:
-  - Componente radiale per regolare il raggio alla distanza desiderata $r_0$.
-  - Componente tangenziale per orbitarvi; include un termine di consensus per distribuire gli angoli.
-- `LOCKED`: stato in cui il drone ferma la dinamica (velocità = 0). Usato per blocchi geometrici (se attivato).
-
-Sensori:
-- Propriocettivi:
-  - `GPSSensor.sense((x,y))`: ritorna la posizione reale con rumore gaussiano opzionale.
-- Esterocettivi:
-  - `CameraSensor.sense(world_field, x, y, x_coords, y_coords)`: estrae una finestra locale (default 25×25) dalla griglia `world_field` centrata nella posizione $(x,y)$ e aggiunge rumore / blur opzionale.
-
-## PERCEZIONE
-
-Come si costruisce la `camera_view`:
-- `CameraSensor.sense()` calcola gli indici di griglia corrispondenti a $(x,y)$:
-  - usa `x_coords` e `y_coords` (lineari) per mappare $x$ e $y$ a indici: `i_center = int((x - x_coords[0]) / dx)` e `j_center = int((y - y_coords[0]) / dy)`.
-  - estrae la sotto-matrice da `world_field[i_min:i_max, j_min:j_max]` e la normalizza come float; pad se vicino ai bordi.
-- Nota implementativa importante: la mappatura usa `x` per l'indice riga e `y` per l'indice colonna. Questo funziona coerentemente con la costruzione di `SimulationMap.X,Y` ma può risultare confusa (di solito si usa $i$ per y e $j$ per x). Tenere conto quando estendi il codice.
-
-Rilevamento del bordo:
-- Nel `SimulationEngine.step()` la misura principale è:
-  - Estrae `camera_view` (25×25).
-  - Calcola `center_val` come media della finestra centrale 5×5:
-    - win = 2 → slice `h//2-win : h//2+win+1`
-  - Se `center_val > c_star` (con `c_star = 0.5` di default), si considera che il drone "vede" la macchia al centro e passa in `APPROACH`.
-- Funzioni di `edge_detection`:
-  - `identify_centroid(camera_matrix)`: centro di massa dei pixel con valore > 0.5 — utile per stimare localmente la forma.
-  - `check_geometric_lock(camera_matrix)`: controlla se il pixel centrale è olio e ha vicini acqua — condizione semplice per rilevare un "bordo netto".
-
-Limiti della percezione binaria/soglia:
-- Sensore locale non fornisce il bordo globale; solo un piccolo patch 25×25.
-- Soglie fisse (`0.5`, `c_star`) sensibili a rumore e a scale del campo.
-- Se il campo è sfumato (es. Gaussian), la decisione binaria può essere imprecisa.
-- Camera centratissima: se il drone è appena fuori dal bordo, la macchia può essere interamente fuori dalla finestra → falso negativo.
-- Raccomandazione: usare misure continue (gradiente locale, centroide) e filtri temporali per robustezza.
-
-## CONTROLLO
-
-L'architettura del controllo separa le direzioni radiale e tangenziale — questa separazione è alla base della stabilità e chiarezza del comportamento.
-
-Terminologia e variabili chiave:
-- Centro della macchia: $(x_0, y_0)$.
-- Posizione drone: $(x,y)$.
-- Distanza corrente: $d = \sqrt{(x-x_0)^2 + (y-y_0)^2}$.
-- Angolo polare: $\phi = \operatorname{atan2}(y - y_0, x - x_0)$.
-- Vettori locali:
-  - radiale unitario: $\mathbf{r} = (\cos\phi, \sin\phi)$.
-  - tangenziale unitario (CCW): $\mathbf{t} = (-\sin\phi, \cos\phi)$.
-- Parametri principali:
-  - $r_0$: raggio desiderato (dal modello `CircleOilSpill`).
-  - $k_{radial}$: guadagno del controllo radiale (in codice: `k_radial`, = 1.5).
-  - $v_{base}$: velocità tangenziale base (`v_base`, = 0.3).
-  - $k_{consensus}$: guadagno consenso (`k_consensus`, = 3.0).
-  - saturazioni: limite massimo su $u_\phi$ (angular correction), e clip su $v_{tangential}$.
-
-### 5.1 Legge di Matveev (controllo radiale)
-- Implementazione nel codice:
-  - Radial error: $e_r = d - r_0$.
-  - Comando radiale: $v_{radial} = -k_{radial} \cdot e_r$.
-- Interpretazione fisica:
-  - Se $d > r_0$ (siamo fuori), $e_r > 0$ → $v_{radial} < 0$ → componente radiale punta verso il centro, portandoci verso $r_0$.
-  - Se $d < r_0$, la componente radiale spinge fuori.
-- Perché funziona per orbiting:
-  - Mantenendo la componente tangenziale non zero e regolando solo la componente radiale per portare $d \to r_0$, il drone converge su una circonferenza di raggio $r_0$. Con un opportuna tangenziale, la traiettoria diventa una rotazione attorno al centro.
-
-### 5.2 Consensus (distribuzione uniforme)
-- Concetto:
-  - Per N droni sull'anello, osservare gli angoli $\phi_i$. L'obiettivo è che gli spazi angolari tra droni siano uniformi: idealmente ogni gap = $2\pi/N$.
-- Implementazione:
-  - Calcolo $\phi_i$ con `np.arctan2`.
-  - Ordinamento per $\phi$ per definire l'ordine CCW.
-  - gap_to_next = $(\phi_{i+1} - \phi_i) \bmod 2\pi$.
-  - gap_from_prev = $(\phi_i - \phi_{i-1}) \bmod 2\pi$.
-  - errori: $e_{next} = gap\_to\_next - ideal\_gap$, $e_{prev} = gap\_from\_prev - ideal\_gap$.
-  - delta_gap = $e_{next} - e_{prev}$.
-  - correzione angolare: $u_\phi = k_{consensus} \cdot delta\_gap$ (clipped).
-  - Applicazione: tangential speed modificata come $v_{tan} = v_{base} + u_\phi d$ (poi clamp).
-- Perché convergerà:
-  - Quando i gap sono uguali, $gap\_to\_next = gap\_from\_prev = ideal\_gap$ → $e_{next}=e_{prev}=0$ → $delta\_gap = 0$ → $u_\phi=0$ (equilibrio).
-  - Analogia: ogni drone usa solo informazione locale (angoli dei vicini ordinati) per smussare gli scarti. Il termine delta_gap agisce come un controllo proporzionale sugli scarti di spaziatura.
-- Caso N=2:
-  - ideal_gap = $\pi$. Se i due droni sono opposti, gap_to_next = gap_from_prev = $\pi$, delta_gap = 0 → equilibrio stabile (180°).
-  - Se non opposti, delta_gap tende a generare velocità tangenziale che aumenti/decremente l'angolo relativo fino a $\pi$.
-
-### 5.3 Separazione radiale / tangenziale
-- Nel codice le componenti sono calcolate separatamente e poi sommate:
-  - $ \mathbf{v} = v_{tan}\, \mathbf{t} + v_{radial}\, \mathbf{r}$.
-- Perché fondamentale:
-  - Mantiene la stabilità; il controllo radiale non interferisce direttamente con quello angolare.
-  - Se non separate: un singolo vettore velocità con un controller combinato può indurre oscillazioni o oscillazioni accoppiate (allosync) e perdita di monotonicità di convergenza.
-- Cosa succede se non si separano:
-  - I comandi possono scambiarsi tra radiale e tangenziale causando scatti, overshoot del raggio e difficoltà di convergenza angolare.
-
-### 5.4 Saturazione (clip)
-- Nella pratica `u_\phi` viene limitato (`max_u_phi = 0.8`) e `v_tangential` è clamped tra 0.05 e 1.5.
-- Perché serve:
-  - Evita comandi eccessivi che potrebbero provocare instabilità numerica e oscillazioni molto grandi.
-  - Riflette i limiti fisici reali di motori/attuatori.
-- Effetto sulla stabilità:
-  - Introduce non-linearità ma previene scatti. Con guadagno troppo alto senza saturazione la risposta potrebbe divergere o oscillare.
-
-## DINAMICA DEL SISTEMA
-
-Evoluzione temporale (riassunto di `SimulationEngine.step()`):
-1. Aggiornamento frame counter.
-2. Calcolo delle phi per droni in `APPROACH` e computazione del consensus quando N>1.
-3. Per ogni drone:
-   - Ottenimento `camera_view` = `Drone.get_camera_view(world_field, x_coords, y_coords)`.
-   - Calcolo `center_val` (media 5×5 centrale).
-   - Transizione `SEARCH -> APPROACH` se `center_val > c_star`. All'ingresso in APPROACH, `theta` inizializzato alla direzione tangenziale CCW.
-   - Se in `APPROACH`: calcolo `v_radial` e `v_tangential` (con correzione consensus) e conversione in componenti (vx, vy).
-   - Se `camera_view` perde traccia (max < 0.15) → ritorno a `SEARCH`.
-   - Integrazione di posizione tramite `Drone.update_position(dt)` (clamp e rimbalzo ai bordi della mappa).
-
-Transizione SEARCH → APPROACH:
-- Basata su soglia `c_star` applicata alla media centrale 5×5. Questo vuol dire che il drone avverte "abbastanza olio" nel centro della sua vista e assume di essere sopra il bordo.
-
-Comportamento emergente:
-- Droni in SEARCH vagano; quando incontrano il bordo passano in APPROACH e convergono radialmente verso $r_0$. Con consensus attivo e con più droni sull'anello, si ottiene una ridistribuzione angolare verso spazi uniformi. Possono anche perdere il bordo e tornare a SEARCH se la macchia non è più visibile nella finestra.
-
-## CONVERGENZA
-
-Quando il sistema è stabile:
-- Stato stabile locale: per ogni drone in APPROACH, $d \approx r_0$ e i gap angolari sono vicini all'ideal gap $2\pi / N$; quindi $v_{radial} \approx 0$ e $u_\phi \approx 0$.
-- La convergenza del consensus è possibile perché il controllo è proporzionale sui gap angolari locali; se i guadagni e saturazioni sono ragionevoli, gli scarti vengono smorzati nel tempo.
-
-Configurazione ideale:
-- N droni uniformemente distribuiti su una circonferenza di raggio $r_0$.
-- Per N=2 l'assetto ideale è $\phi_2 - \phi_1 = \pi$.
-
-Perché il consensus si annulla:
-- Per uniformità: gap_to_next = gap_from_prev = ideal_gap ⇒ errori nulli ⇒ delta_gap = 0 ⇒ $u_\phi = 0$. Quindi nessuna correzione tangenziale aggiuntiva è richiesta.
-
-## LIMITAZIONI
-
-- Percezione locale e soglie:
-  - Soglie fisse (`c_star`, 0.5 threshold in `identify_centroid`) sensibili a scale del campo e rumore.
-- Rumore:
-  - `CameraSensor` e `GPSSensor` possono introdurre rumore; non c'è filtro temporale nel controllo (es. Kalman). Questo può portare a oscillazioni.
-- Mapping coordinate-index:
-  - `CameraSensor` usa `x` per riga e `y` per colonna; potenzialmente fonte di confusione e errori se si cambiano convenzioni.
-- Dipendenza dai parametri:
-  - Guadagni (`k_radial`, `k_consensus`), `v_base` e saturazioni determinano stabilità e velocità di convergenza; non adaptive.
-- Bordi della mappa:
-  - `Drone.update_position` rimbalza invertendo la componente di velocità; se i droni partono vicino al bordo potrebbero compiere rimbalzi indesiderati. (Si raccomanda inizializzare con margine interno.)
-
-## POSSIBILI MIGLIORAMENTI
-
-Percezione e stima del bordo:
-- Usare deriva del campo (gradiente) o fit di cerchio locale (RANSAC / least squares) per stimare raggio e centro localmente invece di soglie.
-- Usare `identify_centroid()` come iniziale ma poi applicare un fitting della curva locale per stimare $\phi$ e la normale.
-
-Filtri e stima:
-- Filtrare le misure GPS/camera con filtro di Kalman o exponential smoothing per rendere il controllo meno sensibile al rumore.
-- Stima distribuita dello stato del gruppo (ogni drone condivide la sua $\phi$) per un consensus più efficiente.
-
-Comunicazione e cooperazione:
-- Implementare scambio esplicito di messaggi (posizione o phi) per migliorare il consensus e renderlo robusto a occlusioni/sfalsamenti locali.
-- Protocollo per gestione ingressi/uscite (join/leave) dell'anello senza perturbazioni.
-
-Controller più sofisticati:
-- Aggiungere controllo PD sulla componente radiale per ridurre overshoot.
-- Regolazione adattiva del `k_consensus` in funzione della densità.
-
-Robustezza ai bordi della mappa:
-- Inizializzare droni con margine (es. 10% interno) oppure generare posizioni distribuite gaussiane attorno al centro.
-
-## COME ESEGUIRE IL CODICE
-
-Prerequisiti:
-- Python 3.8+ (testato con Python 3.x)
-- Dipendenze: `numpy`, `matplotlib`
-- Installa con pip:
-```bash
-python3 -m pip install numpy matplotlib
+```python
+spill = CircleOilSpill(x0=0.0, y0=0.0)
 ```
 
-Esempi di esecuzione:
-- Eseguire simulazione headless (salva immagine finale):
-```bash
-python3 main.py --frames 5000
-```
-- Eseguire con visualizzazione:
-```bash
-python3 main.py --visualize --frames 5000
-```
-- Debug rapido (script di test già presente):
-```bash
-python3 debug_consensus.py
-```
+The project therefore studies the following question:
 
-Parametri utili (nel codice):
-- Modificare in `simulation_engine.py`:
-  - `c_star` (soglia per passare in APPROACH)
-  - `v_base` (velocità tangenziale base)
-  - `k_consensus` (guadagno consenso)
-- Modificare in `environment.py`:
-  - `CircleOilSpill.__init__(r0=..., sigma=...)` per cambiare raggio e morbidezza del bordo.
-- Posizioni iniziali:
-  - `main.py` ora inizializza posizioni uniformi nella mappa; per margine interno: usare `np.random.uniform(xmin+margin, xmax-margin)`.
+> Given several drones with local noisy camera windows over the spill field, how well can they estimate the spill radius and agree on a common estimate?
 
-## ESEMPI E DIAGRAMMI INTUITIVI
+This is a distributed estimation problem, not a path-planning problem.
 
-Vettori di controllo (diagramma ASCII, drone sopra il bordo, CCW tangential):
-  
-  Drone (x,y)
-     |
-     |  r (radiale)
-     v
-    o----> tangential (t, CCW)
-     \\
-      \\  radial towards/away from center
+## 3. Why a Multi-Drone System
 
-Rappresentazione controllo:
-- calcolo vx,vy:
-$$
-\mathbf{v} = v_{tan}\,\mathbf{t} + v_{radial}\,\mathbf{r}
-$$
-dove
-$$
-v_{radial} = -k_{radial}(d - r_0), \quad v_{tan} = v_{base} + u_\phi d.
-$$
+A single drone would only observe a small local patch of the spill. That is sufficient for a rough boundary cue, but not ideal for a robust radius estimate. A multi-drone system is useful because:
 
-## NOTE IMPLEMENTATIVE E "PERCHÉ" DELLE SCELTE
+- different drones see different parts of the boundary,
+- local noise can be averaged out,
+- partial observations can be fused into a more stable estimate,
+- consensus provides a lightweight distributed mechanism without a central fusion server.
 
-- Separazione radiale/tangenziale: scelta strutturale semplice e robusta che rende il comportamento prevedibile — il radiale regola il raggio, il tangenziale gestisce la distribuzione.
-- Uso di una finestra centrale 5×5 e soglia `c_star`: trade-off tra semplicità e robustezza; la media centrale attenua rumore locale e l'uso di 5×5 è una via di mezzo tra sensibilità e stabilità.
-- Consensus locale con ordinamento per $\phi$: evita necessità di comunicazione esplicita; i droni determinano un ordine topologico e regolano gap usando solo questo ordinamento.
-- Saturazione: prevenire comandi troppo grandi dovuti a errori iniziali o rumore.
-- Sensori modulari (`sensors.py`): facilita l'estensione (aggiunta di blur, diversa dimensione, variabilità di rumore).
+The code uses this distributed idea in a simple way: each drone forms an estimate from its own local edge evidence, and then the set of drones near the spill edge repeatedly averages those estimates.
 
-## CONCLUSIONE RAPIDA
+## 4. System Architecture
 
-Questo progetto illustra un'architettura semplice ed efficace per il problema oil-spill edge tracking: percezione locale + controllo separato radiale/tangenziale + semplice consenso angolare. È un buon punto di partenza per sperimentazioni e miglioramenti: migliorare la percezione (fit/gradiente), introdurre filtraggio e comunicazione, e testare la sensibilità ai parametri per rendere il sistema più robusto nelle condizioni realistiche.
+### 4.1 Module Overview
 
---- 
+| Module | Role |
+|---|---|
+| `environment.py` | Defines the map grid and the oil spill field models. |
+| `sensors.py` | Simulates GPS and camera sensors with noise. |
+| `edge_detection.py` | Performs preprocessing, edge detection, and edge pixel extraction. |
+| `drone.py` | Stores drone position, sensors, and local estimate state. |
+| `simulation_engine.py` | Coordinates sensing, estimation, consensus, history, and logging. |
+| `visualization.py` | Draws the spill, drones, communication range, and detected edges. |
+| `main.py` | Builds the scenario, runs the simulation loop, and saves plots. |
 
-Se vuoi, posso:
-- Aggiungere esempi di parametri per esperimenti (grid di valori per `k_consensus`, `v_base`).
-- Implementare una versione con filtro (Kalman) e un semplice protocollo di comunicazione per il consensus.
-# Oil Spill Multi-Drone Simulation
+### 4.2 Main Data Flow
 
-A modular and scalable Python simulation for autonomous drones detecting and tracking oil spills using noisy sensors.
+1. `main.py` creates a `SimulationMap` and an oil spill model.
+2. `main.py` creates a `SimulationEngine`.
+3. Each `Drone` is added to the engine with a random initial position outside the spill.
+4. On each simulation step:
+   - the engine asks each drone for a local camera view,
+   - `edge_detection.py` extracts boundary pixels,
+   - the engine computes a local radius estimate,
+   - participating drones exchange estimates through consensus,
+   - the result is stored for analysis and visualization.
 
-## Architecture
+## 5. Mathematical and Theoretical Foundations
 
-- **`main.py`**: Entry point. Initializes the environment and multi-drone simulation.
-- **`simulation_engine.py`**: The core simulation loop. Manages agent states and sensor polling.
-- **`drone.py`**: Modular drone class with proprioceptive (GPS) and exteroceptive (Camera) support.
-- **`sensors.py`**: Implementation of noisy sensors (Gaussian noise on GPS and Camera data).
-- **`environment.py`**: Defines the simulation map and oil spill mathematical models.
-- **`edge_detection.py`**: Geometric algorithms for identifying oil spill boundaries from local camera data.
-- **`visualization.py`**: Decoupled visualization module using Matplotlib.
+### 5.1 World and Spill Geometry
 
-## Features
+The simulation domain is a rectangular grid:
 
-- **Multi-Drone Support**: Simulates multiple agents independently searching the map.
-- **Sensor Noise**: Real-world-like noise modeled for GPS and local camera perception.
-- **Geometric Locking**: Drones identify the exact "straddling" edge of the oil spill.
-- **Modern Viz**: Clear feedback for drone states (Searching: RED, Locked: GREEN).
-
-## How to Run
-
-Install dependencies:
-```bash
-pip install numpy matplotlib
+```text
+x in [-5, 5], y in [-5, 5], grid_size = 500
 ```
 
-Run simulation:
-```bash
-python3 main.py
+The world is sampled on a Cartesian grid generated by `SimulationMap`:
+
+```python
+self.x_coords = np.linspace(xlim[0], xlim[1], grid_size)
+self.y_coords = np.linspace(ylim[0], ylim[1], grid_size)
+self.X, self.Y = np.meshgrid(self.x_coords, self.y_coords)
 ```
+
+#### Circular spill model
+
+`CircleOilSpill` defines a softened circular spill:
+
+Let
+
+```math
+d(x,y) = \sqrt{(x-x_0)^2 + (y-y_0)^2}
+```
+
+Then the field value is
+
+```math
+f(x,y) =
+\begin{cases}
+1, & d(x,y) \le r_0 \\
+\exp\left(-\frac{(d(x,y)-r_0)^2}{2\sigma^2}\right), & d(x,y) > r_0
+\end{cases}
+```
+
+This means the interior is fully saturated at 1.0, while the exterior decays smoothly from the boundary.
+
+#### Gaussian spill model
+
+`GaussianOilSpill` provides a continuous alternative:
+
+```math
+f(x,y) = A \exp\left(-\frac{(x-x_0)^2 + (y-y_0)^2}{2\sigma^2}\right)
+```
+
+This model is smoother and more realistic for a diffused concentration field, but it is not the active scenario in `main.py`.
+
+### 5.2 Local Camera Model
+
+Each drone uses a `CameraSensor` to extract a local submatrix from the global field. The code:
+
+- converts world coordinates to grid indices,
+- extracts a centered window of size `sensor_size x sensor_size`,
+- adds Gaussian noise,
+- pads with zeros when the drone is near the map boundary.
+
+If the camera view is partially out of bounds, the sensor still returns a fixed-size matrix, which keeps the downstream edge detection code simple.
+
+### 5.3 Edge Detection
+
+The boundary is extracted from the local camera matrix by:
+
+1. converting to grayscale and uint8,
+2. normalizing contrast to `[0, 255]`,
+3. applying Gaussian blur,
+4. running Canny edge detection,
+5. optionally applying morphological closing.
+
+If `I` is the local camera matrix, then the pipeline is:
+
+```text
+I -> normalize -> Gaussian blur -> Canny -> binary edge map
+```
+
+The detected edge pixels are returned as `(row, col)` coordinates.
+
+### 5.4 Local Radius Estimate
+
+The local estimate is not computed by least squares or weighted least squares. Instead, the code uses a simpler geometric estimator:
+
+1. convert edge pixels back to world coordinates,
+2. compute each edge point's distance to the known center `(x_0, y_0)`,
+3. take the mean distance as the local radius estimate.
+
+If the detected edge points are `(x_k, y_k)`, then:
+
+```math
+\hat r_0^{local} = \frac{1}{N}\sum_{k=1}^{N}\sqrt{(x_k - \hat x_0)^2 + (y_k - \hat y_0)^2}
+```
+
+In the current code, the center estimate is effectively the true center:
+
+```python
+center_x = float(drone.estimate_x0)
+center_y = float(drone.estimate_y0)
+```
+
+Since `Drone` is initialized with `true_x0` and `true_y0`, the center is known in this experiment.
+
+### 5.5 Consensus Model
+
+The drones do not use a Kalman filter or a distributed Kalman filter. There is no probabilistic state estimator in the current codebase.
+
+Instead, they use a damped average consensus update over the subset of drones that are deemed to be near the spill edge.
+
+For a drone `i` with estimate `r_i^k` at consensus iteration `k`, let `N_i` be the neighbor set. The update is:
+
+```math
+r_i^{k+1} = r_i^k + \alpha \left( \frac{1}{|N_i|}\sum_{j \in N_i} r_j^k - r_i^k \right)
+```
+
+where `alpha = 0.5` is `consensus_gain`.
+
+This is a lazy averaging step:
+
+- if the drone is already equal to the neighborhood mean, it does not change,
+- otherwise it moves halfway toward the local average.
+
+### 5.6 Neighbor Update for Non-Participating Drones
+
+Drones that are not selected for consensus can still be nudged toward nearby participating drones. The code computes an inverse-distance weighted estimate from nearby consensus participants and updates the drone by:
+
+```math
+r_i \leftarrow r_i + \beta(\bar r_i - r_i)
+```
+
+where `beta = 0.35` is `neighbor_gain`.
+
+This is not part of a classical consensus proof. It is a heuristic to propagate information to non-participating agents.
+
+## 6. Algorithmic Workflow
+
+### 6.1 Step-by-Step Execution
+
+At a high level, each simulation step does the following:
+
+1. Increment the frame counter.
+2. If this is a measurement frame, acquire a fresh local camera view for each drone.
+3. Run edge detection on the local view.
+4. If edges are found, compute a local radius estimate.
+5. Identify drones that see enough oil to qualify as consensus participants.
+6. Run multiple consensus iterations over the participating set.
+7. Apply a neighbor heuristic to non-participating drones.
+8. Store history for later plotting.
+
+### 6.2 Pseudocode
+
+```text
+for each frame:
+    if frame is a measurement frame:
+        for each drone:
+            camera_view <- local spill patch
+            edges <- Canny(camera_view)
+            if edges exist:
+                edge_points <- extract edge pixels
+                r_local <- mean distance(edge_points, center)
+                drone.r <- r_local
+
+    participants <- drones with edge_detected = true and oil_fraction >= threshold
+
+    repeat consensus_iters times:
+        for each participant:
+            r_mean <- average of neighbors' estimates
+            r <- r + alpha * (r_mean - r)
+
+    for each non-participant:
+        if nearby participants exist:
+            r_neighbor <- inverse-distance weighted average
+            r <- r + beta * (r_neighbor - r)
+```
+
+### 6.3 Important Timing Detail
+
+The code separates measurement cadence from consensus cadence:
+
+- sensing is performed only every `measure_every` frames,
+- consensus runs every frame,
+- each measurement frame is followed by multiple consensus iterations.
+
+This means the system can keep refining the current estimate between expensive sensing updates.
+
+## 7. Implementation Details
+
+### 7.1 `main.py`
+
+`main.py` is the entry point. It:
+
+- seeds both NumPy and Python's `random` module,
+- creates the simulation map,
+- instantiates the spill model,
+- creates the `SimulationEngine`,
+- adds 5 drones at random positions outside the spill radius,
+- runs the simulation loop,
+- saves `final_simulation_state.png`,
+- saves `consensus_convergence.png`.
+
+The drones start at random angles and distances:
+
+```python
+dist in [r0 + 0.1, r0 + 2.5]
+```
+
+This ensures they begin outside the spill but close enough to observe it.
+
+### 7.2 `SimulationEngine`
+
+This is the main orchestrator. Its responsibilities include:
+
+- precomputing the global spill field,
+- managing sensing and consensus cadence,
+- selecting consensus participants,
+- updating the estimate history,
+- writing the measurement traces used in plotting.
+
+Key parameters:
+
+- `measure_every = 3`
+- `consensus_iters = 10`
+- `consensus_gain = 0.5`
+- `neighbor_gain = 0.35`
+- `oil_cell_threshold = 0.5`
+- `consensus_oil_fraction_threshold = 0.10`
+
+The engine also computes a communication radius in world units from the configured cell radius:
+
+```python
+communication_radius = communication_radius_cells * 0.5 * (dx + dy)
+```
+
+With the default grid, this is approximately 4.1 world units.
+
+### 7.3 `Drone`
+
+The `Drone` class is intentionally minimal:
+
+- position: `x`, `y`
+- sensors: `gps`, `camera`
+- estimate state: `estimate_x0`, `estimate_y0`, `estimate_r0`
+- detection state: `edge_detected`, `last_edge_point`, `last_gradient_peak`, `last_oil_fraction`
+
+The drone is static. It does not move during the simulation.
+
+### 7.4 `sensors.py`
+
+`Sensor` is the base class for noise injection.
+
+- `GPSSensor.sense((x, y))` returns a noisy position.
+- `CameraSensor.sense(...)` returns a local grid patch with Gaussian noise and optional blur.
+
+The camera is the sensing workhorse of the project.
+
+### 7.5 `edge_detection.py`
+
+This module provides two main operations:
+
+- `detect_edges(...)`: preprocess and run Canny,
+- `extract_edge_points(edges)`: return the coordinates of all positive edge pixels.
+
+The implementation is intentionally standard and robust enough for a soft field, but still lightweight.
+
+### 7.6 `visualization.py`
+
+The visualizer renders:
+
+- the spill field as a grayscale image,
+- contour levels for readability,
+- each drone as a marker,
+- the sensor footprint,
+- the optional communication radius,
+- the closest detected edge point for each drone,
+- annotations showing gradient magnitude and oil fraction.
+
+This is useful for validating whether the local edge evidence matches the intended spill geometry.
+
+## 8. Distributed Aspects
+
+### 8.1 Communication Graph
+
+Communication is not implemented as explicit message passing. Instead, the engine constructs a logical communication graph by checking Euclidean distance between drones.
+
+Two modes exist:
+
+- `fully_connected = True`
+  - every participant can communicate with every other participant,
+- `fully_connected = False`
+  - communication is limited to drones within the configured radius.
+
+### 8.2 What Is Shared
+
+The only shared variable is the scalar radius estimate `estimate_r0`.
+
+This is important:
+
+- there is no sharing of raw images,
+- there is no sharing of edge maps,
+- there is no exchange of full state vectors,
+- there is no explicit belief covariance.
+
+This keeps communication cheap, but it also limits the amount of information available to the consensus layer.
+
+### 8.3 Synchronization and Update Rules
+
+Consensus is synchronous within each frame:
+
+- all participating drones read the current estimates,
+- all updates are computed from the same snapshot,
+- then the estimates are written back.
+
+This is a standard synchronous consensus pattern and is easier to reason about than asynchronous message passing.
+
+### 8.4 Convergence Behavior
+
+If the participating graph is connected and the update weights are fixed, repeated lazy averaging tends to reduce disagreement among the participating drones.
+
+However, exact global convergence to the true radius is not guaranteed by the code for several reasons:
+
+- only drones with sufficient oil fraction are allowed to participate,
+- the graph may be range-limited,
+- non-participants are updated heuristically rather than through the same consensus operator,
+- measurements are noisy and discrete,
+- only a finite number of consensus iterations is executed each frame.
+
+So the algorithm should be understood as an approximate agreement mechanism rather than a formal distributed optimizer.
+
+## 9. Performance Analysis
+
+### 9.1 What the Code Measures
+
+The final script reports:
+
+- each drone's initial post-measurement radius estimate,
+- each drone's final post-consensus estimate,
+- the mean of the final estimates,
+- the standard deviation of the final estimates,
+- the absolute error relative to the true radius.
+
+It also saves:
+
+- `final_simulation_state.png`
+- `consensus_convergence.png`
+
+### 9.2 Sources of Error
+
+The main error sources are:
+
+- camera noise,
+- GPS noise, although GPS is not used in the current radius update,
+- discretization of the spill field on the grid,
+- finite camera window size,
+- Canny threshold sensitivity,
+- boundary padding near the map edges,
+- partial observations of the spill boundary,
+- approximate consensus with a finite number of iterations,
+- the heuristic selection rule based on oil fraction.
+
+### 9.3 Stability and Robustness
+
+The current estimator is simple and therefore relatively easy to tune, but it is not highly robust.
+
+Stability is helped by:
+
+- damping in consensus (`alpha = 0.5`),
+- the neighbor update gain being smaller than the consensus gain,
+- restricting participation to drones that detect enough oil,
+- using a softened spill boundary rather than a discontinuous one.
+
+Stability is weakened by:
+
+- noisy boundary extraction,
+- a fixed oil fraction threshold,
+- the absence of temporal filtering,
+- no explicit outlier rejection.
+
+## 10. Assumptions Made by the Model
+
+The code makes several strong assumptions:
+
+1. The spill center is known.
+2. Drones do not move.
+3. The spill is approximately circular in the active scenario.
+4. Local camera views are sufficient to infer the boundary.
+5. The spill field is static over time.
+6. Drones can communicate if they are within a fixed Euclidean distance.
+7. A scalar radius estimate is sufficient as the shared state.
+
+These assumptions are reasonable for a controlled proof-of-concept, but they limit realism.
+
+## 11. Limitations
+
+The current implementation has the following weaknesses:
+
+- No dynamic motion model for drones.
+- No explicit exploration strategy.
+- No Kalman filter, EKF, or distributed Kalman filter.
+- No least squares or weighted least squares fitting.
+- No robust outlier rejection for edge pixels.
+- No modeling of non-circular spill boundaries in the active pipeline.
+- No uncertainty quantification for the radius estimate.
+- Consensus is applied only to a filtered subset of drones, which can bias the result.
+
+The largest conceptual limitation is that the project estimates a scalar radius, while real oil spills often have irregular, evolving shapes.
+
+## 12. Possible Improvements
+
+### 12.1 Better Geometry Estimation
+
+Replace the mean-distance estimator with:
+
+- least squares circle fitting,
+- robust circle fitting with RANSAC,
+- weighted least squares using edge confidence,
+- contour-based shape fitting for non-circular spills.
+
+### 12.2 Filtering and State Estimation
+
+Add temporal filtering to stabilize the local estimate:
+
+- Kalman filter for a low-dimensional radius state,
+- extended Kalman filter if the geometry is expanded,
+- distributed Kalman filtering for multi-drone fusion.
+
+### 12.3 More Robust Edge Processing
+
+Improvements could include:
+
+- adaptive Canny thresholds,
+- morphological cleanup by default,
+- gradient-based edge confidence,
+- confidence-weighted edge selection,
+- rejection of edge clusters that are inconsistent with the known geometry.
+
+### 12.4 Stronger Distributed Consensus
+
+The current consensus step could be replaced with:
+
+- Metropolis-Hastings weights,
+- doubly stochastic consensus weights,
+- asynchronous consensus,
+- event-triggered communication,
+- consensus over both radius and uncertainty.
+
+### 12.5 Non-Circular Spill Support
+
+To support realistic oil spill shapes, the model could be extended to:
+
+- ellipses,
+- splines,
+- level-set surfaces,
+- multi-lobe blobs,
+- time-varying spill growth and drift.
+
+In that setting, the system would need to estimate a boundary curve rather than a single radius.
+
+## 13. Conclusion
+
+This project is a concise distributed estimation experiment for oil spill radius tracking. Its main contributions are:
+
+- a clean static world and spill model,
+- noisy local sensing with a camera patch,
+- edge-based local radius estimation,
+- simple synchronous consensus among nearby drones,
+- detailed logging and visualization of convergence.
+
+The code is best understood as a controlled prototype for studying how multiple local observers can agree on a shared geometric estimate. It is not yet a full autonomous swarm system, but it provides a solid foundation for adding motion, more robust estimation, and more realistic spill shapes.
+

@@ -19,17 +19,13 @@ class GPSSensor(Sensor):
 
 class CameraSensor(Sensor):
     """Exteroceptive camera sensor: returns a local continuous matrix + noise."""
-    def __init__(self, size=25, noise_std=0.1, apply_blur=False, blur_sigma=1.0):
+    def __init__(self, size=100, noise_std=0.1, apply_blur=False, blur_sigma=1.0):
         super().__init__(noise_std)
         self.size = size
         self.apply_blur = apply_blur
         self.blur_sigma = blur_sigma
 
     def sense(self, world_field, x, y, x_coords, y_coords):
-        """
-        Extracts a local 25x25 window centered at (x, y).
-        Returns continuous values from world_field + optional noise and blur.
-        """
         # Compute grid indices for the center
         dx = x_coords[1] - x_coords[0]
         dy = y_coords[1] - y_coords[0]
