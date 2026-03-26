@@ -70,12 +70,12 @@ def run_multi_drone_simulation(
     else:
         print("Visualization disabled. Headless mode (Agg backend).")
 
-    print(f"Starting Multi-Drone Simulation ({max_frames} frames)...")
+    print(f"Starting Multi-Drone Voronoi Control Simulation ({max_frames} frames)...")
     if fully_connected:
-        print("Mode: Static radius estimation + fully connected consensus")
+        print("Mode: Voronoi control + radius estimation + fully connected consensus")
     else:
         print(
-            "Mode: Static radius estimation + range-based communication "
+            "Mode: Voronoi control + radius estimation + range-based communication "
             f"(Rc={communication_radius_cells} cells, ~{engine.communication_radius:.2f} world units)"
         )
     

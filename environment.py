@@ -7,7 +7,7 @@ class OilSpill:
 
 class CircleOilSpill(OilSpill):
     """Circular oil spill at (x0, y0) with radius r0, now softened with Gaussian."""
-    def __init__(self, x0=0, y0=0, r0=2, sigma=0.2):
+    def __init__(self, x0=0, y0=0, r0=2, sigma=0.5):
         self.x0 = x0
         self.y0 = y0
         self.r0 = r0

@@ -14,10 +14,10 @@ class Visualizer:
         self.ax.set_ylim(sim_map.ylim)
         if self.show_communication_radius:
             self.ax.set_title(
-                f"Static Multi-Drone Radius Estimation - Communication radius Rc={communication_radius:.2f}"
+                f"Voronoi Control + Radius Estimation - Communication radius Rc={communication_radius:.2f}"
             )
         else:
-            self.ax.set_title("Static Multi-Drone Radius Estimation - Fully Connected")
+            self.ax.set_title("Voronoi Control + Radius Estimation - Fully Connected")
         
         # Initial draw of the field
         field_data = oil_spill.field(sim_map.X, sim_map.Y)
@@ -31,6 +31,7 @@ class Visualizer:
         self.drone_patches = {} # {drone_id: [patch_comm, patch_body, patch_sensor]}
         self.texts = {} # {drone_id: text_label}
         self.edge_markers = {} # {drone_id: [scatter, annotation]}
+        self.target_markers = {} # {drone_id: [scatter, annotation]}
 
     def update_drone(self, drone):
         # Remove old patches
@@ -40,6 +41,11 @@ class Visualizer:
 
         if drone.drone_id in self.edge_markers:
             for artist in self.edge_markers[drone.drone_id]:
+                if artist is not None:
+                    artist.remove()
+
+        if drone.drone_id in self.target_markers:
+            for artist in self.target_markers[drone.drone_id]:
                 if artist is not None:
                     artist.remove()
 
@@ -110,6 +116,31 @@ class Visualizer:
                 )
 
         self.edge_markers[drone.drone_id] = [edge_marker, edge_label]
+
+        target_marker = None
+        target_label = None
+        if getattr(drone, "last_voronoi_target", None) is not None:
+            target_marker = self.ax.scatter(
+                [drone.last_voronoi_target[0]],
+                [drone.last_voronoi_target[1]],
+                s=35,
+                c="darkorange",
+                marker="o",
+                edgecolors="black",
+                linewidths=0.6,
+                alpha=0.8,
+                zorder=5,
+            )
+            target_label = self.ax.text(
+                drone.last_voronoi_target[0] + 0.1,
+                drone.last_voronoi_target[1] + 0.1,
+                "V",
+                fontsize=7,
+                color="darkorange",
+                zorder=6,
+            )
+
+        self.target_markers[drone.drone_id] = [target_marker, target_label]
 
     def render(self, drones, pause=True):
         for drone in drones:

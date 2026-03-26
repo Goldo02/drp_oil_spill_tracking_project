@@ -5,7 +5,7 @@ from edge_detection import detect_edges, extract_edge_points
 
 
 class SimulationEngine:
-    """Orchestrates static multi-drone radius estimation and consensus."""
+    """Orchestrates radius estimation, Voronoi partitioning, and control."""
 
     def __init__(
         self,
@@ -18,6 +18,9 @@ class SimulationEngine:
         consensus_iters=10,
         communication_radius_cells=205,
         fully_connected=False,
+        control_gain=1.8,
+        max_speed=0.6,
+        voronoi_grid_step=8,
     ):
         self.sim_map = sim_map
         self.oil_spill = oil_spill
@@ -44,16 +47,36 @@ class SimulationEngine:
         self.consensus_oil_fraction_threshold = 0.10
         self.oil_cell_threshold = 0.5
         self.fully_connected = bool(fully_connected)
+        self.control_gain = float(control_gain)
+        self.max_speed = float(max_speed)
+        self.voronoi_grid_step = max(1, int(voronoi_grid_step))
 
         dx = self.sim_map.x_coords[1] - self.sim_map.x_coords[0] if len(self.sim_map.x_coords) > 1 else 1.0
         dy = self.sim_map.y_coords[1] - self.sim_map.y_coords[0] if len(self.sim_map.y_coords) > 1 else 1.0
         self.communication_radius_cells = int(communication_radius_cells)
         self.communication_radius = float(self.communication_radius_cells * 0.5 * (dx + dy))
 
+        self.control_x_coords = self._sample_axis(self.sim_map.x_coords, self.voronoi_grid_step)
+        self.control_y_coords = self._sample_axis(self.sim_map.y_coords, self.voronoi_grid_step)
+        self.control_X, self.control_Y = np.meshgrid(self.control_x_coords, self.control_y_coords)
+        self.control_points = np.column_stack((self.control_X.ravel(), self.control_Y.ravel()))
+        self.control_density = self._boundary_density(self.control_X, self.control_Y).ravel()
+
         # History for plotting local measurements and consensus convergence.
         self.estimates_history = {}
         self.measurement_consensus_history = []
         self._current_measure_trace = None
+
+    def _sample_axis(self, coords, step):
+        sampled = np.asarray(coords[::step], dtype=float)
+        if sampled.size == 0 or sampled[-1] != coords[-1]:
+            sampled = np.append(sampled, float(coords[-1]))
+        return sampled
+
+    def _boundary_density(self, X, Y):
+        """Weight the Voronoi centroids toward the spill boundary."""
+        field = self.oil_spill.field(X, Y)
+        return np.clip(4.0 * field * (1.0 - field), 0.0, None)
 
     def add_drone(self, drone_id, x, y):
         drone = Drone(
@@ -65,9 +88,12 @@ class SimulationEngine:
             camera_noise=self.sigma_cam,
             true_x0=self.true_x0,
             true_y0=self.true_y0,
+            max_speed=self.max_speed,
         )
         self.drones.append(drone)
         self.estimates_history[drone_id] = {
+            "x": [],
+            "y": [],
             "x0": [],
             "y0": [],
             "edge_x": [],
@@ -81,6 +107,10 @@ class SimulationEngine:
             "r0_measure_end": [],
             "r0_consensus": [],
             "r0_post": [],
+            "u_x": [],
+            "u_y": [],
+            "voronoi_cx": [],
+            "voronoi_cy": [],
         }
 
     def _communication_neighbors(self, drone, candidates):
@@ -197,6 +227,59 @@ class SimulationEngine:
             "r0_local": r0_local,
         }
 
+    def _compute_voronoi_targets(self):
+        """Compute one weighted Voronoi centroid per drone on a sampled grid."""
+        if not self.drones:
+            return {}
+
+        positions = np.array([[d.x, d.y] for d in self.drones], dtype=float)
+        points = self.control_points
+        diff = points[:, None, :] - positions[None, :, :]
+        dist2 = np.sum(diff * diff, axis=2)
+        assignment = np.argmin(dist2, axis=1)
+
+        targets = {}
+        density = self.control_density
+        for idx, drone in enumerate(self.drones):
+            mask = assignment == idx
+            if not np.any(mask):
+                targets[drone.drone_id] = np.array([drone.x, drone.y], dtype=float)
+                continue
+
+            cell_points = points[mask]
+            cell_weights = density[mask]
+            weight_sum = float(np.sum(cell_weights))
+            if weight_sum <= 1e-12:
+                centroid = np.mean(cell_points, axis=0)
+            else:
+                centroid = np.sum(cell_points * cell_weights[:, None], axis=0) / weight_sum
+            targets[drone.drone_id] = centroid
+
+        return targets
+
+    def _apply_voronoi_control(self):
+        """Single-integrator motion toward the weighted Voronoi centroid."""
+        targets = self._compute_voronoi_targets()
+        for drone in self.drones:
+            target = np.asarray(targets.get(drone.drone_id, (drone.x, drone.y)), dtype=float)
+            error = target - np.array([drone.x, drone.y], dtype=float)
+            command = self.control_gain * error
+            speed = float(np.linalg.norm(command))
+            if self.max_speed > 0 and speed > self.max_speed:
+                command = command / speed * self.max_speed
+
+            drone.last_voronoi_target = (float(target[0]), float(target[1]))
+            drone.set_control(float(command[0]), float(command[1]))
+            drone.update_position(self.dt, map_bounds=drone.map_bounds, max_speed=self.max_speed)
+
+            history = self.estimates_history[drone.drone_id]
+            history["u_x"].append(float(drone.u_x))
+            history["u_y"].append(float(drone.u_y))
+            history["voronoi_cx"].append(float(target[0]))
+            history["voronoi_cy"].append(float(target[1]))
+            history["x"].append(float(drone.x))
+            history["y"].append(float(drone.y))
+
     def _select_consensus_drones(self):
         """Keep only drones that see enough oil to be considered near the edge."""
         return [
@@ -304,7 +387,7 @@ class SimulationEngine:
         return updated_drones
 
     def step(self):
-        """Sense the spill edge, estimate radii, then run distributed consensus."""
+        """Sense the spill edge, estimate radii, run consensus, then move the drones."""
         self.frame += 1
 
         measurement_frame = (self.frame % self.measure_every == 0)
@@ -400,6 +483,15 @@ class SimulationEngine:
         print("FRAME RADIUS ESTIMATES:")
         for drone in self.drones:
             print(f"{drone.drone_id}: r0 = {drone.estimate_r0:.6f}")
+
+        self._apply_voronoi_control()
+        print("VORONOI CONTROL:")
+        for drone in self.drones:
+            print(
+                f"{drone.drone_id}: pos=({drone.x:.3f}, {drone.y:.3f}), "
+                f"u=({drone.u_x:.3f}, {drone.u_y:.3f}), "
+                f"target={drone.last_voronoi_target}"
+            )
 
         if measurement_frame:
             if self._current_measure_trace is not None:
