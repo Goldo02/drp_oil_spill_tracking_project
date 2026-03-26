@@ -15,6 +15,8 @@ class SimulationEngine:
         sigma_cam=0.1,
         measure_every=3,
         consensus_iters=10,
+        communication_radius_cells=201,
+        fully_connected=False,
     ):
         self.sim_map = sim_map
         self.oil_spill = oil_spill
@@ -35,13 +37,18 @@ class SimulationEngine:
         # Measurements and consensus now run at different cadences.
         self.consensus_gain = 0.5
         self.neighbor_gain = 0.35
-        self.neighbor_radius = 3.0
         self.measure_every = max(1, int(measure_every))
         self.consensus_iters = max(1, int(consensus_iters))
         self.canny_threshold1 = 20
         self.canny_threshold2 = 60
         self.consensus_oil_fraction_threshold = 0.10
         self.oil_cell_threshold = 0.5
+        self.fully_connected = bool(fully_connected)
+
+        dx = self.sim_map.x_coords[1] - self.sim_map.x_coords[0] if len(self.sim_map.x_coords) > 1 else 1.0
+        dy = self.sim_map.y_coords[1] - self.sim_map.y_coords[0] if len(self.sim_map.y_coords) > 1 else 1.0
+        self.communication_radius_cells = int(communication_radius_cells)
+        self.communication_radius = float(self.communication_radius_cells * 0.5 * (dx + dy))
 
         # History for plotting local measurements and consensus convergence.
         self.estimates_history = {}
@@ -71,6 +78,18 @@ class SimulationEngine:
             "r0_consensus": [],
             "r0_post": [],
         }
+
+    def _communication_neighbors(self, drone, candidates):
+        """Return candidate drones within the communication radius or everyone in fully-connected mode."""
+        if self.fully_connected:
+            return list(candidates)
+
+        neighbors = []
+        for other in candidates:
+            distance = float(np.hypot(drone.x - other.x, drone.y - other.y))
+            if distance <= self.communication_radius:
+                neighbors.append(other)
+        return neighbors
 
     def _estimate_local_radius(self, drone):
         """Estimate the spill radius only when a meaningful edge is detected."""
@@ -188,13 +207,23 @@ class SimulationEngine:
         if not valid_drones:
             return 0, 0.0
 
-        current = np.array([d.estimate_r0 for d in valid_drones], dtype=float)
-        mean_estimate = float(np.mean(current))
-        new_values = current + self.consensus_gain * (mean_estimate - current)
+        current = {d.drone_id: float(d.estimate_r0) for d in valid_drones}
+        new_values = {}
+        max_diff = 0.0
 
-        max_diff = float(np.max(np.abs(new_values - current)))
-        for drone, new_value in zip(valid_drones, new_values):
-            drone.estimate_r0 = float(new_value)
+        for drone in valid_drones:
+            neighbors = self._communication_neighbors(drone, valid_drones)
+            if not neighbors:
+                neighbors = [drone]
+
+            neighbor_estimates = np.array([current[n.drone_id] for n in neighbors], dtype=float)
+            mean_estimate = float(np.mean(neighbor_estimates))
+            new_value = current[drone.drone_id] + self.consensus_gain * (mean_estimate - current[drone.drone_id])
+            new_values[drone.drone_id] = float(new_value)
+            max_diff = max(max_diff, abs(new_value - current[drone.drone_id]))
+
+        for drone in valid_drones:
+            drone.estimate_r0 = new_values[drone.drone_id]
 
         # The final estimate after the frame is the agreed consensus state for
         # this single iteration. It will be used as the starting point on the
@@ -213,18 +242,14 @@ class SimulationEngine:
             if drone in consensus_drones:
                 continue
 
-            distances = np.array(
-                [np.hypot(drone.x - other.x, drone.y - other.y) for other in consensus_drones],
+            nearby_drones = self._communication_neighbors(drone, consensus_drones)
+            if not nearby_drones:
+                continue
+
+            nearby_distances = np.array(
+                [np.hypot(drone.x - other.x, drone.y - other.y) for other in nearby_drones],
                 dtype=float,
             )
-            nearby_mask = distances <= self.neighbor_radius
-            if not np.any(nearby_mask):
-                nearest_idx = int(np.argmin(distances))
-                nearby_mask = np.zeros_like(distances, dtype=bool)
-                nearby_mask[nearest_idx] = True
-
-            nearby_drones = [other for other, is_near in zip(consensus_drones, nearby_mask) if is_near]
-            nearby_distances = distances[nearby_mask]
             nearby_estimates = np.array([other.estimate_r0 for other in nearby_drones], dtype=float)
             weights = 1.0 / np.maximum(nearby_distances, 1e-6)
             neighbor_estimate = float(np.average(nearby_estimates, weights=weights))

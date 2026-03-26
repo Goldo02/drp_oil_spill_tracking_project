@@ -10,7 +10,13 @@ import matplotlib
 from environment import SimulationMap, GaussianOilSpill, CircleOilSpill
 from simulation_engine import SimulationEngine
 
-def run_multi_drone_simulation(visualize=False, max_frames=5000, seed=42):
+def run_multi_drone_simulation(
+    visualize=False,
+    max_frames=5000,
+    seed=42,
+    fully_connected=False,
+    communication_radius_cells=205,
+):
     if visualize:
         matplotlib.use("TkAgg")
     else:
@@ -26,7 +32,15 @@ def run_multi_drone_simulation(visualize=False, max_frames=5000, seed=42):
     # spill = GaussianOilSpill(x0=0.0, y0=0.0, sigma=1.5, amplitude=1.0)
     
     # 2. Setup Engine
-    engine = SimulationEngine(sim_map, spill, dt=0.05, sigma_gps=0.1, sigma_cam=0.1)
+    engine = SimulationEngine(
+        sim_map,
+        spill,
+        dt=0.05,
+        sigma_gps=0.1,
+        sigma_cam=0.1,
+        communication_radius_cells=communication_radius_cells,
+        fully_connected=fully_connected,
+    )
     
     # 3. Add Drones with random start positions outside the circle, not too far
     r0 = spill.r0
@@ -44,12 +58,23 @@ def run_multi_drone_simulation(visualize=False, max_frames=5000, seed=42):
     viz = None
     if visualize:
         from visualization import Visualizer
-        viz = Visualizer(sim_map, spill)
+        viz = Visualizer(
+            sim_map,
+            spill,
+            communication_radius=None if fully_connected else engine.communication_radius,
+            show_communication_radius=not fully_connected,
+        )
     else:
         print("Visualization disabled. Headless mode (Agg backend).")
     
     print(f"Starting Multi-Drone Simulation ({max_frames} frames)...")
-    print("Mode: Static radius estimation + gradient/oil-fraction gated consensus")
+    if fully_connected:
+        print("Mode: Static radius estimation + fully connected consensus")
+    else:
+        print(
+            "Mode: Static radius estimation + range-based communication "
+            f"(Rc={communication_radius_cells} cells, ~{engine.communication_radius:.2f} world units)"
+        )
     
     # 5. Main Loop
     try:
@@ -73,7 +98,12 @@ def run_multi_drone_simulation(visualize=False, max_frames=5000, seed=42):
     if not visualize:
         from visualization import Visualizer
         # Late setup of Visualizer for static final frame
-        viz = Visualizer(sim_map, spill)
+        viz = Visualizer(
+            sim_map,
+            spill,
+            communication_radius=None if fully_connected else engine.communication_radius,
+            show_communication_radius=not fully_connected,
+        )
     
     viz.render(engine.drones, pause=False)
     import matplotlib.pyplot as plt
@@ -134,6 +164,23 @@ if __name__ == "__main__":
     parser.add_argument("--visualize", action="store_true", help="Enable real-time visualization (animation)")
     parser.add_argument("--frames", type=int, default=5000, help="Total number of simulation frames")
     parser.add_argument("--seed", type=int, default=1, help="Random seed for reproducible initialization")
+    parser.add_argument(
+        "--fully-connected",
+        action="store_true",
+        help="Disable range-based communication and use a fully connected consensus graph",
+    )
+    parser.add_argument(
+        "--communication-radius-cells",
+        type=int,
+        default=201,
+        help="Communication radius in grid cells when range-based communication is enabled",
+    )
     args = parser.parse_args()
 
-    run_multi_drone_simulation(visualize=args.visualize, max_frames=args.frames, seed=args.seed)
+    run_multi_drone_simulation(
+        visualize=args.visualize,
+        max_frames=args.frames,
+        seed=args.seed,
+        fully_connected=args.fully_connected,
+        communication_radius_cells=args.communication_radius_cells,
+    )

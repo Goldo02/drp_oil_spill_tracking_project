@@ -238,6 +238,10 @@ python3 main.py --frames 5000
 ```bash
 python3 main.py --visualize --frames 5000
 ```
+- Usare la modalità completamente connessa:
+```bash
+python3 main.py --visualize --frames 5000 --fully-connected
+```
 - Debug rapido (script di test già presente):
 ```bash
 python3 debug_consensus.py
@@ -248,6 +252,7 @@ Parametri utili (nel codice):
   - `c_star` (soglia per passare in APPROACH)
   - `v_base` (velocità tangenziale base)
   - `k_consensus` (guadagno consenso)
+  - `communication_radius_cells` e `fully_connected` per scegliere tra grafico locale e grafo completo.
 - Modificare in `environment.py`:
   - `CircleOilSpill.__init__(r0=..., sigma=...)` per cambiare raggio e morbidezza del bordo.
 - Posizioni iniziali:

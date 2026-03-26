@@ -1,16 +1,23 @@
 import matplotlib.pyplot as plt
-from matplotlib.patches import RegularPolygon, Rectangle
+from matplotlib.patches import Circle, RegularPolygon, Rectangle
 
 class Visualizer:
     """Handles all plotting and animation for the simulation."""
-    def __init__(self, sim_map, oil_spill):
+    def __init__(self, sim_map, oil_spill, communication_radius=None, show_communication_radius=False):
         self.sim_map = sim_map
         self.oil_spill = oil_spill
+        self.communication_radius = communication_radius
+        self.show_communication_radius = show_communication_radius and communication_radius is not None
         
         self.fig, self.ax = plt.subplots(figsize=(10, 8))
         self.ax.set_xlim(sim_map.xlim)
         self.ax.set_ylim(sim_map.ylim)
-        self.ax.set_title("Static Multi-Drone Radius Estimation")
+        if self.show_communication_radius:
+            self.ax.set_title(
+                f"Static Multi-Drone Radius Estimation - Communication radius Rc={communication_radius:.2f}"
+            )
+        else:
+            self.ax.set_title("Static Multi-Drone Radius Estimation - Fully Connected")
         
         # Initial draw of the field
         field_data = oil_spill.field(sim_map.X, sim_map.Y)
@@ -21,7 +28,7 @@ class Visualizer:
         self.contour = self.ax.contour(sim_map.X, sim_map.Y, field_data, levels=[0.1, 0.5, 0.9], 
                                        colors='black', alpha=0.5, linewidths=0.5)
 
-        self.drone_patches = {} # {drone_id: [patch_body, patch_sensor]}
+        self.drone_patches = {} # {drone_id: [patch_comm, patch_body, patch_sensor]}
         self.texts = {} # {drone_id: text_label}
         self.edge_markers = {} # {drone_id: [scatter, annotation]}
 
@@ -36,9 +43,26 @@ class Visualizer:
                 if artist is not None:
                     artist.remove()
 
+        patches = []
+
+        if self.show_communication_radius:
+            comm_circle = Circle(
+                (drone.x, drone.y),
+                radius=self.communication_radius,
+                fill=False,
+                edgecolor="darkorange",
+                linewidth=1.2,
+                linestyle="--",
+                alpha=0.35,
+                zorder=1,
+            )
+            self.ax.add_patch(comm_circle)
+            patches.append(comm_circle)
+
         # Draw new body
         body = RegularPolygon((drone.x, drone.y), numVertices=6, radius=0.15, color='royalblue')
         self.ax.add_patch(body)
+        patches.append(body)
         
         # Draw sensor area (based on real position for visualization)
         # Assuming grid spacing is constant
@@ -48,11 +72,12 @@ class Visualizer:
         sensor_box = Rectangle((drone.x - s_w/2, drone.y - s_h/2), s_w, s_h, 
                                edgecolor='blue', facecolor='none', alpha=0.3, linestyle='--')
         self.ax.add_patch(sensor_box)
+        patches.append(sensor_box)
         
         # Add label
         label = self.ax.text(drone.x + 0.2, drone.y + 0.2, f"Drone {drone.drone_id}", fontsize=8)
 
-        self.drone_patches[drone.drone_id] = [body, sensor_box]
+        self.drone_patches[drone.drone_id] = patches
         self.texts[drone.drone_id] = label
 
         edge_marker = None
