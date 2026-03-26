@@ -10,7 +10,7 @@ class Visualizer:
         self.fig, self.ax = plt.subplots(figsize=(10, 8))
         self.ax.set_xlim(sim_map.xlim)
         self.ax.set_ylim(sim_map.ylim)
-        self.ax.set_title("Modular Drone Simulation: Noisy Sensors & Multi-Drone Support")
+        self.ax.set_title("Static Multi-Drone Radius Estimation")
         
         # Initial draw of the field
         field_data = oil_spill.field(sim_map.X, sim_map.Y)
@@ -23,6 +23,7 @@ class Visualizer:
 
         self.drone_patches = {} # {drone_id: [patch_body, patch_sensor]}
         self.texts = {} # {drone_id: text_label}
+        self.edge_markers = {} # {drone_id: [scatter, annotation]}
 
     def update_drone(self, drone):
         # Remove old patches
@@ -30,9 +31,13 @@ class Visualizer:
             for p in self.drone_patches[drone.drone_id]: p.remove()
             self.texts[drone.drone_id].remove()
 
+        if drone.drone_id in self.edge_markers:
+            for artist in self.edge_markers[drone.drone_id]:
+                if artist is not None:
+                    artist.remove()
+
         # Draw new body
-        color = 'green' if drone.mode == "LOCKED" else 'red'
-        body = RegularPolygon((drone.x, drone.y), numVertices=6, radius=0.15, color=color)
+        body = RegularPolygon((drone.x, drone.y), numVertices=6, radius=0.15, color='royalblue')
         self.ax.add_patch(body)
         
         # Draw sensor area (based on real position for visualization)
@@ -46,12 +51,44 @@ class Visualizer:
         
         # Add label
         label = self.ax.text(drone.x + 0.2, drone.y + 0.2, f"Drone {drone.drone_id}", fontsize=8)
-        
+
         self.drone_patches[drone.drone_id] = [body, sensor_box]
         self.texts[drone.drone_id] = label
 
-    def render(self, drones):
+        edge_marker = None
+        edge_label = None
+        if drone.edge_detected and drone.last_edge_point is not None:
+            edge_color = "limegreen"
+            edge_marker = self.ax.scatter(
+                [drone.last_edge_point[0]],
+                [drone.last_edge_point[1]],
+                s=70,
+                c=edge_color,
+                marker="X",
+                edgecolors="black",
+                linewidths=0.8,
+                zorder=6,
+            )
+            if drone.last_gradient_peak is not None:
+                oil_fraction = getattr(drone, "last_oil_fraction", None)
+                if oil_fraction is None:
+                    annotation = f"g={drone.last_gradient_peak:.3f}"
+                else:
+                    annotation = f"g={drone.last_gradient_peak:.3f}\n{100.0 * oil_fraction:.1f}% oil"
+                edge_label = self.ax.text(
+                    drone.last_edge_point[0] + 0.12,
+                    drone.last_edge_point[1] + 0.12,
+                    annotation,
+                    fontsize=7,
+                    color=edge_color,
+                    zorder=7,
+                )
+
+        self.edge_markers[drone.drone_id] = [edge_marker, edge_label]
+
+    def render(self, drones, pause=True):
         for drone in drones:
             self.update_drone(drone)
         plt.draw()
-        plt.pause(0.001)
+        if pause:
+            plt.pause(0.001)

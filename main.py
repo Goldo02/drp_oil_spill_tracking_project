@@ -1,12 +1,21 @@
+import os
 import numpy as np
 import argparse
 import random
+
+if not os.environ.get("MPLCONFIGDIR"):
+    os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib"
+
 import matplotlib
 from environment import SimulationMap, GaussianOilSpill, CircleOilSpill
 from simulation_engine import SimulationEngine
-from visualization import Visualizer
 
 def run_multi_drone_simulation(visualize=False, max_frames=5000, seed=42):
+    if visualize:
+        matplotlib.use("TkAgg")
+    else:
+        matplotlib.use("Agg")
+
     # Seed both numpy and python random for full reproducibility
     np.random.seed(seed)
     random.seed(seed)
@@ -34,12 +43,13 @@ def run_multi_drone_simulation(visualize=False, max_frames=5000, seed=42):
     # 4. Setup Visualization (only if enabled)
     viz = None
     if visualize:
+        from visualization import Visualizer
         viz = Visualizer(sim_map, spill)
     else:
         print("Visualization disabled. Headless mode (Agg backend).")
     
     print(f"Starting Multi-Drone Simulation ({max_frames} frames)...")
-    print("Mode: SEARCH -> APPROACH (Matveev Tracking + Consensus Distribution)")
+    print("Mode: Static radius estimation + gradient/oil-fraction gated consensus")
     
     # 5. Main Loop
     try:
@@ -61,32 +71,40 @@ def run_multi_drone_simulation(visualize=False, max_frames=5000, seed=42):
     print("Simulation finished. Saving final state to 'final_simulation_state.png'...")
     # Create a final plot even if visualization was disabled
     if not visualize:
+        from visualization import Visualizer
         # Late setup of Visualizer for static final frame
         viz = Visualizer(sim_map, spill)
     
-    viz.render(engine.drones)
+    viz.render(engine.drones, pause=False)
     import matplotlib.pyplot as plt
     plt.savefig('final_simulation_state.png')
     
-    # Plot consensus convergence through all consensus iterations (including initial pre-consensus point)
-    frames = list(range(len(engine.estimates_history[next(iter(engine.estimates_history))]['r0_consensus'])))
+    # Plot per-frame local and post-consensus estimates.
+    frames = list(range(len(engine.estimates_history[next(iter(engine.estimates_history))]['r0_post'])))
     fig, ax = plt.subplots(figsize=(12, 6))
 
     for drone_id, history in engine.estimates_history.items():
-        ax.plot(frames, history['r0_consensus'], label=f'{drone_id}', linewidth=2, alpha=0.7)
+        ax.plot(frames, history['r0_local'], label=f'{drone_id} local', linewidth=1.5, alpha=0.4)
+        ax.plot(frames, history['r0_post'], label=f'{drone_id} consensus', linewidth=2.0, alpha=0.9)
 
     # Add true radius line
     ax.axhline(y=spill.r0, color='black', linestyle='--', linewidth=2.5, label='True r0')
     
     # Calculate final statistics
     final_r0_post = [engine.estimates_history[f'D{i}']['r0_post'][-1] for i in range(len(engine.drones))]
+    initial_r0_local = [engine.estimates_history[f'D{i}']['r0_local'][0] for i in range(len(engine.drones))]
+    initial_r0_post = [engine.estimates_history[f'D{i}']['r0_post'][0] for i in range(len(engine.drones))]
     mean_r0 = np.mean(final_r0_post)
     std_r0 = np.std(final_r0_post)
     
     # Print to console
     print("\n=== FINAL CONSENSUS RESULTS ===")
     for i in range(len(engine.drones)):
-        print(f"D{i} final r0_post: {final_r0_post[i]:.6f}")
+        print(
+            f"D{i}: initial r0_local={initial_r0_local[i]:.6f}, "
+            f"initial r0_post={initial_r0_post[i]:.6f}, "
+            f"final r0_post={final_r0_post[i]:.6f}"
+        )
     print(f"Mean r0: {mean_r0:.6f}")
     print(f"Std Dev: {std_r0:.6f}")
     print(f"True r0: {spill.r0:.6f}")
@@ -97,8 +115,8 @@ def run_multi_drone_simulation(visualize=False, max_frames=5000, seed=42):
     ax.text(0.02, 0.98, textstr, transform=ax.transAxes, fontsize=10,
             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
     
-    ax.set_title('Radius Estimates: Post-Consensus (all drones should overlap)')
-    ax.set_xlabel('Consensus Iterations')
+    ax.set_title('Radius Estimates: Local Measurements and Consensus Agreement')
+    ax.set_xlabel('Frame')
     ax.set_ylabel('Radius r0')
     ax.legend()
     ax.grid(True, alpha=0.3)
@@ -118,8 +136,4 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=1, help="Random seed for reproducible initialization")
     args = parser.parse_args()
 
-    # Set backend headlessly if not visualizing
-    if not args.visualize:
-        matplotlib.use('Agg')
-    
     run_multi_drone_simulation(visualize=args.visualize, max_frames=args.frames, seed=args.seed)

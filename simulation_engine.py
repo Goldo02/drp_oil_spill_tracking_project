@@ -1,10 +1,21 @@
 import numpy as np
 from drone import Drone
-from edge_detection import identify_centroid, check_geometric_lock
+from edge_detection import detect_edges, extract_edge_points
+
 
 class SimulationEngine:
-    """Orchestrates the simulation loop for multiple drones."""
-    def __init__(self, sim_map, oil_spill, dt=0.1, sigma_gps=0.1, sigma_cam=0.1):
+    """Orchestrates static multi-drone radius estimation and consensus."""
+
+    def __init__(
+        self,
+        sim_map,
+        oil_spill,
+        dt=0.1,
+        sigma_gps=0.1,
+        sigma_cam=0.1,
+        measure_every=3,
+        consensus_iters=10,
+    ):
         self.sim_map = sim_map
         self.oil_spill = oil_spill
         self.dt = dt
@@ -12,225 +23,303 @@ class SimulationEngine:
         self.sigma_cam = sigma_cam
         self.drones = []
         self.frame = 0
-        
-        # True circle parameters (unknown to drones)
+
+        # Center is known in this experiment.
         self.true_x0 = oil_spill.x0
         self.true_y0 = oil_spill.y0
-        self.true_r0 = oil_spill.r0
-        
-        # Pre-calculated field
-        self.world_field = oil_spill.field(sim_map.X, sim_map.Y)
-        
-        # Matveev & Consensus Control Parameters
-        self.c_star = 0.5 
-        self.u_bar = 3.0       # Radial correction gain
-        self.v_base = 0.3      # Constant orbit speed
-        self.k_consensus = 0.2 # Consensus gain for distributed averaging
-        self.num_consensus_steps = 10  # Number of consensus iterations per frame
 
-        # History for plotting consensus convergence
+        # Pre-computed oil field sampled on the simulation grid.
+        self.world_field = oil_spill.field(sim_map.X, sim_map.Y)
+
+        # Consensus parameters for distributed averaging.
+        # Measurements and consensus now run at different cadences.
+        self.consensus_gain = 0.5
+        self.neighbor_gain = 0.35
+        self.neighbor_radius = 3.0
+        self.measure_every = max(1, int(measure_every))
+        self.consensus_iters = max(1, int(consensus_iters))
+        self.canny_threshold1 = 20
+        self.canny_threshold2 = 60
+        self.consensus_oil_fraction_threshold = 0.10
+        self.oil_cell_threshold = 0.5
+
+        # History for plotting local measurements and consensus convergence.
         self.estimates_history = {}
 
     def add_drone(self, drone_id, x, y):
-        drone = Drone(drone_id, x, y, map_bounds=(*self.sim_map.xlim, *self.sim_map.ylim),
-                      gps_noise=self.sigma_gps, camera_noise=self.sigma_cam,
-                      true_x0=self.true_x0, true_y0=self.true_y0, true_r0=self.true_r0)
-        # Initial random velocity and heading for SEARCH
-        angle = np.random.uniform(0, 2 * np.pi)
-        vx, vy = np.cos(angle) * 0.5, np.sin(angle) * 0.5
-        drone.set_velocity(vx, vy)
-        drone.theta = angle
-        drone.speed = self.v_base
-        drone.on_edge = False  # track APPROACH state entry
+        drone = Drone(
+            drone_id,
+            x,
+            y,
+            map_bounds=(*self.sim_map.xlim, *self.sim_map.ylim),
+            gps_noise=self.sigma_gps,
+            camera_noise=self.sigma_cam,
+            true_x0=self.true_x0,
+            true_y0=self.true_y0,
+        )
         self.drones.append(drone)
-        # Initialize history
         self.estimates_history[drone_id] = {
-            'x0': [], 'y0': [], 'r0_pre': [], 'r0_post': [], 'r0_consensus': []
+            "x0": [],
+            "y0": [],
+            "edge_x": [],
+            "edge_y": [],
+            "edge_detected": [],
+            "gradient_magnitude": [],
+            "gradient_peak": [],
+            "oil_fraction": [],
+            "r0_local": [],
+            "r0_consensus": [],
+            "r0_post": [],
         }
 
+    def _estimate_local_radius(self, drone):
+        """Estimate the spill radius only when a meaningful edge is detected."""
+        camera_view = drone.get_camera_view(
+            self.world_field,
+            self.sim_map.x_coords,
+            self.sim_map.y_coords,
+        )
+        if camera_view.size == 0:
+            drone.edge_detected = False
+            drone.last_edge_point = None
+            drone.last_gradient_peak = None
+            drone.last_oil_fraction = None
+            return {
+                "edge_x": np.nan,
+                "edge_y": np.nan,
+                "edge_detected": False,
+                "gradient_magnitude": np.nan,
+                "gradient_peak": np.nan,
+                "oil_fraction": np.nan,
+                "r0_local": np.nan,
+            }
+
+        # Rebuild the local world-coordinate frame around the drone position.
+        dx = self.sim_map.x_coords[1] - self.sim_map.x_coords[0] if len(self.sim_map.x_coords) > 1 else 1.0
+        dy = self.sim_map.y_coords[1] - self.sim_map.y_coords[0] if len(self.sim_map.y_coords) > 1 else 1.0
+        i_center = int((drone.x - self.sim_map.x_coords[0]) / dx)
+        j_center = int((drone.y - self.sim_map.y_coords[0]) / dy)
+        half = camera_view.shape[0] // 2
+
+        i_min = max(0, i_center - half)
+        i_max = min(len(self.sim_map.x_coords), i_center + half + 1)
+        j_min = max(0, j_center - half)
+        j_max = min(len(self.sim_map.y_coords), j_center + half + 1)
+
+        local_x_coords = self.sim_map.x_coords[i_min:i_max]
+        local_y_coords = self.sim_map.y_coords[j_min:j_max]
+
+        # Smooth the drone's sensing matrix first, then apply Canny.
+        edges = detect_edges(
+            camera_view,
+            threshold1=self.canny_threshold1,
+            threshold2=self.canny_threshold2,
+            blur_kernel=(5, 5),
+            blur_sigma=1.2,
+        )
+        edge_pixels = extract_edge_points(edges)
+
+        if edge_pixels.size == 0:
+            drone.edge_detected = False
+            drone.last_edge_point = None
+            drone.last_gradient_peak = None
+            drone.last_oil_fraction = None
+            return {
+                "edge_x": np.nan,
+                "edge_y": np.nan,
+                "edge_detected": False,
+                "gradient_magnitude": np.nan,
+                "gradient_peak": np.nan,
+                "oil_fraction": np.nan,
+                "r0_local": np.nan,
+            }
+
+        edge_rows = edge_pixels[:, 0]
+        edge_cols = edge_pixels[:, 1]
+
+        # The camera matrix is stored with the first axis aligned to x and the
+        # second axis aligned to y, so rows map to x and cols map to y here.
+        world_x = local_x_coords[np.clip(edge_rows, 0, len(local_x_coords) - 1)]
+        world_y = local_y_coords[np.clip(edge_cols, 0, len(local_y_coords) - 1)]
+
+        # Keep the centroid for estimation, but store the closest detected edge
+        # point to the drone so the visualizer can highlight it directly.
+        distances = np.hypot(world_x - drone.x, world_y - drone.y)
+        nearest_idx = int(np.argmin(distances))
+        nearest_edge_point = (float(world_x[nearest_idx]), float(world_y[nearest_idx]))
+
+        edge_x = float(np.mean(world_x))
+        edge_y = float(np.mean(world_y))
+        center_x = float(drone.estimate_x0)
+        center_y = float(drone.estimate_y0)
+        r0_local = float(np.mean(np.hypot(world_x - center_x, world_y - center_y)))
+
+        drone.edge_detected = True
+        drone.last_edge_point = nearest_edge_point
+        drone.last_gradient_peak = float(np.count_nonzero(edges))
+        drone.last_oil_fraction = float(np.mean(camera_view >= self.oil_cell_threshold))
+        drone.estimate_r0 = r0_local
+
+        return {
+            "edge_x": edge_x,
+            "edge_y": edge_y,
+            "edge_detected": True,
+            "gradient_magnitude": float(np.count_nonzero(edges)),
+            "gradient_peak": float(np.count_nonzero(edges)),
+            "oil_fraction": float(np.mean(camera_view >= self.oil_cell_threshold)),
+            "r0_local": r0_local,
+        }
+
+    def _select_consensus_drones(self):
+        """Keep only drones that see enough oil to be considered near the edge."""
+        return [
+            d
+            for d in self.drones
+            if getattr(d, "edge_detected", False)
+            and getattr(d, "last_oil_fraction", 0.0) >= self.consensus_oil_fraction_threshold
+        ]
+
+    def _run_consensus(self):
+        """
+        One distributed averaging consensus step over drones near the edge.
+        A single simulation frame corresponds to a single consensus iteration.
+        """
+        valid_drones = self._select_consensus_drones()
+        if not valid_drones:
+            return 0, 0.0
+
+        current = np.array([d.estimate_r0 for d in valid_drones], dtype=float)
+        mean_estimate = float(np.mean(current))
+        new_values = current + self.consensus_gain * (mean_estimate - current)
+
+        max_diff = float(np.max(np.abs(new_values - current)))
+        for drone, new_value in zip(valid_drones, new_values):
+            drone.estimate_r0 = float(new_value)
+
+        # The final estimate after the frame is the agreed consensus state for
+        # this single iteration. It will be used as the starting point on the
+        # next frame.
+        return 1, max_diff
+
+    def _update_neighbor_drones(self, consensus_drones):
+        """
+        Let non-participating drones move toward nearby consensus participants.
+        """
+        if not consensus_drones:
+            return []
+
+        updated_drones = []
+        for drone in self.drones:
+            if drone in consensus_drones:
+                continue
+
+            distances = np.array(
+                [np.hypot(drone.x - other.x, drone.y - other.y) for other in consensus_drones],
+                dtype=float,
+            )
+            nearby_mask = distances <= self.neighbor_radius
+            if not np.any(nearby_mask):
+                nearest_idx = int(np.argmin(distances))
+                nearby_mask = np.zeros_like(distances, dtype=bool)
+                nearby_mask[nearest_idx] = True
+
+            nearby_drones = [other for other, is_near in zip(consensus_drones, nearby_mask) if is_near]
+            nearby_distances = distances[nearby_mask]
+            nearby_estimates = np.array([other.estimate_r0 for other in nearby_drones], dtype=float)
+            weights = 1.0 / np.maximum(nearby_distances, 1e-6)
+            neighbor_estimate = float(np.average(nearby_estimates, weights=weights))
+
+            drone.estimate_r0 = float(
+                drone.estimate_r0 + self.neighbor_gain * (neighbor_estimate - drone.estimate_r0)
+            )
+            updated_drones.append((drone.drone_id, neighbor_estimate, drone.estimate_r0))
+
+        return updated_drones
+
     def step(self):
-        """Update physics and logic for all drones."""
+        """Sense the spill edge, estimate radii, then run distributed consensus."""
         self.frame += 1
 
-        # 0. Local measurements and updates for drones detecting edge
+        measurement_frame = (self.frame % self.measure_every == 0)
+        if measurement_frame:
+            print(f"Frame {self.frame} - MEASUREMENT FRAME:")
+        else:
+            print(f"Frame {self.frame} - CONSENSUS ONLY FRAME:")
+
+        # 1. Local edge detection and radius estimation, performed only on
+        # measurement frames. On skipped frames we carry forward the last
+        # recorded measurement history without touching the live drone state.
         for drone in self.drones:
-            # Robust perception
-            camera_view = drone.get_camera_view(self.world_field, self.sim_map.x_coords, self.sim_map.y_coords)
-            h, w = camera_view.shape
-            win = 2
-            center_val = np.mean(camera_view[h//2-win : h//2+win+1, w//2-win : w//2+win+1])
+            history = self.estimates_history[drone.drone_id]
+            history["x0"].append(drone.estimate_x0)
+            history["y0"].append(drone.estimate_y0)
 
-            gps_x, gps_y = drone.get_gps_pos()
+            if measurement_frame:
+                local_estimate = self._estimate_local_radius(drone)
+                history["edge_x"].append(local_estimate["edge_x"])
+                history["edge_y"].append(local_estimate["edge_y"])
+                history["edge_detected"].append(local_estimate["edge_detected"])
+                history["gradient_magnitude"].append(local_estimate["gradient_magnitude"])
+                history["gradient_peak"].append(local_estimate["gradient_peak"])
+                history["oil_fraction"].append(local_estimate["oil_fraction"])
+                history["r0_local"].append(local_estimate["r0_local"])
 
-            # If detecting edge, compute local radius estimate
-            if center_val > self.c_star:
-                # Distance to center
-                dist_to_center = np.sqrt((gps_x - self.true_x0)**2 + (gps_y - self.true_y0)**2)
-                # True distance to boundary
-                if dist_to_center <= self.true_r0:
-                    d_i = self.true_r0 - dist_to_center
+                if local_estimate["edge_detected"]:
+                    print(
+                        f"{drone.drone_id}: edge detected, "
+                        f"grad={local_estimate['gradient_magnitude']:.6f}, "
+                        f"oil={local_estimate['oil_fraction']:.3f}, "
+                        f"local r0 = {local_estimate['r0_local']:.6f}"
+                    )
                 else:
-                    d_i = dist_to_center - self.true_r0
-                # Noisy distance to boundary
-                d_i_noisy = d_i + np.random.normal(0, self.sigma_cam)
-                # Local radius estimate
-                r_i = dist_to_center - d_i_noisy
-                drone.estimate_r0 = r_i
-                # Center is known
-                drone.estimate_x0 = self.true_x0
-                drone.estimate_y0 = self.true_y0
+                    print(
+                        f"{drone.drone_id}: no edge detected, "
+                        f"grad={local_estimate['gradient_magnitude']:.6f}, "
+                        f"oil={local_estimate['oil_fraction']:.3f}"
+                    )
+            else:
+                history["edge_x"].append(history["edge_x"][-1] if history["edge_x"] else np.nan)
+                history["edge_y"].append(history["edge_y"][-1] if history["edge_y"] else np.nan)
+                history["edge_detected"].append(history["edge_detected"][-1] if history["edge_detected"] else False)
+                history["gradient_magnitude"].append(
+                    history["gradient_magnitude"][-1] if history["gradient_magnitude"] else np.nan
+                )
+                history["gradient_peak"].append(history["gradient_peak"][-1] if history["gradient_peak"] else np.nan)
+                history["oil_fraction"].append(history["oil_fraction"][-1] if history["oil_fraction"] else np.nan)
+                history["r0_local"].append(history["r0_local"][-1] if history["r0_local"] else np.nan)
+                print(f"{drone.drone_id}: sensing skipped, carrying previous measurement")
 
-        # Print initial measurements (post-measurement and pre-consensus)
-        print(f"Frame {self.frame} - INITIAL MEASUREMENTS:")
-        for d in self.drones:
-            print(f"D{d.drone_id}: {d.estimate_r0:.6f}")
+        # 2. Consensus over the local estimates.
+        consensus_drones = self._select_consensus_drones()
+        consensus_ids = ", ".join(d.drone_id for d in consensus_drones) if consensus_drones else "none"
+        print(
+            f"Consensus participants (oil_fraction >= {self.consensus_oil_fraction_threshold:.2f}): "
+            f"{consensus_ids}"
+        )
+        max_diff = 0.0
+        for _ in range(self.consensus_iters):
+            _, diff = self._run_consensus()
+            max_diff = max(max_diff, diff)
 
-        # Record history BEFORE consensus so we can visualize individual estimate paths
-        for d in self.drones:
-            self.estimates_history[d.drone_id]['x0'].append(d.estimate_x0)
-            self.estimates_history[d.drone_id]['y0'].append(d.estimate_y0)
-            self.estimates_history[d.drone_id]['r0_pre'].append(d.estimate_r0)
-            # Record initial consensus state point (pre-iteration)
-            self.estimates_history[d.drone_id]['r0_consensus'].append(d.estimate_r0)
-
-        # Distributed consensus: iterate until convergence (all-to-all topology)
-        max_iters = 100
-        tol = 1e-6
-        actual_iters = 0
-
-        for it in range(1, max_iters + 1):
-            new_r0 = {}
-            for drone in self.drones:
-                neighbors = [d for d in self.drones if d != drone]
-                if neighbors:
-                    mean_neighbors = np.mean([d.estimate_r0 for d in neighbors])
-                    new_r0[drone] = drone.estimate_r0 + self.k_consensus * (mean_neighbors - drone.estimate_r0)
-                else:
-                    new_r0[drone] = drone.estimate_r0
-
-            max_diff = 0.0
-            for drone in self.drones:
-                diff = abs(new_r0[drone] - drone.estimate_r0)
-                max_diff = max(max_diff, diff)
-                drone.estimate_r0 = new_r0[drone]
-
-            # store intra-consensus state for visualization
-            for d in self.drones:
-                self.estimates_history[d.drone_id]['r0_consensus'].append(d.estimate_r0)
-
-            actual_iters = it
-            if max_diff < tol:
-                break
-
-        # Optionally enforce exact consensus average at the end of the loop
-        # (ensures all r0 values are effectively identical when plotting)
-        consensus_avg = np.mean([d.estimate_r0 for d in self.drones])
-        for d in self.drones:
-            d.estimate_r0 = consensus_avg
-
-        print(f"AFTER CONSENSUS (converged in {actual_iters} iter(s), max_diff={max_diff:.2e}):")
-        for d in self.drones:
-            print(f"D{d.drone_id}: {d.estimate_r0:.6f}")
-
-        # Record history AFTER consensus for comparison
-        for d in self.drones:
-            self.estimates_history[d.drone_id]['r0_post'].append(d.estimate_r0)
-
-        # 1. Compute angular positions and consensus gaps for APPROACH drones
-        drones_on_edge = [d for d in self.drones if d.mode == "APPROACH"]
-        
-        # Reset gap attributes
-        for d in self.drones:
-            d.u_consensus = 0.0
-
-        if len(drones_on_edge) > 1:
-            # Compute each drone's angle relative to its estimated spill center
-            for d in drones_on_edge:
-                d.phi = np.arctan2(d.y - d.estimate_y0, d.x - d.estimate_x0)
-
-            # Sort drones by phi (ascending) — defines CCW circular order
-            drones_on_edge.sort(key=lambda d: d.phi)
-            N = len(drones_on_edge)
-            # Ideal equal-spacing gap
-            ideal_gap = 2 * np.pi / N
-
-            for i in range(N):
-                d = drones_on_edge[i]
-                # Neighbors in sorted CCW order (circular)
-                d_prev = drones_on_edge[(i - 1) % N]
-                d_next = drones_on_edge[(i + 1) % N]
-
-                # Gap to next drone (CCW ahead) and from previous (CCW behind)
-                gap_to_next   = (d_next.phi - d.phi)   % (2 * np.pi)
-                gap_from_prev = (d.phi      - d_prev.phi) % (2 * np.pi)
-
-                # Error terms: positive means "drone should move CCW to close gap"
-                #   e_next  > 0  → gap ahead is too big  → speed up (move CCW)
-                #   e_prev  > 0  → gap behind is too big → slow down (move CW)
-                e_next = gap_to_next  - ideal_gap   # positive → move CCW
-                e_prev = gap_from_prev - ideal_gap  # positive → move CW
-
-                # Net: move CCW when ahead gap is large, move CW when behind gap is large
-                delta_gap = e_next - e_prev  # same as gap_to_next - gap_from_prev
-                # Compute a proportional correction (rad/s) for the angular velocity
-                u_phi = self.k_consensus * delta_gap
-                max_u_phi = 0.8
-                u_phi = np.clip(u_phi, -max_u_phi, max_u_phi)
-                # Store as angular-speed correction (to be applied to tangential speed)
-                d.u_consensus_phi = u_phi
-
+        # Record the state after the active consensus step.
         for drone in self.drones:
-            # 2. Robust perception (mean of 5x5 center window)
-            camera_view = drone.get_camera_view(self.world_field, self.sim_map.x_coords, self.sim_map.y_coords)
-            h, w = camera_view.shape
-            win = 2
-            center_val = np.mean(camera_view[h//2-win : h//2+win+1, w//2-win : w//2+win+1])
+            self.estimates_history[drone.drone_id]["r0_consensus"].append(drone.estimate_r0)
 
-            # 3. Mode transition logic
-            if drone.mode == "SEARCH":
-                if center_val > self.c_star:
-                    drone.mode = "APPROACH"
-                    drone.on_edge = True
-                    # --- KEY FIX: Initialize theta to the CCW tangent direction ---
-                    # The tangent to the circle at drone's position is perpendicular
-                    # to the radial vector (pointing CCW).
-                    radial_angle = np.arctan2(drone.y - drone.estimate_y0, drone.x - drone.estimate_x0)
-                    drone.theta = radial_angle + np.pi / 2  # 90° CCW = tangent direction
-                    print(f"Frame {self.frame}: Drone {drone.drone_id} -> APPROACH (theta_init={np.degrees(drone.theta):.1f}°).")
+        updated_neighbors = self._update_neighbor_drones(consensus_drones)
+        if updated_neighbors:
+            for drone_id, neighbor_estimate, new_r0 in updated_neighbors:
+                print(
+                    f"{drone_id}: neighbor update from {neighbor_estimate:.6f}, "
+                    f"new r0 = {new_r0:.6f}"
+                )
+        else:
+            print("Neighbor update: no non-participating drones had a nearby consensus source.")
 
-            if drone.mode == "APPROACH":
-                # Continuous radial control (proportional to radial error)
-                desired_r = drone.estimate_r0
-                dx = drone.x - drone.estimate_x0
-                dy = drone.y - drone.estimate_y0
-                dist = np.sqrt(dx*dx + dy*dy)
-                radial_error = dist - desired_r
-                k_radial = 1.5
-                v_radial = -k_radial * radial_error
+        print(f"AFTER CONSENSUS ({self.consensus_iters} iters/frame, max_diff={max_diff:.2e}):")
+        for drone in self.drones:
+            self.estimates_history[drone.drone_id]["r0_post"].append(drone.estimate_r0)
+            print(f"{drone.drone_id}: agreed r0 = {drone.estimate_r0:.6f}")
 
-                # Tangential speed: base plus consensus correction on angular rate
-                u_phi = getattr(drone, 'u_consensus_phi', 0.0)
-                v_tangential = self.v_base + (u_phi * max(dist, 1e-3))
-                v_tangential = np.clip(v_tangential, 0.05, 1.5)
-
-                # Tangential unit vector (CCW): (-sin(phi), cos(phi))
-                phi_now = np.arctan2(dy, dx)
-                t_x, t_y = -np.sin(phi_now), np.cos(phi_now)
-                r_x, r_y = np.cos(phi_now), np.sin(phi_now)
-
-                vx = v_tangential * t_x + v_radial * r_x
-                vy = v_tangential * t_y + v_radial * r_y
-
-                drone.set_velocity(vx, vy)
-                drone.theta = np.arctan2(vy, vx)
-
-                # Lost track: return to SEARCH only if no oil is visible at all
-                if np.max(camera_view) < 0.15:
-                    drone.mode = "SEARCH"
-                    drone.on_edge = False
-                    angle = np.random.uniform(0, 2 * np.pi)
-                    drone.set_velocity(np.cos(angle) * 0.5, np.sin(angle) * 0.5)
-                    drone.theta = angle
-
-            # 4. Physics integration (commented out to keep drones static)
-            # drone.update_position(self.dt)
+        print("FRAME RADIUS ESTIMATES:")
+        for drone in self.drones:
+            print(f"{drone.drone_id}: r0 = {drone.estimate_r0:.6f}")
