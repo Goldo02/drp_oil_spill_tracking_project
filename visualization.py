@@ -4,6 +4,7 @@ from matplotlib.patches import Circle, RegularPolygon, Rectangle
 class Visualizer:
     """Handles all plotting and animation for the simulation."""
     def __init__(self, sim_map, oil_spill, communication_radius=None, show_communication_radius=False):
+        plt.ion()
         self.sim_map = sim_map
         self.oil_spill = oil_spill
         self.communication_radius = communication_radius
@@ -14,15 +15,15 @@ class Visualizer:
         self.ax.set_ylim(sim_map.ylim)
         if self.show_communication_radius:
             self.ax.set_title(
-                f"Static Multi-Drone Radius Estimation - Communication radius Rc={communication_radius:.2f}"
+                f"Distributed Occupancy Grid Mapping - Communication radius Rc={communication_radius:.2f}"
             )
         else:
-            self.ax.set_title("Static Multi-Drone Radius Estimation - Fully Connected")
+            self.ax.set_title("Distributed Occupancy Grid Mapping - Fully Connected")
         
         # Initial draw of the field
         field_data = oil_spill.field(sim_map.X, sim_map.Y)
         # Use 'Greys' colormap: 0 is white, higher values are darker
-        self.img = self.ax.imshow(field_data, extent=[*sim_map.xlim, *sim_map.ylim], 
+        self.img = self.ax.imshow(field_data.T, extent=[*sim_map.xlim, *sim_map.ylim], 
                                   origin='lower', cmap='Greys', alpha=0.8, vmin=0, vmax=1.0)
         # Draw multiple contour levels for a more continuous look
         self.contour = self.ax.contour(sim_map.X, sim_map.Y, field_data, levels=[0.1, 0.5, 0.9], 
@@ -31,6 +32,8 @@ class Visualizer:
         self.drone_patches = {} # {drone_id: [patch_comm, patch_body, patch_sensor]}
         self.texts = {} # {drone_id: text_label}
         self.edge_markers = {} # {drone_id: [scatter, annotation]}
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
 
     def update_drone(self, drone):
         # Remove old patches
@@ -94,26 +97,27 @@ class Visualizer:
                 linewidths=0.8,
                 zorder=6,
             )
-            if drone.last_gradient_peak is not None:
-                oil_fraction = getattr(drone, "last_oil_fraction", None)
-                if oil_fraction is None:
-                    annotation = f"g={drone.last_gradient_peak:.3f}"
-                else:
-                    annotation = f"g={drone.last_gradient_peak:.3f}\n{100.0 * oil_fraction:.1f}% oil"
-                edge_label = self.ax.text(
-                    drone.last_edge_point[0] + 0.12,
-                    drone.last_edge_point[1] + 0.12,
-                    annotation,
-                    fontsize=7,
-                    color=edge_color,
-                    zorder=7,
-                )
+            oil_fraction = getattr(drone, "last_oil_fraction", None)
+            edge_count = getattr(drone, "last_edge_count", 0)
+            if oil_fraction is None:
+                annotation = f"n={edge_count}"
+            else:
+                annotation = f"n={edge_count}\n{100.0 * oil_fraction:.1f}% oil"
+            edge_label = self.ax.text(
+                drone.last_edge_point[0] + 0.12,
+                drone.last_edge_point[1] + 0.12,
+                annotation,
+                fontsize=7,
+                color=edge_color,
+                zorder=7,
+            )
 
         self.edge_markers[drone.drone_id] = [edge_marker, edge_label]
 
     def render(self, drones, pause=True):
         for drone in drones:
             self.update_drone(drone)
-        plt.draw()
+        self.fig.canvas.draw_idle()
+        self.fig.canvas.flush_events()
         if pause:
             plt.pause(0.001)

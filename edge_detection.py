@@ -1,48 +1,41 @@
 import numpy as np
-import cv2
-
-
-def _to_uint8_grayscale(image: np.ndarray) -> np.ndarray:
-    """Convert an image to a single-channel uint8 array for Canny."""
-    img = np.asarray(image)
-
-    if img.ndim == 3 and img.shape[2] == 3:
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    elif img.ndim == 3 and img.shape[2] == 1:
-        img = img[:, :, 0]
-
-    if img.dtype != np.uint8:
-        img = img.astype(np.float32)
-        if img.size > 0 and float(np.nanmax(img)) <= 1.0:
-            img = img * 255.0
-        img = np.clip(img, 0, 255).astype(np.uint8)
-
-    return img
 
 
 def detect_edges(
     image: np.ndarray,
-    threshold1: int = 20,
-    threshold2: int = 60,
+    threshold1: float = 0.5,
+    threshold2: float = 0.5,
     blur_kernel: tuple[int, int] = (5, 5),
     blur_sigma: float = 1.2,
     apply_morphology: bool = False,
 ) -> np.ndarray:
-    """Detect edges with Gaussian smoothing followed by Canny."""
-    gray = _to_uint8_grayscale(image)
-    # Normalize contrast so Canny can work reliably on soft camera matrices.
-    gray = cv2.normalize(gray.astype(np.float32), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    smoothed = cv2.GaussianBlur(gray, blur_kernel, blur_sigma)
+    """
+    Lightweight numpy-only boundary detector.
 
-    edges = cv2.Canny(smoothed, threshold1, threshold2)
+    This function is kept for compatibility, but the simulation now performs
+    occupancy boundary extraction directly inside the drone sensing pipeline.
+    """
+    del threshold1, threshold2, blur_kernel, blur_sigma, apply_morphology
 
-    if apply_morphology:
-        kernel = np.ones((3, 3), dtype=np.uint8)
-        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+    arr = np.asarray(image, dtype=float)
+    if arr.size == 0:
+        return np.zeros_like(arr, dtype=np.uint8)
 
-    return edges.astype(np.uint8)
+    if np.nanmax(arr) <= 1.0:
+        arr = arr * 255.0
+
+    binary = arr >= 128.0
+    padded = np.pad(binary, 1, mode="constant", constant_values=False)
+    center = padded[1:-1, 1:-1]
+    north = padded[:-2, 1:-1]
+    south = padded[2:, 1:-1]
+    west = padded[1:-1, :-2]
+    east = padded[1:-1, 2:]
+
+    edges = center & (~north | ~south | ~west | ~east)
+    return edges.astype(np.uint8) * 255
 
 
 def extract_edge_points(edges: np.ndarray) -> np.ndarray:
     """Return edge pixel coordinates as (row, col) pairs."""
-    return np.column_stack(np.where(edges > 0))
+    return np.column_stack(np.where(np.asarray(edges) > 0))

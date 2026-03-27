@@ -250,13 +250,12 @@ for each frame:
 
 ### 6.3 Important Timing Detail
 
-The code separates measurement cadence from consensus cadence:
+The current code runs a simple synchronous loop:
 
-- sensing is performed only every `measure_every` frames,
-- consensus runs every frame,
-- each measurement frame is followed by multiple consensus iterations.
-
-This means the system can keep refining the current estimate between expensive sensing updates.
+- each drone senses the spill boundary in global coordinates,
+- each drone updates a full global occupancy grid,
+- the drones exchange their full grids and apply consensus,
+- the disagreement error is stored after each iteration.
 
 ## 7. Implementation Details
 
@@ -276,7 +275,7 @@ This means the system can keep refining the current estimate between expensive s
 The drones start at random angles and distances:
 
 ```python
-dist in [r0 + 0.1, r0 + 2.5]
+dist in [radius + 0.1, radius + 2.5]
 ```
 
 This ensures they begin outside the spill but close enough to observe it.
@@ -286,19 +285,17 @@ This ensures they begin outside the spill but close enough to observe it.
 This is the main orchestrator. Its responsibilities include:
 
 - precomputing the global spill field,
-- managing sensing and consensus cadence,
-- selecting consensus participants,
-- updating the estimate history,
-- writing the measurement traces used in plotting.
+- managing the drone fleet,
+- updating local occupancy grids from sensed edge points,
+- running synchronous full-grid consensus,
+- storing the disagreement error history.
 
 Key parameters:
 
-- `measure_every = 3`
-- `consensus_iters = 10`
-- `consensus_gain = 0.5`
-- `neighbor_gain = 0.35`
+- `resolution = 0.1`
+- `temporal_alpha = 0.05`
+- `consensus_rounds = 5`
 - `oil_cell_threshold = 0.5`
-- `consensus_oil_fraction_threshold = 0.10`
 
 The engine also computes a communication radius in world units from the configured cell radius:
 
@@ -306,7 +303,7 @@ The engine also computes a communication radius in world units from the configur
 communication_radius = communication_radius_cells * 0.5 * (dx + dy)
 ```
 
-With the default grid, this is approximately 4.1 world units.
+With the default grid, this is approximately 5.0 world units.
 
 ### 7.3 `Drone`
 
@@ -314,8 +311,8 @@ The `Drone` class is intentionally minimal:
 
 - position: `x`, `y`
 - sensors: `gps`, `camera`
-- estimate state: `estimate_x0`, `estimate_y0`, `estimate_r0`
-- detection state: `edge_detected`, `last_edge_point`, `last_gradient_peak`, `last_oil_fraction`
+- occupancy state: `grid`
+- detection state: `edge_detected`, `last_edge_point`, `last_edge_points`, `last_edge_count`
 
 The drone is static. It does not move during the simulation.
 
@@ -326,16 +323,13 @@ The drone is static. It does not move during the simulation.
 - `GPSSensor.sense((x, y))` returns a noisy position.
 - `CameraSensor.sense(...)` returns a local grid patch with Gaussian noise and optional blur.
 
-The camera is the sensing workhorse of the project.
+The current occupancy-grid pipeline uses the simulated camera window to extract
+boundary pixels in the global frame.
 
 ### 7.5 `edge_detection.py`
 
-This module provides two main operations:
-
-- `detect_edges(...)`: preprocess and run Canny,
-- `extract_edge_points(edges)`: return the coordinates of all positive edge pixels.
-
-The implementation is intentionally standard and robust enough for a soft field, but still lightweight.
+This module now provides a lightweight NumPy-based compatibility layer for
+boundary detection and edge extraction.
 
 ### 7.6 `visualization.py`
 
@@ -366,16 +360,14 @@ Two modes exist:
 
 ### 8.2 What Is Shared
 
-The only shared variable is the scalar radius estimate `estimate_r0`.
+The shared variable is the full occupancy grid.
 
-This is important:
+This means:
 
 - there is no sharing of raw images,
-- there is no sharing of edge maps,
-- there is no exchange of full state vectors,
-- there is no explicit belief covariance.
-
-This keeps communication cheap, but it also limits the amount of information available to the consensus layer.
+- there is no exchange of local coordinate frames,
+- all drones operate in the same global grid,
+- consensus acts directly on the full map state.
 
 ### 8.3 Synchronization and Update Rules
 
@@ -532,13 +524,12 @@ In that setting, the system would need to estimate a boundary curve rather than 
 
 ## 13. Conclusion
 
-This project is a concise distributed estimation experiment for oil spill radius tracking. Its main contributions are:
+This project is a concise distributed estimation experiment for oil spill occupancy mapping. Its main contributions are:
 
 - a clean static world and spill model,
 - noisy local sensing with a camera patch,
-- edge-based local radius estimation,
-- simple synchronous consensus among nearby drones,
+- global occupancy grid updates from global edge points,
+- synchronous consensus over the full grid,
 - detailed logging and visualization of convergence.
 
 The code is best understood as a controlled prototype for studying how multiple local observers can agree on a shared geometric estimate. It is not yet a full autonomous swarm system, but it provides a solid foundation for adding motion, more robust estimation, and more realistic spill shapes.
-
