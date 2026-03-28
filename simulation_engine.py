@@ -38,9 +38,8 @@ class SimulationEngine:
         self.world_field = oil_spill.field(sim_map.X, sim_map.Y)
 
         # Consensus parameters for distributed averaging.
-        # Measurements and consensus now run at different cadences.
-        self.consensus_gain = 0.5
-        self.neighbor_gain = 0.35
+        self.alpha = 0.4  # Consensus gain (neighbor weight)
+        self.gamma = 0.2  # Innovation gain (local measure weight)
         self.measure_every = max(1, int(measure_every))
         self.consensus_iters = max(1, int(consensus_iters))
         self.canny_threshold1 = 20
@@ -109,9 +108,14 @@ class SimulationEngine:
             true_y0=self.true_y0,
             max_speed=self.max_speed,
         )
-        angle = float(np.random.uniform(0.0, 2.0 * np.pi))
-        drone.exploration_direction = np.array([np.cos(angle), np.sin(angle)], dtype=float)
-        drone.exploration_speed = float(0.5 * self.max_speed)
+        # Ensure exploration has significant X and Y components (angle not too close to axes)
+        while True:
+            angle = float(np.random.uniform(0.0, 2.0 * np.pi))
+            direction = np.array([np.cos(angle), np.sin(angle)], dtype=float)
+            if abs(direction[0]) > 0.3 and abs(direction[1]) > 0.3:
+                break
+        drone.exploration_direction = direction
+        drone.exploration_speed = float(0.8 * self.max_speed)
         self.drones.append(drone)
         self.estimates_history[drone_id] = {
             "x": [],
@@ -142,10 +146,13 @@ class SimulationEngine:
         direction = getattr(drone, "exploration_direction", None)
         speed = float(getattr(drone, "exploration_speed", 0.0))
         if direction is None or speed <= 0.0:
-            angle = float(np.random.uniform(0.0, 2.0 * np.pi))
-            direction = np.array([np.cos(angle), np.sin(angle)], dtype=float)
+            while True:
+                angle = float(np.random.uniform(0.0, 2.0 * np.pi))
+                direction = np.array([np.cos(angle), np.sin(angle)], dtype=float)
+                if abs(direction[0]) > 0.3 and abs(direction[1]) > 0.3:
+                    break
             drone.exploration_direction = direction
-            drone.exploration_speed = float(0.5 * self.max_speed)
+            drone.exploration_speed = float(0.8 * self.max_speed)
             speed = float(drone.exploration_speed)
 
         direction = np.asarray(direction, dtype=float)
@@ -324,6 +331,10 @@ class SimulationEngine:
         drone.last_r0_local = r0_local
         drone.estimate_r0 = r0_local
 
+        # Sync with consensus required attributes
+        drone.has_measure = True
+        drone.local_measure = r0_local
+
         return {
             "edge_x": edge_x,
             "edge_y": edge_y,
@@ -469,148 +480,52 @@ class SimulationEngine:
             history["x"].append(float(drone.x))
             history["y"].append(float(drone.y))
 
-    def _select_consensus_drones(self):
-        """Keep only drones that see enough oil to be considered near the edge."""
-        return [
-            d
-            for d in self.drones
-            if getattr(d, "edge_detected", False)
-            and getattr(d, "last_oil_fraction", 0.0) >= self.consensus_oil_fraction_threshold
-        ]
 
-    def _run_consensus(self, iteration_index=None, iteration_total=None):
+    def _run_consensus(self):
         """
-        One distributed averaging consensus step over drones near the edge.
-        A single simulation frame corresponds to a single consensus iteration.
+        Unified consensus step: all drones update estimates from neighbors.
+        Drones with local measures also add an innovation term.
         """
-        valid_drones = self._select_consensus_drones()
-        if not valid_drones:
-            if iteration_index is not None and iteration_total is not None:
-                print(
-                    f"  Consensus iter {iteration_index}/{iteration_total}: "
-                    f"no eligible drones"
-                )
-            if self._current_measure_trace is not None:
-                for drone in self.drones:
-                    self._current_measure_trace[drone.drone_id].append(float(drone.estimate_r0))
-            return 0, 0.0
-
-        current = {d.drone_id: float(d.estimate_r0) for d in valid_drones}
-        new_values = {}
-        neighbor_info = {}
+        # 1. First, save current estimates to avoid semi-sequential updates in the same loop
+        current_estimates = {d.drone_id: d.estimate_r0 for d in self.drones}
+        
+        new_estimates = {}
         max_diff = 0.0
 
-        for drone in valid_drones:
-            neighbors = self._communication_neighbors(drone, valid_drones)
-            if not neighbors:
-                neighbors = [drone]
+        for drone in self.drones:
+            # Calculate media_vicini (neighbor average)
+            if not drone.neighbors:
+                media_vicini = drone.estimate_r0
+            else:
+                neighbor_vals = [current_estimates[n.drone_id] for n in drone.neighbors]
+                media_vicini = np.mean(neighbor_vals)
+            
+            # Formula: x_i = x_i + alpha * (media_vicini - x_i) + gamma * (local_measure - x_i)
+            # The gamma term only if the drone has measure.
+            
+            innovation_term = 0.0
+            if drone.has_measure:
+                innovation_term = self.gamma * (drone.local_measure - drone.estimate_r0)
+            
+            consensus_term = self.alpha * (media_vicini - drone.estimate_r0)
+            
+            new_estimate = drone.estimate_r0 + consensus_term + innovation_term
+            new_estimates[drone.drone_id] = new_estimate
+            
+            diff = abs(new_estimate - drone.estimate_r0)
+            if diff > max_diff:
+                max_diff = diff
 
-            neighbor_estimates = np.array([current[n.drone_id] for n in neighbors], dtype=float)
-            mean_estimate = float(np.mean(neighbor_estimates))
-            new_value = current[drone.drone_id] + self.consensus_gain * (mean_estimate - current[drone.drone_id])
-            new_values[drone.drone_id] = float(new_value)
-            max_diff = max(max_diff, abs(new_value - current[drone.drone_id]))
-            neighbor_info[drone.drone_id] = {
-                "neighbors": [n.drone_id for n in neighbors],
-                "mean": mean_estimate,
-                "old": current[drone.drone_id],
-                "new": float(new_value),
-            }
+        # 2. Update all drones
+        for drone in self.drones:
+            drone.estimate_r0 = new_estimates[drone.drone_id]
 
-        for drone in valid_drones:
-            drone.estimate_r0 = new_values[drone.drone_id]
-
-        if iteration_index is not None and iteration_total is not None:
-            ordered_ids = [d.drone_id for d in valid_drones]
-            details = []
-            for drone_id in ordered_ids:
-                info = neighbor_info[drone_id]
-                neighbor_str = ",".join(info["neighbors"])
-                details.append(
-                    f"{drone_id}:{info['old']:.6f}->{info['new']:.6f} "
-                    f"(mean={info['mean']:.6f}, n=[{neighbor_str}])"
-                )
-            print(
-                f"  Consensus iter {iteration_index}/{iteration_total} | "
-                f"max_diff={max_diff:.2e} | " + " ; ".join(details)
-            )
-
-        if self._current_measure_trace is not None:
-            for drone in self.drones:
-                self._current_measure_trace[drone.drone_id].append(float(drone.estimate_r0))
-
-        # The final estimate after the frame is the agreed consensus state for
-        # this single iteration. It will be used as the starting point on the
-        # next frame.
         return 1, max_diff
 
-    def _update_neighbor_drones(self, consensus_drones):
-        """
-        Let non-participating drones move toward nearby drones that already
-        hold a radius estimate, propagating the estimate across multiple hops.
-        """
-        if not consensus_drones:
-            return []
-
-        source_ids = {drone.drone_id for drone in consensus_drones}
-        source_estimates = {drone.drone_id: float(drone.estimate_r0) for drone in consensus_drones}
-        source_paths = {drone.drone_id: [drone.drone_id] for drone in consensus_drones}
-        updated_drones = []
-        max_hops = max(1, len(self.drones) - 1)
-
-        for hop_idx in range(max_hops):
-            round_updates = []
-            round_source_ids = set(source_ids)
-            hop_number = hop_idx + 1
-
-            for drone in self.drones:
-                if drone.drone_id in round_source_ids:
-                    continue
-
-                nearby_sources = [
-                    other
-                    for other in self.drones
-                    if other.drone_id in round_source_ids
-                    and float(np.hypot(drone.x - other.x, drone.y - other.y)) <= self.communication_radius
-                ]
-                if not nearby_sources:
-                    continue
-
-                nearby_distances = np.array(
-                    [np.hypot(drone.x - other.x, drone.y - other.y) for other in nearby_sources],
-                    dtype=float,
-                )
-                nearby_estimates = np.array([source_estimates[other.drone_id] for other in nearby_sources], dtype=float)
-                weights = 1.0 / np.maximum(nearby_distances, 1e-6)
-                neighbor_estimate = float(np.average(nearby_estimates, weights=weights))
-                parent_source = nearby_sources[int(np.argmin(nearby_distances))]
-
-                new_r0 = float(drone.estimate_r0 + self.neighbor_gain * (neighbor_estimate - drone.estimate_r0))
-                round_updates.append((drone, neighbor_estimate, new_r0, parent_source.drone_id))
-
-            if not round_updates:
-                break
-
-            hop_messages = []
-            for drone, neighbor_estimate, new_r0, parent_id in round_updates:
-                drone.estimate_r0 = new_r0
-                drone.has_radius_estimate = True
-                source_ids.add(drone.drone_id)
-                source_estimates[drone.drone_id] = new_r0
-                parent_chain = list(source_paths.get(parent_id, [parent_id]))
-                source_paths[drone.drone_id] = parent_chain + [drone.drone_id]
-                updated_drones.append((drone.drone_id, neighbor_estimate, new_r0))
-                chain_str = "<-".join(reversed(source_paths[drone.drone_id]))
-                hop_messages.append(
-                    f"{chain_str} (new={new_r0:.6f})"
-                )
-
-            print(
-                f"  Neighbor hop {hop_number}: "
-                + " ; ".join(hop_messages)
-            )
-
-        return updated_drones
+    def _update_communication_topology(self):
+        """Update the neighbors list for each drone based on current positions."""
+        for drone in self.drones:
+            drone.neighbors = self._communication_neighbors(drone, [d for d in self.drones if d != drone])
 
     def step(self):
         """Sense the spill edge, estimate radii, run consensus, then move the drones."""
@@ -623,9 +538,11 @@ class SimulationEngine:
             print(f"Frame {self.frame} - CONSENSUS ONLY FRAME:")
 
         # 1. Local edge detection and radius estimation, performed only on
-        # measurement frames. On skipped frames we carry forward the last
-        # recorded measurement history without touching the live drone state.
+        # measurement frames.
         for drone in self.drones:
+            # Reset measure flag for this step
+            drone.has_measure = False
+            
             history = self.estimates_history[drone.drone_id]
             history["x0"].append(drone.estimate_x0)
             history["y0"].append(drone.estimate_y0)
@@ -674,30 +591,16 @@ class SimulationEngine:
             print(f"Measurement start radii: {start_snapshot}")
 
         # 2. Consensus over the local estimates.
-        consensus_drones = self._select_consensus_drones()
-        consensus_ids = ", ".join(d.drone_id for d in consensus_drones) if consensus_drones else "none"
-        print(
-            f"Consensus participants (oil_fraction >= {self.consensus_oil_fraction_threshold:.2f}): "
-            f"{consensus_ids}"
-        )
+        self._update_communication_topology()
+        
         max_diff = 0.0
         for iter_idx in range(self.consensus_iters):
-            _, diff = self._run_consensus(iteration_index=iter_idx + 1, iteration_total=self.consensus_iters)
+            _, diff = self._run_consensus()
             max_diff = max(max_diff, diff)
 
         # Record the state after the active consensus step.
         for drone in self.drones:
             self.estimates_history[drone.drone_id]["r0_consensus"].append(drone.estimate_r0)
-
-        updated_neighbors = self._update_neighbor_drones(consensus_drones)
-        if updated_neighbors:
-            for drone_id, neighbor_estimate, new_r0 in updated_neighbors:
-                print(
-                    f"{drone_id}: neighbor update from {neighbor_estimate:.6f}, "
-                    f"new r0 = {new_r0:.6f}"
-                )
-        else:
-            print("Neighbor update: no non-participating drones had a nearby consensus source.")
 
         print(f"AFTER CONSENSUS ({self.consensus_iters} iters/frame, max_diff={max_diff:.2e}):")
         for drone in self.drones:

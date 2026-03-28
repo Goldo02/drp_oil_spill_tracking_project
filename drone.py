@@ -39,6 +39,11 @@ class Drone:
         self.last_exploration_target = None
         self.exploration_direction = None
         self.exploration_speed = 0.0
+        
+        # Consolidation for consensus requirements
+        self.has_measure = False
+        self.local_measure = 0.0
+        self.neighbors = []
 
     def get_gps_pos(self):
         """Returns noisy (x, y) coordinates."""
