@@ -25,6 +25,7 @@ class Drone:
         self.estimate_x0 = true_x0
         self.estimate_y0 = true_y0
         self.estimate_r0 = 1.0
+        self.has_radius_estimate = False
         self.edge_detected = False
         self.last_gradient_peak = None
         self.last_edge_point = None
@@ -32,6 +33,9 @@ class Drone:
         self.u_x = 0.0
         self.u_y = 0.0
         self.last_voronoi_target = None
+        self.last_exploration_target = None
+        self.exploration_direction = None
+        self.exploration_speed = 0.0
 
     def get_gps_pos(self):
         """Returns noisy (x, y) coordinates."""

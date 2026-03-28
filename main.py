@@ -45,17 +45,13 @@ def run_multi_drone_simulation(
         fully_connected=fully_connected,
     )
     
-    # 3. Add Drones with random start positions outside the circle, not too far
-    r0 = spill.r0
-    for i in range(5):
-        angle = np.random.uniform(0, 2 * np.pi)
-        dist = np.random.uniform(r0 + 0.1, r0 + 2.5)
-        start_x = spill.x0 + dist * np.cos(angle)
-        start_y = spill.y0 + dist * np.sin(angle)
-        # Ensure within map bounds
-        start_x = np.clip(start_x, sim_map.xlim[0], sim_map.xlim[1])
-        start_y = np.clip(start_y, sim_map.ylim[0], sim_map.ylim[1])
-        engine.add_drone(drone_id=f"D{i}", x=start_x, y=start_y)
+    # 3. Add drones at random grid positions across the map.
+    #    Starting positions are fully random, not constrained to the spill exterior.
+    grid_positions = np.column_stack((sim_map.X.ravel(), sim_map.Y.ravel()))
+    selected_indices = np.random.choice(len(grid_positions), size=5, replace=False)
+    for i, idx in enumerate(selected_indices):
+        start_x, start_y = grid_positions[idx]
+        engine.add_drone(drone_id=f"D{i}", x=float(start_x), y=float(start_y))
     
     # 4. Setup Visualization (only if enabled)
     viz = None

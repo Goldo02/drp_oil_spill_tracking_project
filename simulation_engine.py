@@ -50,6 +50,8 @@ class SimulationEngine:
         self.control_gain = float(control_gain)
         self.max_speed = float(max_speed)
         self.voronoi_grid_step = max(1, int(voronoi_grid_step))
+        self.boundary_detection_oil_fraction_min = 0.02
+        self.exploration_oil_fraction_threshold = 0.98
 
         dx = self.sim_map.x_coords[1] - self.sim_map.x_coords[0] if len(self.sim_map.x_coords) > 1 else 1.0
         dy = self.sim_map.y_coords[1] - self.sim_map.y_coords[0] if len(self.sim_map.y_coords) > 1 else 1.0
@@ -90,6 +92,9 @@ class SimulationEngine:
             true_y0=self.true_y0,
             max_speed=self.max_speed,
         )
+        angle = float(np.random.uniform(0.0, 2.0 * np.pi))
+        drone.exploration_direction = np.array([np.cos(angle), np.sin(angle)], dtype=float)
+        drone.exploration_speed = float(0.5 * self.max_speed)
         self.drones.append(drone)
         self.estimates_history[drone_id] = {
             "x": [],
@@ -111,7 +116,47 @@ class SimulationEngine:
             "u_y": [],
             "voronoi_cx": [],
             "voronoi_cy": [],
+            "exploration_x": [],
+            "exploration_y": [],
         }
+
+    def _bounce_exploration_command(self, drone):
+        """Return a persistent exploration command reflected at map bounds."""
+        direction = getattr(drone, "exploration_direction", None)
+        speed = float(getattr(drone, "exploration_speed", 0.0))
+        if direction is None or speed <= 0.0:
+            angle = float(np.random.uniform(0.0, 2.0 * np.pi))
+            direction = np.array([np.cos(angle), np.sin(angle)], dtype=float)
+            drone.exploration_direction = direction
+            drone.exploration_speed = float(0.5 * self.max_speed)
+            speed = float(drone.exploration_speed)
+
+        direction = np.asarray(direction, dtype=float)
+        norm = float(np.linalg.norm(direction))
+        if norm <= 1e-12:
+            direction = np.array([1.0, 0.0], dtype=float)
+            norm = 1.0
+        direction = direction / norm
+
+        command = direction * speed
+        xmin, xmax, ymin, ymax = drone.map_bounds
+        next_x = float(drone.x + command[0] * self.dt)
+        next_y = float(drone.y + command[1] * self.dt)
+
+        bounced = False
+        if next_x < xmin or next_x > xmax:
+            direction[0] *= -1.0
+            command[0] *= -1.0
+            bounced = True
+        if next_y < ymin or next_y > ymax:
+            direction[1] *= -1.0
+            command[1] *= -1.0
+            bounced = True
+
+        if bounced:
+            drone.exploration_direction = direction / max(float(np.linalg.norm(direction)), 1e-12)
+
+        return command
 
     def _communication_neighbors(self, drone, candidates):
         """Return candidate drones within the communication radius or everyone in fully-connected mode."""
@@ -148,6 +193,26 @@ class SimulationEngine:
                 "r0_local": np.nan,
             }
 
+        oil_fraction = float(np.mean(camera_view >= self.oil_cell_threshold))
+        if (
+            oil_fraction <= self.boundary_detection_oil_fraction_min
+            or oil_fraction >= self.exploration_oil_fraction_threshold
+        ):
+            drone.edge_detected = False
+            drone.last_edge_point = None
+            drone.last_gradient_peak = 0.0
+            drone.last_oil_fraction = oil_fraction
+            return {
+                "edge_x": np.nan,
+                "edge_y": np.nan,
+                "edge_detected": False,
+                "gradient_magnitude": 0.0,
+                "gradient_peak": 0.0,
+                "oil_fraction": oil_fraction,
+                "r0_local_raw": np.nan,
+                "r0_local": np.nan,
+            }
+
         # Rebuild the local world-coordinate frame around the drone position.
         dx = self.sim_map.x_coords[1] - self.sim_map.x_coords[0] if len(self.sim_map.x_coords) > 1 else 1.0
         dy = self.sim_map.y_coords[1] - self.sim_map.y_coords[0] if len(self.sim_map.y_coords) > 1 else 1.0
@@ -162,6 +227,30 @@ class SimulationEngine:
 
         local_x_coords = self.sim_map.x_coords[i_min:i_max]
         local_y_coords = self.sim_map.y_coords[j_min:j_max]
+
+        # If the camera footprint is clipped by the map boundary, zero padding
+        # can create artificial edges. In that case we skip edge estimation and
+        # keep the drone in exploration mode.
+        if (
+            i_min == 0
+            or j_min == 0
+            or i_max == len(self.sim_map.x_coords)
+            or j_max == len(self.sim_map.y_coords)
+        ):
+            drone.edge_detected = False
+            drone.last_edge_point = None
+            drone.last_gradient_peak = 0.0
+            drone.last_oil_fraction = oil_fraction
+            return {
+                "edge_x": np.nan,
+                "edge_y": np.nan,
+                "edge_detected": False,
+                "gradient_magnitude": 0.0,
+                "gradient_peak": 0.0,
+                "oil_fraction": oil_fraction,
+                "r0_local_raw": np.nan,
+                "r0_local": np.nan,
+            }
 
         # Smooth the drone's sensing matrix first, then apply Canny.
         edges = detect_edges(
@@ -211,9 +300,10 @@ class SimulationEngine:
         r0_local = raw_r0_local
 
         drone.edge_detected = True
+        drone.has_radius_estimate = True
         drone.last_edge_point = nearest_edge_point
         drone.last_gradient_peak = float(np.count_nonzero(edges))
-        drone.last_oil_fraction = float(np.mean(camera_view >= self.oil_cell_threshold))
+        drone.last_oil_fraction = oil_fraction
         drone.estimate_r0 = r0_local
 
         return {
@@ -222,7 +312,7 @@ class SimulationEngine:
             "edge_detected": True,
             "gradient_magnitude": float(np.count_nonzero(edges)),
             "gradient_peak": float(np.count_nonzero(edges)),
-            "oil_fraction": float(np.mean(camera_view >= self.oil_cell_threshold)),
+            "oil_fraction": oil_fraction,
             "r0_local_raw": raw_r0_local,
             "r0_local": r0_local,
         }
@@ -261,22 +351,39 @@ class SimulationEngine:
         """Single-integrator motion toward the weighted Voronoi centroid."""
         targets = self._compute_voronoi_targets()
         for drone in self.drones:
-            target = np.asarray(targets.get(drone.drone_id, (drone.x, drone.y)), dtype=float)
-            error = target - np.array([drone.x, drone.y], dtype=float)
-            command = self.control_gain * error
-            speed = float(np.linalg.norm(command))
-            if self.max_speed > 0 and speed > self.max_speed:
-                command = command / speed * self.max_speed
+            if getattr(drone, "has_radius_estimate", False):
+                target = np.asarray(targets.get(drone.drone_id, (drone.x, drone.y)), dtype=float)
+                error = target - np.array([drone.x, drone.y], dtype=float)
+                command = self.control_gain * error
+                speed = float(np.linalg.norm(command))
+                if self.max_speed > 0 and speed > self.max_speed:
+                    command = command / speed * self.max_speed
 
-            drone.last_voronoi_target = (float(target[0]), float(target[1]))
+                drone.last_voronoi_target = (float(target[0]), float(target[1]))
+                drone.last_exploration_target = None
+            else:
+                command = self._bounce_exploration_command(drone)
+                drone.last_exploration_target = (float(drone.x + command[0]), float(drone.y + command[1]))
+                drone.last_voronoi_target = None
+
             drone.set_control(float(command[0]), float(command[1]))
             drone.update_position(self.dt, map_bounds=drone.map_bounds, max_speed=self.max_speed)
 
             history = self.estimates_history[drone.drone_id]
             history["u_x"].append(float(drone.u_x))
             history["u_y"].append(float(drone.u_y))
-            history["voronoi_cx"].append(float(target[0]))
-            history["voronoi_cy"].append(float(target[1]))
+            if getattr(drone, "has_radius_estimate", False):
+                history["voronoi_cx"].append(float(drone.last_voronoi_target[0]))
+                history["voronoi_cy"].append(float(drone.last_voronoi_target[1]))
+            else:
+                history["voronoi_cx"].append(np.nan)
+                history["voronoi_cy"].append(np.nan)
+            history["exploration_x"].append(
+                float(drone.last_exploration_target[0]) if drone.last_exploration_target is not None else np.nan
+            )
+            history["exploration_y"].append(
+                float(drone.last_exploration_target[1]) if drone.last_exploration_target is not None else np.nan
+            )
             history["x"].append(float(drone.x))
             history["y"].append(float(drone.y))
 
@@ -357,32 +464,69 @@ class SimulationEngine:
 
     def _update_neighbor_drones(self, consensus_drones):
         """
-        Let non-participating drones move toward nearby consensus participants.
+        Let non-participating drones move toward nearby drones that already
+        hold a radius estimate, propagating the estimate across multiple hops.
         """
         if not consensus_drones:
             return []
 
+        source_ids = {drone.drone_id for drone in consensus_drones}
+        source_estimates = {drone.drone_id: float(drone.estimate_r0) for drone in consensus_drones}
+        source_paths = {drone.drone_id: [drone.drone_id] for drone in consensus_drones}
         updated_drones = []
-        for drone in self.drones:
-            if drone in consensus_drones:
-                continue
+        max_hops = max(1, len(self.drones) - 1)
 
-            nearby_drones = self._communication_neighbors(drone, consensus_drones)
-            if not nearby_drones:
-                continue
+        for hop_idx in range(max_hops):
+            round_updates = []
+            round_source_ids = set(source_ids)
+            hop_number = hop_idx + 1
 
-            nearby_distances = np.array(
-                [np.hypot(drone.x - other.x, drone.y - other.y) for other in nearby_drones],
-                dtype=float,
+            for drone in self.drones:
+                if drone.drone_id in round_source_ids:
+                    continue
+
+                nearby_sources = [
+                    other
+                    for other in self.drones
+                    if other.drone_id in round_source_ids
+                    and float(np.hypot(drone.x - other.x, drone.y - other.y)) <= self.communication_radius
+                ]
+                if not nearby_sources:
+                    continue
+
+                nearby_distances = np.array(
+                    [np.hypot(drone.x - other.x, drone.y - other.y) for other in nearby_sources],
+                    dtype=float,
+                )
+                nearby_estimates = np.array([source_estimates[other.drone_id] for other in nearby_sources], dtype=float)
+                weights = 1.0 / np.maximum(nearby_distances, 1e-6)
+                neighbor_estimate = float(np.average(nearby_estimates, weights=weights))
+                parent_source = nearby_sources[int(np.argmin(nearby_distances))]
+
+                new_r0 = float(drone.estimate_r0 + self.neighbor_gain * (neighbor_estimate - drone.estimate_r0))
+                round_updates.append((drone, neighbor_estimate, new_r0, parent_source.drone_id))
+
+            if not round_updates:
+                break
+
+            hop_messages = []
+            for drone, neighbor_estimate, new_r0, parent_id in round_updates:
+                drone.estimate_r0 = new_r0
+                drone.has_radius_estimate = True
+                source_ids.add(drone.drone_id)
+                source_estimates[drone.drone_id] = new_r0
+                parent_chain = list(source_paths.get(parent_id, [parent_id]))
+                source_paths[drone.drone_id] = parent_chain + [drone.drone_id]
+                updated_drones.append((drone.drone_id, neighbor_estimate, new_r0))
+                chain_str = "<-".join(reversed(source_paths[drone.drone_id]))
+                hop_messages.append(
+                    f"{chain_str} (new={new_r0:.6f})"
+                )
+
+            print(
+                f"  Neighbor hop {hop_number}: "
+                + " ; ".join(hop_messages)
             )
-            nearby_estimates = np.array([other.estimate_r0 for other in nearby_drones], dtype=float)
-            weights = 1.0 / np.maximum(nearby_distances, 1e-6)
-            neighbor_estimate = float(np.average(nearby_estimates, weights=weights))
-
-            drone.estimate_r0 = float(
-                drone.estimate_r0 + self.neighbor_gain * (neighbor_estimate - drone.estimate_r0)
-            )
-            updated_drones.append((drone.drone_id, neighbor_estimate, drone.estimate_r0))
 
         return updated_drones
 
@@ -485,12 +629,14 @@ class SimulationEngine:
             print(f"{drone.drone_id}: r0 = {drone.estimate_r0:.6f}")
 
         self._apply_voronoi_control()
-        print("VORONOI CONTROL:")
+        print("CONTROL:")
         for drone in self.drones:
+            mode = "voronoi" if getattr(drone, "has_radius_estimate", False) else "explore"
+            target = drone.last_voronoi_target if mode == "voronoi" else drone.last_exploration_target
             print(
                 f"{drone.drone_id}: pos=({drone.x:.3f}, {drone.y:.3f}), "
                 f"u=({drone.u_x:.3f}, {drone.u_y:.3f}), "
-                f"target={drone.last_voronoi_target}"
+                f"mode={mode}, target={target}"
             )
 
         if measurement_frame:
