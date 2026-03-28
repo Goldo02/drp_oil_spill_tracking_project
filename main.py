@@ -20,6 +20,11 @@ def run_multi_drone_simulation(
     fully_connected=False,
     communication_radius_cells=205,
     measure_every=3,
+    consensus_epsilon=1e-3,
+    boundary_threshold=float("nan"),
+    regularization_max_points=40,
+    regularization_iterations=30,
+    regularization_epsilon=1e-3,
 ):
     if visualize:
         matplotlib.use("TkAgg")
@@ -51,6 +56,12 @@ def run_multi_drone_simulation(
         occupancy_threshold=0.5,
         temporal_alpha=0.05,
         consensus_rounds=10,
+        consensus_epsilon=consensus_epsilon,
+        boundary_tracking=True,
+        boundary_threshold=boundary_threshold,
+        boundary_regularization_max_points=regularization_max_points,
+        boundary_regularization_iterations=regularization_iterations,
+        boundary_regularization_epsilon=regularization_epsilon,
         verbose=True,
     )
 
@@ -69,16 +80,15 @@ def run_multi_drone_simulation(
         start_y = np.clip(start_y, sim_map.ylim[0], sim_map.ylim[1])
         engine.add_drone(drone_id=f"D{i}", x=start_x, y=start_y, gps_noise=0.03, camera_noise=0.03)
 
-    viz = None
-    if visualize:
-        from visualization import Visualizer
+    from visualization import Visualizer
 
-        viz = Visualizer(
-            sim_map,
-            spill,
-            communication_radius=None if fully_connected else engine.communication_radius,
-            show_communication_radius=not fully_connected,
-        )
+    viz = Visualizer(
+        sim_map,
+        spill,
+        communication_radius=None if fully_connected else engine.communication_radius,
+        show_communication_radius=not fully_connected,
+    )
+    if visualize:
         plt.show(block=False)
     else:
         print("Visualization disabled. Headless mode (Agg backend).")
@@ -110,9 +120,9 @@ def run_multi_drone_simulation(
 
     print("Simulation finished.")
 
-    if visualize:
-        print("Saving the final scene to 'final_simulation_state.png'...")
-        plt.savefig("final_simulation_state.png", bbox_inches="tight")
+    viz.render(engine.drones, pause=False)
+    print("Saving the final scene to 'final_simulation_state.png'...")
+    plt.savefig("final_simulation_state.png", bbox_inches="tight")
 
     error_history = np.asarray(engine.error_history, dtype=float)
     fig, ax = plt.subplots(figsize=(12, 5))
@@ -177,6 +187,32 @@ def run_multi_drone_simulation(
     plt.savefig("final_occupancy_grid.png", bbox_inches="tight")
     print("Final occupancy grid saved to 'final_occupancy_grid.png'")
 
+    from boundary_regularization import save_regularization_plots
+
+    regularization_result = engine.latest_boundary_result
+    if regularization_result is None:
+        from boundary_regularization import lloyd_regularize_boundary_points
+
+        regularization_result = lloyd_regularize_boundary_points(
+            final_grid,
+            x_min=engine.x_min,
+            y_min=engine.y_min,
+            resolution=engine.resolution,
+            threshold=boundary_threshold,
+            max_points=regularization_max_points,
+            max_iterations=regularization_iterations,
+            epsilon=regularization_epsilon,
+            bounding_box=(engine.x_min, engine.x_max, engine.y_min, engine.y_max),
+        )
+    save_regularization_plots(regularization_result)
+    print("Boundary regularization plots saved to 'boundary_regularization_points.png' and 'boundary_regularization_convergence.png'")
+    print(f"Boundary threshold used: {regularization_result['threshold']:.6f}")
+    print(f"Spacing variance before: {regularization_result['spacing_variance_before']:.6f}")
+    print(f"Spacing variance after:  {regularization_result['spacing_variance_after']:.6f}")
+    if regularization_result["movement_history"]:
+        print(f"Regularization iterations: {len(regularization_result['movement_history'])}")
+        print(f"Final regularization movement: {regularization_result['movement_history'][-1]:.6f}")
+
     if error_history.size:
         print("\n=== FINAL CONSENSUS RESULTS ===")
         print(f"Initial error: {error_history[0]:.6f}")
@@ -215,6 +251,36 @@ if __name__ == "__main__":
         default=3,
         help="Perform a new sensing update every N frames",
     )
+    parser.add_argument(
+        "--consensus-epsilon",
+        type=float,
+        default=1e-3,
+        help="Stop consensus early once disagreement drops below this threshold",
+    )
+    parser.add_argument(
+        "--boundary-threshold",
+        type=float,
+        default=float("nan"),
+        help="Threshold used to extract boundary points from the final occupancy grid; NaN means auto",
+    )
+    parser.add_argument(
+        "--regularization-max-points",
+        type=int,
+        default=40,
+        help="Maximum number of boundary points kept for CVT regularization",
+    )
+    parser.add_argument(
+        "--regularization-iterations",
+        type=int,
+        default=30,
+        help="Maximum number of Lloyd iterations for boundary regularization",
+    )
+    parser.add_argument(
+        "--regularization-epsilon",
+        type=float,
+        default=1e-3,
+        help="Convergence threshold on the mean point movement",
+    )
     args = parser.parse_args()
 
     run_multi_drone_simulation(
@@ -224,4 +290,9 @@ if __name__ == "__main__":
         fully_connected=(args.fully_connected and not args.range_based),
         communication_radius_cells=args.communication_radius_cells,
         measure_every=args.measure_every,
+        consensus_epsilon=args.consensus_epsilon,
+        boundary_threshold=args.boundary_threshold,
+        regularization_max_points=args.regularization_max_points,
+        regularization_iterations=args.regularization_iterations,
+        regularization_epsilon=args.regularization_epsilon,
     )

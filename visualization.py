@@ -32,6 +32,7 @@ class Visualizer:
         self.drone_patches = {} # {drone_id: [patch_comm, patch_body, patch_sensor]}
         self.texts = {} # {drone_id: text_label}
         self.edge_markers = {} # {drone_id: [scatter, annotation]}
+        self.target_markers = {} # {drone_id: target scatter}
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
 
@@ -45,6 +46,9 @@ class Visualizer:
             for artist in self.edge_markers[drone.drone_id]:
                 if artist is not None:
                     artist.remove()
+
+        if drone.drone_id in self.target_markers:
+            self.target_markers[drone.drone_id].remove()
 
         patches = []
 
@@ -112,7 +116,25 @@ class Visualizer:
                 zorder=7,
             )
 
+        target_marker = None
+        if getattr(drone, "boundary_target", None) is not None:
+            target = drone.boundary_target
+            target_marker = self.ax.scatter(
+                [target[0]],
+                [target[1]],
+                s=45,
+                c="crimson",
+                marker="o",
+                edgecolors="white",
+                linewidths=0.7,
+                zorder=6,
+            )
+
         self.edge_markers[drone.drone_id] = [edge_marker, edge_label]
+        if target_marker is not None:
+            self.target_markers[drone.drone_id] = target_marker
+        elif drone.drone_id in self.target_markers:
+            del self.target_markers[drone.drone_id]
 
     def render(self, drones, pause=True):
         for drone in drones:

@@ -4,7 +4,11 @@ from sensors import CameraSensor, GPSSensor
 
 
 class Drone:
-    """Static drone agent for distributed occupancy grid mapping."""
+    """Drone agent for distributed occupancy grid mapping.
+
+    The drone keeps a shared occupancy grid and a lightweight motion model so
+    that the simulation can visualize actual movement between frames.
+    """
 
     def __init__(
         self,
@@ -28,6 +32,20 @@ class Drone:
         self.gps = GPSSensor(noise_std=gps_noise)
         self.camera = CameraSensor(size=sensor_size, noise_std=camera_noise)
 
+        # Motion state used to make the drone move around the spill during the
+        # simulation. The anchor is configured by the simulation engine after
+        # creation so all drones orbit around the same spill center.
+        self.motion_anchor = None
+        self.target_radius = None
+        self.heading = float(np.random.uniform(0.0, 2.0 * np.pi))
+        self.speed = float(np.random.uniform(0.02, 0.05))
+        self.turn_noise = float(np.random.uniform(0.01, 0.03))
+        self.radial_gain = 0.08
+        self.boundary_target = None
+        self.boundary_tracking_gain = 0.22
+        self.boundary_max_step = 0.18
+        self.boundary_tolerance = 0.05
+
         # Each drone keeps a full copy of the global occupancy grid.
         self.grid = np.zeros(self.grid_shape, dtype=float)
 
@@ -41,6 +59,76 @@ class Drone:
     def get_gps_pos(self):
         """Return noisy GPS coordinates."""
         return self.gps.sense((self.x, self.y))
+
+    def configure_motion(self, anchor_x, anchor_y, target_radius=None, speed=None, turn_noise=None):
+        """Configure the motion model used during the simulation."""
+        self.motion_anchor = np.array([float(anchor_x), float(anchor_y)], dtype=float)
+        if target_radius is not None:
+            self.target_radius = float(target_radius)
+        if speed is not None:
+            self.speed = float(speed)
+        if turn_noise is not None:
+            self.turn_noise = float(turn_noise)
+
+    def set_boundary_target(self, target_x, target_y):
+        """Assign a target point on the regularized boundary."""
+        self.boundary_target = np.array([float(target_x), float(target_y)], dtype=float)
+
+    def clear_boundary_target(self):
+        """Clear the current boundary target so the drone falls back to exploration."""
+        self.boundary_target = None
+
+    def move(self, x_min=None, x_max=None, y_min=None, y_max=None):
+        """Advance the drone position by one small motion step."""
+        if self.boundary_target is not None:
+            # First-order target tracking keeps the drone on the regularized
+            # boundary samples produced by the Voronoi/Lloyd stage.
+            offset = np.asarray(self.boundary_target, dtype=float) - np.array([self.x, self.y], dtype=float)
+            distance = float(np.linalg.norm(offset))
+            if distance <= self.boundary_tolerance:
+                self.x = float(self.boundary_target[0])
+                self.y = float(self.boundary_target[1])
+            else:
+                step_length = min(self.boundary_tracking_gain * distance, self.boundary_max_step)
+                step = (offset / distance) * step_length
+                self.x += float(step[0])
+                self.y += float(step[1])
+                self.heading = float(np.arctan2(offset[1], offset[0]))
+        else:
+            # A small random turn gives each drone a slightly different track.
+            self.heading += float(np.random.normal(0.0, self.turn_noise))
+
+            step_x = self.speed * float(np.cos(self.heading))
+            step_y = self.speed * float(np.sin(self.heading))
+            self.x += step_x
+            self.y += step_y
+
+            # Keep drones on a loose ring around the spill center so they keep
+            # observing the boundary throughout the simulation.
+            if self.motion_anchor is not None and self.target_radius is not None:
+                offset = np.array([self.x, self.y], dtype=float) - self.motion_anchor
+                distance = float(np.linalg.norm(offset))
+                if distance > 1e-12:
+                    radial_error = self.target_radius - distance
+                    correction = self.radial_gain * radial_error
+                    offset /= distance
+                    self.x += correction * offset[0]
+                    self.y += correction * offset[1]
+
+        # Reflect from the simulation boundaries so drones remain visible.
+        if x_min is not None and self.x < x_min:
+            self.x = x_min
+            self.heading = np.pi - self.heading
+        elif x_max is not None and self.x > x_max:
+            self.x = x_max
+            self.heading = np.pi - self.heading
+
+        if y_min is not None and self.y < y_min:
+            self.y = y_min
+            self.heading = -self.heading
+        elif y_max is not None and self.y > y_max:
+            self.y = y_max
+            self.heading = -self.heading
 
     def _camera_window(self, world_field, x_coords, y_coords):
         """Extract the local sensing window in global coordinates."""
