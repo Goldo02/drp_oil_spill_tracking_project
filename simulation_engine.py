@@ -21,6 +21,7 @@ class SimulationEngine:
         control_gain=1.8,
         max_speed=0.6,
         voronoi_grid_step=8,
+        boundary_tangent_band=0.35,
     ):
         self.sim_map = sim_map
         self.oil_spill = oil_spill
@@ -50,8 +51,9 @@ class SimulationEngine:
         self.control_gain = float(control_gain)
         self.max_speed = float(max_speed)
         self.voronoi_grid_step = max(1, int(voronoi_grid_step))
-        self.boundary_detection_oil_fraction_min = 0.02
-        self.exploration_oil_fraction_threshold = 0.98
+        self.boundary_tangent_band = float(boundary_tangent_band)
+        self.boundary_detection_oil_fraction_min = 0.05
+        self.exploration_oil_fraction_threshold = 0.95
 
         dx = self.sim_map.x_coords[1] - self.sim_map.x_coords[0] if len(self.sim_map.x_coords) > 1 else 1.0
         dy = self.sim_map.y_coords[1] - self.sim_map.y_coords[0] if len(self.sim_map.y_coords) > 1 else 1.0
@@ -62,7 +64,8 @@ class SimulationEngine:
         self.control_y_coords = self._sample_axis(self.sim_map.y_coords, self.voronoi_grid_step)
         self.control_X, self.control_Y = np.meshgrid(self.control_x_coords, self.control_y_coords)
         self.control_points = np.column_stack((self.control_X.ravel(), self.control_Y.ravel()))
-        self.control_density = self._boundary_density(self.control_X, self.control_Y).ravel()
+        # No ground-truth radius is used in control; this is kept as a neutral fallback.
+        self.control_density = np.zeros_like(self.control_X, dtype=float).ravel()
 
         # History for plotting local measurements and consensus convergence.
         self.estimates_history = {}
@@ -75,9 +78,23 @@ class SimulationEngine:
             sampled = np.append(sampled, float(coords[-1]))
         return sampled
 
-    def _boundary_density(self, X, Y):
+    def _boundary_density(self, X, Y, x0=None, y0=None, r0=None):
         """Weight the Voronoi centroids toward the spill boundary."""
-        field = self.oil_spill.field(X, Y)
+        if x0 is None:
+            x0 = self.oil_spill.x0
+        if y0 is None:
+            y0 = self.oil_spill.y0
+
+        if r0 is None:
+            return np.zeros_like(X, dtype=float)
+
+        dist = np.sqrt((X - x0) ** 2 + (Y - y0) ** 2)
+        sigma = float(getattr(self.oil_spill, "sigma", 0.5))
+        field = np.where(
+            dist <= r0,
+            1.0,
+            np.exp(-((dist - r0) ** 2) / (2 * sigma**2)),
+        )
         return np.clip(4.0 * field * (1.0 - field), 0.0, None)
 
     def add_drone(self, drone_id, x, y):
@@ -179,9 +196,9 @@ class SimulationEngine:
         )
         if camera_view.size == 0:
             drone.edge_detected = False
-            drone.last_edge_point = None
             drone.last_gradient_peak = None
             drone.last_oil_fraction = None
+            drone.last_r0_local = None
             return {
                 "edge_x": np.nan,
                 "edge_y": np.nan,
@@ -199,9 +216,9 @@ class SimulationEngine:
             or oil_fraction >= self.exploration_oil_fraction_threshold
         ):
             drone.edge_detected = False
-            drone.last_edge_point = None
             drone.last_gradient_peak = 0.0
             drone.last_oil_fraction = oil_fraction
+            drone.last_r0_local = None
             return {
                 "edge_x": np.nan,
                 "edge_y": np.nan,
@@ -238,9 +255,9 @@ class SimulationEngine:
             or j_max == len(self.sim_map.y_coords)
         ):
             drone.edge_detected = False
-            drone.last_edge_point = None
             drone.last_gradient_peak = 0.0
             drone.last_oil_fraction = oil_fraction
+            drone.last_r0_local = None
             return {
                 "edge_x": np.nan,
                 "edge_y": np.nan,
@@ -264,9 +281,9 @@ class SimulationEngine:
 
         if edge_pixels.size == 0:
             drone.edge_detected = False
-            drone.last_edge_point = None
             drone.last_gradient_peak = None
             drone.last_oil_fraction = None
+            drone.last_r0_local = None
             return {
                 "edge_x": np.nan,
                 "edge_y": np.nan,
@@ -304,6 +321,7 @@ class SimulationEngine:
         drone.last_edge_point = nearest_edge_point
         drone.last_gradient_peak = float(np.count_nonzero(edges))
         drone.last_oil_fraction = oil_fraction
+        drone.last_r0_local = r0_local
         drone.estimate_r0 = r0_local
 
         return {
@@ -318,7 +336,11 @@ class SimulationEngine:
         }
 
     def _compute_voronoi_targets(self):
-        """Compute one weighted Voronoi centroid per drone on a sampled grid."""
+        """Compute one weighted Voronoi centroid per drone on a sampled grid.
+
+        Each drone uses its own post-consensus radius estimate to weight the
+        centroid of its Voronoi cell.
+        """
         if not self.drones:
             return {}
 
@@ -329,7 +351,6 @@ class SimulationEngine:
         assignment = np.argmin(dist2, axis=1)
 
         targets = {}
-        density = self.control_density
         for idx, drone in enumerate(self.drones):
             mask = assignment == idx
             if not np.any(mask):
@@ -337,7 +358,20 @@ class SimulationEngine:
                 continue
 
             cell_points = points[mask]
-            cell_weights = density[mask]
+            r0_est = getattr(drone, "estimate_r0", None)
+            if r0_est is None:
+                r0_est = 1.0
+            r0_est = float(r0_est)
+            if not np.isfinite(r0_est) or r0_est <= 0.0:
+                r0_est = 1.0
+
+            cell_weights = self._boundary_density(
+                self.control_X,
+                self.control_Y,
+                x0=float(getattr(drone, "estimate_x0", self.true_x0)),
+                y0=float(getattr(drone, "estimate_y0", self.true_y0)),
+                r0=r0_est,
+            ).ravel()[mask]
             weight_sum = float(np.sum(cell_weights))
             if weight_sum <= 1e-12:
                 centroid = np.mean(cell_points, axis=0)
@@ -347,24 +381,72 @@ class SimulationEngine:
 
         return targets
 
+    def _tangential_boundary_command(self, command, drone, gps_pos):
+        """Remove the radial component when the drone is close to the boundary.
+
+        The boundary normal is approximated from the spill center to the drone
+        position, which keeps the motion tangent to a circular spill boundary.
+        """
+        if not getattr(drone, "edge_detected", False):
+            return command, False
+
+        edge_point = getattr(drone, "last_edge_point", None)
+        if edge_point is None:
+            return command, False
+
+        edge_point = np.asarray(edge_point, dtype=float)
+        if not np.all(np.isfinite(edge_point)):
+            return command, False
+
+        boundary_error = edge_point - gps_pos
+        distance_to_edge = float(np.linalg.norm(boundary_error))
+        if distance_to_edge > self.boundary_tangent_band:
+            return command, False
+
+        center = np.array([float(getattr(drone, "estimate_x0", self.true_x0)), float(getattr(drone, "estimate_y0", self.true_y0))], dtype=float)
+        normal = gps_pos - center
+        normal_norm = float(np.linalg.norm(normal))
+        if normal_norm <= 1e-12:
+            normal = edge_point - center
+            normal_norm = float(np.linalg.norm(normal))
+        if normal_norm <= 1e-12:
+            return command, False
+
+        normal_unit = normal / normal_norm
+        tangential_command = command - np.dot(command, normal_unit) * normal_unit
+        tangential_speed = float(np.linalg.norm(tangential_command))
+        if tangential_speed <= 1e-12:
+            return np.zeros_like(command), True
+        return tangential_command, True
+
     def _apply_voronoi_control(self):
-        """Single-integrator motion toward the weighted Voronoi centroid."""
+        """Single-integrator motion toward the weighted Voronoi centroid.
+
+        Each drone uses its own estimated radius to build the weighted Voronoi
+        target. When the drone is near the detected boundary, the command is
+        projected onto the tangent direction so it moves along the contour
+        instead of cutting radially through it.
+        """
         targets = self._compute_voronoi_targets()
         for drone in self.drones:
             if getattr(drone, "has_radius_estimate", False):
                 target = np.asarray(targets.get(drone.drone_id, (drone.x, drone.y)), dtype=float)
-                error = target - np.array([drone.x, drone.y], dtype=float)
-                command = self.control_gain * error
+                gps_pos = np.asarray(drone.get_gps_pos(), dtype=float)
+                command = self.control_gain * (target - gps_pos)
+                command, tangentialized = self._tangential_boundary_command(command, drone, gps_pos)
+                drone.last_boundary_tangential = bool(tangentialized)
+                drone.last_control_mode = "voronoi"
+                drone.last_voronoi_target = (float(target[0]), float(target[1]))
+                drone.last_exploration_target = None
                 speed = float(np.linalg.norm(command))
                 if self.max_speed > 0 and speed > self.max_speed:
                     command = command / speed * self.max_speed
-
-                drone.last_voronoi_target = (float(target[0]), float(target[1]))
-                drone.last_exploration_target = None
             else:
                 command = self._bounce_exploration_command(drone)
                 drone.last_exploration_target = (float(drone.x + command[0]), float(drone.y + command[1]))
                 drone.last_voronoi_target = None
+                drone.last_boundary_tangential = False
+                drone.last_control_mode = "explore"
 
             drone.set_control(float(command[0]), float(command[1]))
             drone.update_position(self.dt, map_bounds=drone.map_bounds, max_speed=self.max_speed)
@@ -631,12 +713,15 @@ class SimulationEngine:
         self._apply_voronoi_control()
         print("CONTROL:")
         for drone in self.drones:
-            mode = "voronoi" if getattr(drone, "has_radius_estimate", False) else "explore"
+            mode = getattr(drone, "last_control_mode", None)
+            if mode is None:
+                mode = "voronoi" if getattr(drone, "has_radius_estimate", False) else "explore"
             target = drone.last_voronoi_target if mode == "voronoi" else drone.last_exploration_target
+            tangential = "tangent" if getattr(drone, "last_boundary_tangential", False) else "none"
             print(
                 f"{drone.drone_id}: pos=({drone.x:.3f}, {drone.y:.3f}), "
                 f"u=({drone.u_x:.3f}, {drone.u_y:.3f}), "
-                f"mode={mode}, target={target}"
+                f"mode={mode}, target={target}, boundary_mode={tangential}"
             )
 
         if measurement_frame:

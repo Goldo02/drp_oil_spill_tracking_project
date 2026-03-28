@@ -29,7 +29,10 @@ class Drone:
         self.edge_detected = False
         self.last_gradient_peak = None
         self.last_edge_point = None
+        self.last_r0_local = None
         self.last_oil_fraction = None
+        self.last_boundary_tangential = False
+        self.last_control_mode = None
         self.u_x = 0.0
         self.u_y = 0.0
         self.last_voronoi_target = None
