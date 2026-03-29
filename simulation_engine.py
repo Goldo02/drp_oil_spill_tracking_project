@@ -254,6 +254,7 @@ class SimulationEngine:
         oil_fraction = float(np.mean(camera_view >= self.oil_cell_threshold))
         if oil_fraction <= self.boundary_detection_oil_fraction_min or oil_fraction >= self.exploration_oil_fraction_threshold:
             drone.edge_detected = False
+            drone.last_nls_points = None
             return None, oil_fraction
 
         dx = self.sim_map.x_coords[1] - self.sim_map.x_coords[0]
@@ -273,6 +274,7 @@ class SimulationEngine:
         edge_pixels = extract_edge_points(edges)
         if edge_pixels.size < 5:
             drone.edge_detected = False
+            drone.last_nls_points = None
             return None, 0.0
 
         local_x, local_y = self.sim_map.x_coords[i_min:i_max], self.sim_map.y_coords[j_min:j_max]
@@ -285,6 +287,7 @@ class SimulationEngine:
         drone.last_edge_point = (float(world_x[np.argmin(dist_to_edges)]), float(world_y[np.argmin(dist_to_edges)]))
         drone.last_gradient_peak = float(np.count_nonzero(edges))
         drone.last_oil_fraction = oil_fraction
+        drone.last_nls_points = points.copy()
         drone.edge_detected = True
         return points, oil_fraction
 

@@ -19,6 +19,7 @@ def run_multi_drone_simulation(
     seed=42,
     fully_connected=False,
     communication_radius_cells=205,
+    show_nls_points=False,
 ):
     if visualize:
         matplotlib.use("TkAgg")
@@ -62,6 +63,7 @@ def run_multi_drone_simulation(
             spill,
             communication_radius=None if fully_connected else engine.communication_radius,
             show_communication_radius=not fully_connected,
+            show_nls_points=show_nls_points,
         )
     else:
         print("Visualization disabled. Headless mode (Agg backend).")
@@ -95,6 +97,7 @@ def run_multi_drone_simulation(
             spill,
             communication_radius=None if fully_connected else engine.communication_radius,
             show_communication_radius=not fully_connected,
+            show_nls_points=show_nls_points,
         )
     
     viz.render(engine.drones, pause=False)
@@ -189,6 +192,11 @@ if __name__ == "__main__":
         default=205,
         help="Communication radius in grid cells when range-based communication is enabled",
     )
+    parser.add_argument(
+        "--show-nls-points",
+        action="store_true",
+        help="Visualize the edge points used for local NLS fitting (in red)",
+    )
     args = parser.parse_args()
 
     run_multi_drone_simulation(
@@ -197,4 +205,5 @@ if __name__ == "__main__":
         seed=args.seed,
         fully_connected=args.fully_connected,
         communication_radius_cells=args.communication_radius_cells,
+        show_nls_points=args.show_nls_points,
     )

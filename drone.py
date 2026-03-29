@@ -40,6 +40,9 @@ class Drone:
         self.exploration_direction = None
         self.exploration_speed = 0.0
         
+        # Points used for local NLS fit (for visualization)
+        self.last_nls_points = None
+        
         # Consolidation for fusion requirements
         self.has_measure = False
         self.confidence_weight = 0.0

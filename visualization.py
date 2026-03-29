@@ -3,11 +3,12 @@ from matplotlib.patches import Circle, RegularPolygon, Rectangle
 
 class Visualizer:
     """Handles all plotting and animation for the simulation."""
-    def __init__(self, sim_map, oil_spill, communication_radius=None, show_communication_radius=False):
+    def __init__(self, sim_map, oil_spill, communication_radius=None, show_communication_radius=False, show_nls_points=False):
         self.sim_map = sim_map
         self.oil_spill = oil_spill
         self.communication_radius = communication_radius
         self.show_communication_radius = show_communication_radius and communication_radius is not None
+        self.show_nls_points = show_nls_points
         
         self.fig, self.ax = plt.subplots(figsize=(10, 8))
         self.ax.set_xlim(sim_map.xlim)
@@ -32,6 +33,7 @@ class Visualizer:
         self.texts = {} # {drone_id: text_label}
         self.edge_markers = {} # {drone_id: [scatter, annotation]}
         self.target_markers = {} # {drone_id: [scatter, annotation]}
+        self.nls_markers = {} # {drone_id: scatter}
 
     def update_drone(self, drone):
         # Remove old patches
@@ -48,6 +50,10 @@ class Visualizer:
             for artist in self.target_markers[drone.drone_id]:
                 if artist is not None:
                     artist.remove()
+        
+        if drone.drone_id in self.nls_markers:
+            if self.nls_markers[drone.drone_id] is not None:
+                self.nls_markers[drone.drone_id].remove()
 
         patches = []
 
@@ -155,6 +161,19 @@ class Visualizer:
             )
 
         self.target_markers[drone.drone_id] = [target_marker, target_label]
+
+        nls_marker = None
+        if self.show_nls_points and getattr(drone, "last_nls_points", None) is not None:
+            pts = drone.last_nls_points
+            nls_marker = self.ax.scatter(
+                pts[:, 0],
+                pts[:, 1],
+                s=2,
+                c="red",
+                alpha=0.4,
+                zorder=4,
+            )
+        self.nls_markers[drone.drone_id] = nls_marker
 
     def render(self, drones, pause=True):
         for drone in drones:
