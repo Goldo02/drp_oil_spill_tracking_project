@@ -25,6 +25,9 @@ class SimulationEngine:
         boundary_tangent_band=0.35,
         lambda_reg=0.2,
         lambda_smooth=5.0,
+        lambda_center=0.05,
+        min_total_angle=np.pi * 2 / 3,
+        w_gps=5.0,
     ):
         self.sim_map = sim_map
         self.oil_spill = oil_spill
@@ -45,6 +48,9 @@ class SimulationEngine:
         self.wls_iters = max(1, int(consensus_iters))  # Reusing census_iters for WLS
         self.lambda_reg = float(lambda_reg)
         self.lambda_smooth = float(lambda_smooth)
+        self.lambda_center = float(lambda_center)
+        self.min_total_angle = float(min_total_angle)
+        self.w_gps = float(w_gps)
 
         # Optimization & detection thresholds
         self.canny_threshold1 = 20
@@ -97,15 +103,24 @@ class SimulationEngine:
             return np.array([cx, cy, np.sqrt(r2)])
         except: return None
 
-    def _geometric_circle_fit(self, points, theta_init, theta_prev=None, lambda_reg=0.0):
-        """Geometric circle fit with temporal regularization."""
+    def _geometric_circle_fit(self, points, theta_init, theta_prev=None, lambda_reg=0.0, center_prior=None, lambda_center=0.0):
+        """Geometric circle fit with temporal and center regularization."""
         def residuals(theta):
             cx, cy, r = theta
             dists = np.sqrt((points[:, 0] - cx)**2 + (points[:, 1] - cy)**2)
             res = dists - r
+            
+            aug_res = [res]
             if theta_prev is not None and lambda_reg > 0:
                 reg_res = np.sqrt(lambda_reg) * (theta - theta_prev)
-                return np.concatenate([res, reg_res])
+                aug_res.append(reg_res)
+            
+            if center_prior is not None and lambda_center > 0:
+                center_res = np.sqrt(lambda_center) * (theta[:2] - center_prior)
+                aug_res.append(center_res)
+                
+            if len(aug_res) > 1:
+                return np.concatenate(aug_res)
             return res
         xmin, xmax, ymin, ymax = self.sim_map.xlim[0], self.sim_map.xlim[1], self.sim_map.ylim[0], self.sim_map.ylim[1]
         lower_bounds = [xmin, ymin, 0.01]
@@ -229,77 +244,75 @@ class SimulationEngine:
                 neighbors.append(other)
         return neighbors
 
-    def _estimate_local_circle(self, drone):
-        """Estimate the spill center and radius (cx, cy, r) and compute confidence."""
+    def _detect_local_edges(self, drone):
+        """Sense camera and extract edge points in world coordinates."""
         camera_view = drone.get_camera_view(self.world_field, self.sim_map.x_coords, self.sim_map.y_coords)
         if camera_view.size == 0:
             drone.edge_detected = False
-            return {"edge_detected": False, "theta_measured": drone.theta, "weight": 0.0}
+            return None, 0.0
 
         oil_fraction = float(np.mean(camera_view >= self.oil_cell_threshold))
         if oil_fraction <= self.boundary_detection_oil_fraction_min or oil_fraction >= self.exploration_oil_fraction_threshold:
             drone.edge_detected = False
-            return {"edge_detected": False, "theta_measured": drone.theta, "weight": 0.0, "oil_fraction": oil_fraction}
+            return None, oil_fraction
 
-        # camera_view rows (j) correspond to y, cols (i) correspond to x
         dx = self.sim_map.x_coords[1] - self.sim_map.x_coords[0]
         dy = self.sim_map.y_coords[1] - self.sim_map.y_coords[0]
         i_center = int((drone.x - self.sim_map.x_coords[0]) / dx)
         j_center = int((drone.y - self.sim_map.y_coords[0]) / dy)
         half = camera_view.shape[0] // 2
         
-        # Ranges for world coordinates
-        # i = x (cols), j = y (rows)
         i_min, i_max = max(0, i_center - half), min(len(self.sim_map.x_coords), i_center + half + 1)
         j_min, j_max = max(0, j_center - half), min(len(self.sim_map.y_coords), j_center + half + 1)
         
         if i_min == 0 or j_min == 0 or i_max == len(self.sim_map.x_coords) or j_max == len(self.sim_map.y_coords):
             drone.edge_detected = False
-            return {"edge_detected": False, "theta_measured": drone.theta, "weight": 0.0}
+            return None, 0.0
 
         edges = detect_edges(camera_view, threshold1=self.canny_threshold1, threshold2=self.canny_threshold2)
-        edge_pixels = extract_edge_points(edges) # (row, col) -> (j, i) -> (Y, X)
+        edge_pixels = extract_edge_points(edges)
         if edge_pixels.size < 5:
             drone.edge_detected = False
-            return {"edge_detected": False, "theta_measured": drone.theta, "weight": 0.0}
+            return None, 0.0
 
         local_x, local_y = self.sim_map.x_coords[i_min:i_max], self.sim_map.y_coords[j_min:j_max]
-        
-        # rows (edge_pixels[:, 0]) match local_y
-        # cols (edge_pixels[:, 1]) match local_x
         world_y = local_y[np.clip(edge_pixels[:, 0], 0, len(local_y) - 1)]
         world_x = local_x[np.clip(edge_pixels[:, 1], 0, len(local_x) - 1)]
         points = np.column_stack([world_x, world_y])
-
-        # Use current fused estimate as initial guess for NLS to provide stability
-        theta_init = drone.theta.copy()
         
-        # Refine with Bounded NLS + Temporal Regularization
-        lambda_r = self.lambda_reg if drone.theta_prev is not None else 0.0
-        theta_measured = self._geometric_circle_fit(points, theta_init, theta_prev=drone.theta_prev, lambda_reg=lambda_r)
-        
-        # Update drone state
-        if drone.theta_prev is None: drone.theta_prev = theta_measured.copy()
-        drone.theta_measured = theta_measured.copy()
-        
-        # Confidence weight: n_points * (span / pi)
-        span = self._compute_angular_span(points, theta_measured[:2])
-        weight = float(len(points) * (span / np.pi))
-        drone.confidence_weight = weight
-        drone.has_measure = True
-        drone.edge_detected = True
-        drone.has_radius_estimate = True
-        
+        # Cache for visualization
         dist_to_edges = np.hypot(world_x - drone.x, world_y - drone.y)
         drone.last_edge_point = (float(world_x[np.argmin(dist_to_edges)]), float(world_y[np.argmin(dist_to_edges)]))
         drone.last_gradient_peak = float(np.count_nonzero(edges))
         drone.last_oil_fraction = oil_fraction
+        drone.edge_detected = True
+        return points, oil_fraction
+
+    def _fit_local_circle(self, drone, points, center_prior=None, lambda_center=0.0):
+        """Perform NLS fit with fallback for theta_measured."""
+        theta_init = drone.theta.copy()
+        lambda_r = self.lambda_reg if drone.theta_prev is not None else 0.0
         
-        return {
-            "edge_detected": True, "theta_measured": theta_measured, "weight": weight,
-            "oil_fraction": oil_fraction, "gradient_peak": float(np.count_nonzero(edges)),
-            "edge_x": float(np.mean(world_x)), "edge_y": float(np.mean(world_y))
-        }
+        theta_measured = self._geometric_circle_fit(
+            points, theta_init, theta_prev=drone.theta_prev, lambda_reg=lambda_r,
+            center_prior=center_prior, lambda_center=lambda_center
+        )
+        
+        # Robustness check: if NLS produce something completely unrealistic or hits bounds, use Taubin/LLS
+        if np.linalg.norm(theta_measured - theta_init) > 5.0 or theta_measured[2] < 0.1:
+            taubin = self._taubin_fit(points)
+            if taubin is not None:
+                theta_measured = taubin
+        
+        if drone.theta_prev is None: drone.theta_prev = theta_measured.copy()
+        drone.theta_measured = theta_measured.copy()
+        
+        span = self._compute_angular_span(points, theta_measured[:2])
+        weight = float(len(points) * (span / np.pi))
+        drone.confidence_weight = weight
+        drone.has_measure = True
+        drone.has_radius_estimate = True
+        return {"theta_measured": theta_measured, "weight": weight, "span": span}
 
     def _compute_voronoi_targets(self):
         """Compute one weighted Voronoi centroid per drone on a sampled grid.
@@ -425,8 +438,8 @@ class SimulationEngine:
             history["x"].append(float(drone.x))
             history["y"].append(float(drone.y))
 
-    def _run_wls_fusion(self):
-        """Iterative Normalized WLS fusion: theta_i = (wi*theta_i + sum(wj*theta_j)) / (wi + sum(wj))."""
+    def _run_wls_fusion(self, gps_centroid=None, use_gps_prior=False):
+        """Iterative Normalized WLS fusion with optional GPS center prior."""
         for drone in self.drones:
             drone.theta_fused = drone.theta_measured.copy()
 
@@ -444,7 +457,14 @@ class SimulationEngine:
                     weighted_theta_sum += neighbor.confidence_weight * neighbor.theta_fused
                 
                 if weight_sum > 1e-12:
-                    new_fused[drone.drone_id] = weighted_theta_sum / weight_sum
+                    if use_gps_prior and gps_centroid is not None:
+                        # Apply w_gps only to cx, cy components
+                        cx_fused = (weighted_theta_sum[0] + self.w_gps * gps_centroid[0]) / (weight_sum + self.w_gps)
+                        cy_fused = (weighted_theta_sum[1] + self.w_gps * gps_centroid[1]) / (weight_sum + self.w_gps)
+                        r_fused = weighted_theta_sum[2] / weight_sum
+                        new_fused[drone.drone_id] = np.array([cx_fused, cy_fused, r_fused])
+                    else:
+                        new_fused[drone.drone_id] = weighted_theta_sum / weight_sum
                 else:
                     new_fused[drone.drone_id] = drone.theta_fused
             
@@ -480,6 +500,31 @@ class SimulationEngine:
         self.frame += 1
         measurement_frame = (self.frame % self.measure_every == 0)
 
+        # 1. Edge detection results for all (points, edge_detected)
+        detection_results = {}
+        all_on_border = True
+        for drone in self.drones:
+            points, oil_fraction = self._detect_local_edges(drone)
+            detection_results[drone.drone_id] = (points, oil_fraction)
+            if not getattr(drone, "edge_detected", False):
+                all_on_border = False
+
+        # 2. GPS Centroid of all drones
+        px = [d.x for d in self.drones]
+        py = [d.y for d in self.drones]
+        cx_gps, cy_gps = np.mean(px), np.mean(py)
+        gps_centroid = np.array([cx_gps, cy_gps])
+
+        # 3. Fitting for all drones
+        mean_theta = np.mean([d.theta for d in self.drones], axis=0)
+        total_span = 0.0
+        for d in self.drones:
+            pts, _ = detection_results[d.drone_id]
+            if d.edge_detected and pts is not None:
+                total_span += self._compute_angular_span(pts, mean_theta[:2])
+        
+        use_gps_prior = (all_on_border and total_span >= self.min_total_angle)
+
         for drone in self.drones:
             drone.has_measure = False
             history = self.estimates_history[drone.drone_id]
@@ -488,24 +533,42 @@ class SimulationEngine:
             history["r"].append(float(drone.theta[2]))
 
             if measurement_frame:
-                res = self._estimate_local_circle(drone)
-                history["edge_x"].append(res.get("edge_x", np.nan))
-                history["edge_y"].append(res.get("edge_y", np.nan))
-                history["edge_detected"].append(res["edge_detected"])
-                history["gradient_magnitude"].append(res.get("gradient_peak", np.nan))
-                history["gradient_peak"].append(res.get("gradient_peak", np.nan))
-                history["oil_fraction"].append(res.get("oil_fraction", np.nan))
-                history["cx_meas"].append(float(drone.theta_measured[0]))
-                history["cy_meas"].append(float(drone.theta_measured[1]))
-                history["r_meas"].append(float(drone.theta_measured[2]))
-                history["weight"].append(drone.confidence_weight)
+                points, oil_fraction = detection_results[drone.drone_id]
+                if drone.edge_detected and points is not None:
+                    res = self._fit_local_circle(
+                        drone, points, 
+                        center_prior=gps_centroid if use_gps_prior else None,
+                        lambda_center=self.lambda_center if use_gps_prior else 0.0
+                    )
+                    
+                    history["edge_x"].append(float(np.mean(points[:, 0])))
+                    history["edge_y"].append(float(np.mean(points[:, 1])))
+                    history["edge_detected"].append(True)
+                    history["gradient_magnitude"].append(drone.last_gradient_peak)
+                    history["gradient_peak"].append(drone.last_gradient_peak)
+                    history["oil_fraction"].append(oil_fraction)
+                    history["cx_meas"].append(float(drone.theta_measured[0]))
+                    history["cy_meas"].append(float(drone.theta_measured[1]))
+                    history["r_meas"].append(float(drone.theta_measured[2]))
+                    history["weight"].append(drone.confidence_weight)
+                else:
+                    history["edge_x"].append(np.nan)
+                    history["edge_y"].append(np.nan)
+                    history["edge_detected"].append(False)
+                    history["gradient_magnitude"].append(0.0)
+                    history["gradient_peak"].append(0.0)
+                    history["oil_fraction"].append(oil_fraction if isinstance(oil_fraction, float) else np.nan)
+                    history["cx_meas"].append(float(drone.theta_measured[0]))
+                    history["cy_meas"].append(float(drone.theta_measured[1]))
+                    history["r_meas"].append(float(drone.theta_measured[2]))
+                    history["weight"].append(0.0)
             else:
                 for k in ["edge_x", "edge_y", "edge_detected", "gradient_magnitude", "gradient_peak", "oil_fraction", "cx_meas", "cy_meas", "r_meas", "weight"]:
                     history[k].append(history[k][-1] if history[k] else np.nan)
 
         # Consensus/Fusion
         self._update_communication_topology()
-        max_diff = self._run_wls_fusion()
+        max_diff = self._run_wls_fusion(gps_centroid=gps_centroid, use_gps_prior=use_gps_prior)
 
         if measurement_frame and self._current_measure_trace:
             self.measurement_consensus_history.append(self._current_measure_trace)
