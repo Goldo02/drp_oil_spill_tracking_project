@@ -106,8 +106,8 @@ def run_multi_drone_simulation(
     fig, ax = plt.subplots(figsize=(13, 6))
     color_cycle = plt.cm.tab10(np.linspace(0, 1, max(1, len(engine.drones))))
 
-    initial_r0_post = [engine.estimates_history[f"D{i}"]["r0_post"][0] for i in range(len(engine.drones))]
-    final_r0_post = [engine.estimates_history[f"D{i}"]["r0_measure_end"][-1] for i in range(len(engine.drones))]
+    initial_r0_post = [engine.estimates_history[f"D{i}"]["r_fused"][0] for i in range(len(engine.drones))]
+    final_r0_post = [engine.estimates_history[f"D{i}"]["r_fused"][-1] for i in range(len(engine.drones))]
     all_end_values = []
 
     for measure_idx, cycle_trace in enumerate(engine.measurement_consensus_history, start=1):
@@ -134,14 +134,16 @@ def run_multi_drone_simulation(
 
     print("\n=== FINAL CONSENSUS RESULTS ===")
     for i in range(len(engine.drones)):
+        d_id = f"D{i}"
+        hist = engine.estimates_history[d_id]
         print(
-            f"D{i}: initial r0_post={initial_r0_post[i]:.6f}, "
-            f"final r0_post={final_r0_post[i]:.6f}"
+            f"{d_id}: initial=[{hist['cx'][0]:.3f}, {hist['cy'][0]:.3f}, {hist['r'][0]:.3f}], "
+            f"final=[{hist['cx'][-1]:.3f}, {hist['cy'][-1]:.3f}, {hist['r'][-1]:.3f}]"
         )
-    print(f"Mean r0: {mean_r0:.6f}")
+    print(f"Mean r: {mean_r0:.6f}")
     print(f"Std Dev: {std_r0:.6f}")
-    print(f"True r0: {spill.r0:.6f}")
-    print(f"Error from true: {abs(mean_r0 - spill.r0):.6f}")
+    print(f"True r: {spill.r0:.6f}")
+    print(f"Error from true r: {abs(mean_r0 - spill.r0):.6f}")
 
     textstr = f"Mean: {mean_r0:.4f}\nStd: {std_r0:.6f}\nTrue: {spill.r0:.4f}"
     ax.text(

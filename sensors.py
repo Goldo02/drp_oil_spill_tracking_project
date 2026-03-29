@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.ndimage import gaussian_filter
 
 class Sensor:
     """Base class for all sensors."""
@@ -27,21 +28,24 @@ class CameraSensor(Sensor):
 
     def sense(self, world_field, x, y, x_coords, y_coords):
         # Compute grid indices for the center
+        # rows (j) map to y, cols (i) map to x
         dx = x_coords[1] - x_coords[0]
         dy = y_coords[1] - y_coords[0]
         
+        # Grid indices (i=col, j=row)
         i_center = int((x - x_coords[0]) / dx)
         j_center = int((y - y_coords[0]) / dy)
         
         half = self.size // 2
         
-        # Clip indices to stay inside world_field
-        i_min = max(0, i_center - half)
-        i_max = min(world_field.shape[0], i_center + half + 1)
+        # Rows = Y, Cols = X
         j_min = max(0, j_center - half)
-        j_max = min(world_field.shape[1], j_center + half + 1)
+        j_max = min(world_field.shape[0], j_center + half + 1)
+        i_min = max(0, i_center - half)
+        i_max = min(world_field.shape[1], i_center + half + 1)
         
-        local_matrix = world_field[i_min:i_max, j_min:j_max].astype(float)
+        # world_field[row, col] -> world_field[y, x]
+        local_matrix = world_field[j_min:j_max, i_min:i_max].astype(float)
         
         # Add Gaussian noise
         noisy_matrix = self.add_noise(local_matrix)
@@ -52,13 +56,13 @@ class CameraSensor(Sensor):
         
         # Re-pad if at boundary
         if noisy_matrix.shape != (self.size, self.size):
-            pad_before_i = max(0, half - i_center)
-            pad_after_i = max(0, (i_center + half + 1) - world_field.shape[0])
             pad_before_j = max(0, half - j_center)
-            pad_after_j = max(0, (j_center + half + 1) - world_field.shape[1])
+            pad_after_j = max(0, (j_center + half + 1) - world_field.shape[0])
+            pad_before_i = max(0, half - i_center)
+            pad_after_i = max(0, (i_center + half + 1) - world_field.shape[1])
             
             noisy_matrix = np.pad(noisy_matrix, 
-                                  ((pad_before_i, pad_after_i), (pad_before_j, pad_after_j)), 
+                                  ((pad_before_j, pad_after_j), (pad_before_i, pad_after_i)), 
                                   'constant', constant_values=0)
         
         return noisy_matrix

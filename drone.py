@@ -19,17 +19,17 @@ class Drone:
         self.gps = GPSSensor(noise_std=gps_noise)
         self.camera = CameraSensor(size=sensor_size, noise_std=camera_noise)
 
-        # Current local estimate of the spill center and radius.
-        # The center is known in this simulation, but the field is structured
-        # so the rest of the pipeline still works if it is later estimated.
-        self.estimate_x0 = true_x0
-        self.estimate_y0 = true_y0
-        self.estimate_r0 = 1.0
+        # Current local estimate of the spill: theta = [cx, cy, r]
+        # Initialize with ground truth if available, but will be overwritten by first measurement.
+        self.theta = np.array([float(true_x0), float(true_y0), 1.0], dtype=float)
+        self.theta_prev = None  # To be set after first valid estimation
+        self.theta_measured = np.array([float(true_x0), float(true_y0), 1.0], dtype=float)
+        self.theta_fused = np.array([float(true_x0), float(true_y0), 1.0], dtype=float)
+
         self.has_radius_estimate = False
         self.edge_detected = False
         self.last_gradient_peak = None
         self.last_edge_point = None
-        self.last_r0_local = None
         self.last_oil_fraction = None
         self.last_boundary_tangential = False
         self.last_control_mode = None
@@ -40,17 +40,29 @@ class Drone:
         self.exploration_direction = None
         self.exploration_speed = 0.0
         
-        # Consolidation for consensus requirements
+        # Consolidation for fusion requirements
         self.has_measure = False
-        self.local_measure = 0.0
+        self.confidence_weight = 0.0
         self.neighbors = []
+
+    @property
+    def estimate_x0(self):
+        return float(self.theta[0])
+
+    @property
+    def estimate_y0(self):
+        return float(self.theta[1])
+
+    @property
+    def estimate_r0(self):
+        return float(self.theta[2])
 
     def get_gps_pos(self):
         """Returns noisy (x, y) coordinates."""
         return self.gps.sense((self.x, self.y))
 
     def get_camera_view(self, world_field, x_coords, y_coords):
-        """Returns noisy 25x25 local matrix."""
+        """Returns noisy local matrix."""
         return self.camera.sense(world_field, self.x, self.y, x_coords, y_coords)
 
     def set_control(self, u_x, u_y):

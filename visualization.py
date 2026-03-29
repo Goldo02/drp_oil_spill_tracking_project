@@ -65,6 +65,20 @@ class Visualizer:
             self.ax.add_patch(comm_circle)
             patches.append(comm_circle)
 
+        # Draw estimated circle
+        est_circle = Circle(
+            (drone.estimate_x0, drone.estimate_y0),
+            radius=drone.estimate_r0,
+            fill=False,
+            edgecolor='royalblue',
+            linewidth=0.8,
+            alpha=0.3,
+            linestyle='--',
+            zorder=2,
+        )
+        self.ax.add_patch(est_circle)
+        patches.append(est_circle)
+
         # Draw new body
         body = RegularPolygon((drone.x, drone.y), numVertices=6, radius=0.15, color='royalblue')
         self.ax.add_patch(body)
