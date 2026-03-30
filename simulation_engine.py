@@ -161,6 +161,13 @@ class SimulationEngine:
         return np.clip(4.0 * field * (1.0 - field), 0.0, None)
 
     def add_drone(self, drone_id, x, y):
+        # Initialize with random guesses for center and radius instead of ground truth.
+        # Maps are typically [-5, 5], so guesses in [-2, 2] for center 
+        # and [0.5, 2.5] for radius are reasonable deviations.
+        init_cx = float(np.random.uniform(-2.0, 2.0))
+        init_cy = float(np.random.uniform(-2.0, 2.0))
+        init_r = float(np.random.uniform(0.5, 2.5))
+
         drone = Drone(
             drone_id,
             x,
@@ -168,8 +175,9 @@ class SimulationEngine:
             map_bounds=(*self.sim_map.xlim, *self.sim_map.ylim),
             gps_noise=self.sigma_gps,
             camera_noise=self.sigma_cam,
-            true_x0=self.true_x0,
-            true_y0=self.true_y0,
+            initial_x0=init_cx,
+            initial_y0=init_cy,
+            initial_r0=init_r,
             max_speed=self.max_speed,
         )
         # Ensure exploration has significant X and Y components (angle not too close to axes)

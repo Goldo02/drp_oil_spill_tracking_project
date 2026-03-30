@@ -7,8 +7,8 @@ class Drone:
     The drone senses the spill and is moved by an external control input.
     """
     def __init__(self, drone_id, x, y, map_bounds, sensor_size=100, 
-                 gps_noise=0.03, camera_noise=0.03, true_x0=0.0, true_y0=0.0,
-                 max_speed=0.6):
+                 gps_noise=0.03, camera_noise=0.03, initial_x0=0.0, initial_y0=0.0,
+                 initial_r0=1.0, max_speed=0.6):
         self.drone_id = drone_id
         self.x = x
         self.y = y
@@ -20,11 +20,11 @@ class Drone:
         self.camera = CameraSensor(size=sensor_size, noise_std=camera_noise)
 
         # Current local estimate of the spill: theta = [cx, cy, r]
-        # Initialize with ground truth if available, but will be overwritten by first measurement.
-        self.theta = np.array([float(true_x0), float(true_y0), 1.0], dtype=float)
+        # Initialize with provided guess.
+        self.theta = np.array([float(initial_x0), float(initial_y0), float(initial_r0)], dtype=float)
         self.theta_prev = None  # To be set after first valid estimation
-        self.theta_measured = np.array([float(true_x0), float(true_y0), 1.0], dtype=float)
-        self.theta_fused = np.array([float(true_x0), float(true_y0), 1.0], dtype=float)
+        self.theta_measured = np.array([float(initial_x0), float(initial_y0), float(initial_r0)], dtype=float)
+        self.theta_fused = np.array([float(initial_x0), float(initial_y0), float(initial_r0)], dtype=float)
 
         self.has_radius_estimate = False
         self.edge_detected = False
