@@ -490,10 +490,13 @@ class SimulationEngine:
         max_diff = 0.0
         for drone in self.drones:
             # Temporal tracking: theta = alpha * theta_fused + (1 - alpha) * theta_prev
-            alpha = drone.confidence_weight / (drone.confidence_weight + self.lambda_smooth)
-            if not drone.edge_detected and drone.confidence_weight < 1e-6:
-                # If no current measurement, alpha is 0, keeping previous theta
-                alpha = 0.0
+            if drone.confidence_weight > 1e-6:
+                alpha = float(drone.confidence_weight / (drone.confidence_weight + self.lambda_smooth))
+            else:
+                # If no measurement, follow consensus slowly (20% update) if it was influenced by neighbors.
+                # theta_fused started as drone.theta (the previous estimate) before consensus iterations.
+                diff_fused = float(np.linalg.norm(drone.theta_fused - drone.theta))
+                alpha = 0.2 if diff_fused > 1e-12 else 0.0
                 
             new_theta = alpha * drone.theta_fused + (1.0 - alpha) * drone.theta
             diff = np.linalg.norm(new_theta - drone.theta)
@@ -540,6 +543,7 @@ class SimulationEngine:
 
         for drone in self.drones:
             drone.has_measure = False
+            drone.confidence_weight = 0.0
             history = self.estimates_history[drone.drone_id]
             history["cx"].append(float(drone.theta[0]))
             history["cy"].append(float(drone.theta[1]))
