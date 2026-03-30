@@ -487,23 +487,34 @@ class SimulationEngine:
 
         self._current_measure_trace = trace
 
+        print(f"\n--- FUSION RESULTS (Frame {self.frame}) ---")
         max_diff = 0.0
         for drone in self.drones:
             # Temporal tracking: theta = alpha * theta_fused + (1 - alpha) * theta_prev
             if drone.confidence_weight > 1e-6:
                 alpha = float(drone.confidence_weight / (drone.confidence_weight + self.lambda_smooth))
+                mode = f"MEASURER (w={drone.confidence_weight:.2f})"
             else:
                 # If no measurement, follow consensus slowly (20% update) if it was influenced by neighbors.
                 # theta_fused started as drone.theta (the previous estimate) before consensus iterations.
                 diff_fused = float(np.linalg.norm(drone.theta_fused - drone.theta))
                 alpha = 0.2 if diff_fused > 1e-12 else 0.0
+                mode = "LISTENER" if alpha > 0 else "ISOLATED"
                 
             new_theta = alpha * drone.theta_fused + (1.0 - alpha) * drone.theta
             diff = np.linalg.norm(new_theta - drone.theta)
+            
+            neighbor_ids = [n.drone_id for n in drone.neighbors]
+            print(f" {drone.drone_id}: {mode} | Neighbors: {neighbor_ids}")
+            print(f"   Pre-fusion:  [{drone.theta[0]:.3f}, {drone.theta[1]:.3f}, {drone.theta[2]:.3f}]")
+            print(f"   Consensus:   [{drone.theta_fused[0]:.3f}, {drone.theta_fused[1]:.3f}, {drone.theta_fused[2]:.3f}]")
+            print(f"   Post-fusion: [{new_theta[0]:.3f}, {new_theta[1]:.3f}, {new_theta[2]:.3f}] (diff: {diff:.4f}, alpha: {alpha:.2f})")
+
             drone.theta = new_theta
             drone.theta_prev = new_theta.copy()
             max_diff = max(max_diff, diff)
             
+        print(f"----------------------------------------")
         return max_diff
 
     def _update_communication_topology(self):
@@ -519,11 +530,15 @@ class SimulationEngine:
         # 1. Edge detection results for all (points, edge_detected)
         detection_results = {}
         all_on_border = True
+        print(f"\n>>> FRAME {self.frame} {'(MEASUREMENT)' if measurement_frame else ''} <<<")
         for drone in self.drones:
             points, oil_fraction = self._detect_local_edges(drone)
             detection_results[drone.drone_id] = (points, oil_fraction)
             if not getattr(drone, "edge_detected", False):
                 all_on_border = False
+                print(f" {drone.drone_id}: No edge. (Oil fraction: {oil_fraction:.3f})")
+            else:
+                print(f" {drone.drone_id}: EDGE DETECTED! (Points: {len(points)}, Oil: {oil_fraction:.3f})")
 
         # 2. GPS Centroid of all drones
         px = [d.x for d in self.drones]
