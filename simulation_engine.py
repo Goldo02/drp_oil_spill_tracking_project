@@ -161,12 +161,14 @@ class SimulationEngine:
         return np.clip(4.0 * field * (1.0 - field), 0.0, None)
 
     def add_drone(self, drone_id, x, y):
-        # Initialize with random guesses for center and radius instead of ground truth.
-        # Maps are typically [-5, 5], so guesses in [-2, 2] for center 
-        # and [0.5, 2.5] for radius are reasonable deviations.
-        init_cx = float(np.random.uniform(-2.0, 2.0))
-        init_cy = float(np.random.uniform(-2.0, 2.0))
-        init_r = float(np.random.uniform(0.5, 2.5))
+        # Initialize with random guesses for center and radius across the full map extent.
+        xmin, xmax = self.sim_map.xlim
+        ymin, ymax = self.sim_map.ylim
+        
+        init_cx = float(np.random.uniform(xmin, xmax))
+        init_cy = float(np.random.uniform(ymin, ymax))
+        # Radius can range from very small to half the map width
+        init_r = float(np.random.uniform(0.1, 5.0))
 
         drone = Drone(
             drone_id,
@@ -454,8 +456,8 @@ class SimulationEngine:
         for drone in self.drones:
             drone.theta_fused = drone.theta_measured.copy()
 
-        # Trace for visualization of consensus convergence
-        trace = {d.drone_id: [d.theta_fused[2]] for d in self.drones}
+        # Trace for visualization of consensus convergence (storing full theta)
+        trace = {d.drone_id: [d.theta_fused.copy()] for d in self.drones}
 
         for k in range(self.wls_iters):
             new_fused = {}
@@ -481,7 +483,7 @@ class SimulationEngine:
             
             for drone in self.drones:
                 drone.theta_fused = new_fused[drone.drone_id]
-                trace[drone.drone_id].append(drone.theta_fused[2])
+                trace[drone.drone_id].append(drone.theta_fused.copy())
 
         self._current_measure_trace = trace
 

@@ -106,31 +106,34 @@ def run_multi_drone_simulation(
     
     # Plot convergence by measurement index, including every consensus iteration.
     measurement_count = len(engine.measurement_consensus_history)
-    fig, ax = plt.subplots(figsize=(13, 6))
+    fig, axes = plt.subplots(3, 1, figsize=(13, 12), sharex=True)
+    ax_cx, ax_cy, ax_r = axes
     color_cycle = plt.cm.tab10(np.linspace(0, 1, max(1, len(engine.drones))))
 
     initial_r0_post = [engine.estimates_history[f"D{i}"]["r_fused"][0] for i in range(len(engine.drones))]
     final_r0_post = [engine.estimates_history[f"D{i}"]["r_fused"][-1] for i in range(len(engine.drones))]
-    all_end_values = []
-
+    
     for measure_idx, cycle_trace in enumerate(engine.measurement_consensus_history, start=1):
         x_values = np.linspace(measure_idx - 1.0, measure_idx, len(next(iter(cycle_trace.values()))))
         for idx, drone in enumerate(engine.drones):
             drone_id = drone.drone_id
+            # cycle_trace[drone_id] is a list of [cx, cy, r] arrays
             y_values = np.asarray(cycle_trace[drone_id], dtype=float)
-            all_end_values.append(y_values[-1])
-            ax.plot(
-                x_values,
-                y_values,
+            
+            common_params = dict(
                 color=color_cycle[idx % len(color_cycle)],
-                linewidth=1.8,
-                marker="o",
-                markersize=3,
-                alpha=0.9,
-                label=f"{drone_id}" if measure_idx == 1 else None,
+                linewidth=1.8, marker="o", markersize=3, alpha=0.9,
+                label=f"{drone_id}" if measure_idx == 1 else None
             )
+            
+            ax_cx.plot(x_values, y_values[:, 0], **common_params)
+            ax_cy.plot(x_values, y_values[:, 1], **common_params)
+            ax_r.plot(x_values, y_values[:, 2], **common_params)
 
-    ax.axhline(y=spill.r0, color="black", linestyle="--", linewidth=2.5, label="True r0")
+    # Add ground truth horizontal lines
+    ax_cx.axhline(y=spill.x0, color="black", linestyle="--", linewidth=2.5, label="True x0")
+    ax_cy.axhline(y=spill.y0, color="black", linestyle="--", linewidth=2.5, label="True y0")
+    ax_r.axhline(y=spill.r0, color="black", linestyle="--", linewidth=2.5, label="True r0")
 
     mean_r0 = np.mean(final_r0_post)
     std_r0 = np.std(final_r0_post)
@@ -148,25 +151,22 @@ def run_multi_drone_simulation(
     print(f"True r: {spill.r0:.6f}")
     print(f"Error from true r: {abs(mean_r0 - spill.r0):.6f}")
 
-    textstr = f"Mean: {mean_r0:.4f}\nStd: {std_r0:.6f}\nTrue: {spill.r0:.4f}"
-    ax.text(
-        0.02,
-        0.98,
-        textstr,
-        transform=ax.transAxes,
-        fontsize=10,
-        verticalalignment="top",
-        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8),
-    )
+    # Titles and labels
+    ax_cx.set_title("Consensus Evolution: Center X (cx)")
+    ax_cx.set_ylabel("cx")
+    ax_cy.set_title("Consensus Evolution: Center Y (cy)")
+    ax_cy.set_ylabel("cy")
+    ax_r.set_title("Consensus Evolution: Radius (r)")
+    ax_r.set_ylabel("radius")
+    
+    for ax in axes:
+        ax.set_xlim(0, measurement_count if measurement_count else 1)
+        ax.set_xticks(np.arange(0, measurement_count + 1, 1))
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=True)
 
-    ax.set_title("Consensus Evolution Inside Each Measurement Cycle")
-    ax.set_xlabel("Number of measurements + 1")
-    ax.set_ylabel("Radius r0")
-    ax.set_xlim(0, measurement_count if measurement_count else 1)
-    ax.set_xticks(np.arange(0, measurement_count + 1, 1))
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=True)
-
+    axes[-1].set_xlabel("Number of measurements")
+    
     plt.tight_layout()
     plt.savefig("consensus_convergence.png", bbox_inches="tight")
     print("Consensus convergence plot saved to 'consensus_convergence.png'")
