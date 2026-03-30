@@ -45,6 +45,7 @@ class Drone:
         
         # Consolidation for fusion requirements
         self.has_measure = False
+        self.first_measurement_done = False
         self.confidence_weight = 0.0
         self.neighbors = []
 

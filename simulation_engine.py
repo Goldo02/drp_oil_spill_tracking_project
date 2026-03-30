@@ -205,6 +205,9 @@ class SimulationEngine:
         """Return a persistent exploration command reflected at map bounds."""
         direction = getattr(drone, "exploration_direction", None)
         speed = float(getattr(drone, "exploration_speed", 0.0))
+        
+        # Initialize direction only if not set (or if speed is 0).
+        # Note: _apply_voronoi_control may have already set this for "reacquire" mode.
         if direction is None or speed <= 0.0:
             while True:
                 angle = float(np.random.uniform(0.0, 2.0 * np.pi))
@@ -415,7 +418,8 @@ class SimulationEngine:
         """Single-integrator motion toward the weighted Voronoi centroid."""
         targets = self._compute_voronoi_targets()
         for drone in self.drones:
-            if getattr(drone, "has_radius_estimate", False):
+            # Use Voronoi control ONLY if we have a radius estimate AND we currently see the edge.
+            if getattr(drone, "has_radius_estimate", False) and getattr(drone, "edge_detected", False):
                 target = np.asarray(targets.get(drone.drone_id, (drone.x, drone.y)), dtype=float)
                 gps_pos = np.asarray(drone.get_gps_pos(), dtype=float)
                 command = self.control_gain * (target - gps_pos)
@@ -428,11 +432,26 @@ class SimulationEngine:
                 if self.max_speed > 0 and speed > self.max_speed:
                     command = command / speed * self.max_speed
             else:
+                # DIVERGENCE HANDLING: if we have an estimate but lost the edge, 
+                # point exploration towards the last known edge point.
+                edge_pt = getattr(drone, "last_edge_point", None)
+                if getattr(drone, "has_radius_estimate", False) and edge_pt is not None:
+                    target = np.array(edge_pt, dtype=float)
+                    direction = target - np.array([drone.x, drone.y])
+                    dist = float(np.linalg.norm(direction))
+                    if dist > 1e-4:
+                        drone.exploration_direction = direction / dist
+                        drone.last_control_mode = "reacquire"
+                    else:
+                        # Already at the edge point but no detection, go random
+                        drone.last_control_mode = "explore"
+                else:
+                    drone.last_control_mode = "explore"
+
                 command = self._bounce_exploration_command(drone)
                 drone.last_exploration_target = (float(drone.x + command[0]), float(drone.y + command[1]))
                 drone.last_voronoi_target = None
                 drone.last_boundary_tangential = False
-                drone.last_control_mode = "explore"
 
             drone.set_control(float(command[0]), float(command[1]))
             drone.update_position(self.dt, map_bounds=drone.map_bounds, max_speed=self.max_speed)
@@ -440,7 +459,7 @@ class SimulationEngine:
             history = self.estimates_history[drone.drone_id]
             history["u_x"].append(float(drone.u_x))
             history["u_y"].append(float(drone.u_y))
-            if getattr(drone, "has_radius_estimate", False):
+            if getattr(drone, "last_voronoi_target", None) is not None:
                 history["voronoi_cx"].append(float(drone.last_voronoi_target[0]))
                 history["voronoi_cy"].append(float(drone.last_voronoi_target[1]))
             else:
@@ -492,8 +511,13 @@ class SimulationEngine:
         for drone in self.drones:
             # Temporal tracking: theta = alpha * theta_fused + (1 - alpha) * theta_prev
             if drone.confidence_weight > 1e-6:
-                alpha = float(drone.confidence_weight / (drone.confidence_weight + self.lambda_smooth))
-                mode = f"MEASURER (w={drone.confidence_weight:.2f})"
+                if not drone.first_measurement_done:
+                    alpha = 1.0
+                    drone.first_measurement_done = True
+                    mode = f"FIRST MEASURE (w={drone.confidence_weight:.2f})"
+                else:
+                    alpha = float(drone.confidence_weight / (drone.confidence_weight + self.lambda_smooth))
+                    mode = f"MEASURER (w={drone.confidence_weight:.2f})"
             else:
                 # If no measurement, follow consensus slowly (20% update) if it was influenced by neighbors.
                 # theta_fused started as drone.theta (the previous estimate) before consensus iterations.
