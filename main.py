@@ -9,7 +9,7 @@ if not os.environ.get("MPLCONFIGDIR"):
 
 import matplotlib
 
-from environment import CircleOilSpill, SimulationMap
+from environment import CircleOilSpill, SimulationMap, SmoothedPolygonOilSpill
 from simulation_engine import SimulationEngine
 
 
@@ -17,9 +17,18 @@ def run_multi_drone_simulation(
     visualize=False,
     max_frames=500,
     seed=42,
+    num_drones=5,
+    oil_shape="smoothed_polygon",
     fully_connected=False,
     communication_radius_cells=205,
     measure_every=3,
+    show_nls_points=False,
+    polygon_vertices=14,
+    polygon_r0=2.0,
+    polygon_smoothness=0.35,
+    polygon_x0=None,
+    polygon_y0=None,
+    polygon_continuous=False,
 ):
     if visualize:
         matplotlib.use("TkAgg")
@@ -34,7 +43,20 @@ def run_multi_drone_simulation(
 
     # Global simulation domain used by all drones.
     sim_map = SimulationMap(xlim=(-5, 5), ylim=(-5, 5), grid_size=500)
-    spill = CircleOilSpill(x0=0.0, y0=0.0, radius=2.0)
+    if oil_shape == "circle":
+        spill = CircleOilSpill(x0=0.0, y0=0.0, radius=2.0)
+    else:
+        spill = SmoothedPolygonOilSpill(
+            sim_map.X,
+            sim_map.Y,
+            n_vertices=polygon_vertices,
+            r0=polygon_r0,
+            smoothness=polygon_smoothness,
+            x0=polygon_x0,
+            y0=polygon_y0,
+            seed=seed,
+            continuous=polygon_continuous,
+        )
 
     engine = SimulationEngine(
         sim_map,
@@ -58,7 +80,6 @@ def run_multi_drone_simulation(
     # distances from the boundary. This makes the initial geometry less
     # regular and is useful for robustness tests.
     initial_radius = spill.radius
-    num_drones = 5
     for i in range(num_drones):
         angle = np.random.uniform(0.0, 2.0 * np.pi)
         radial_offset = np.random.uniform(-0.5, 1.5)
@@ -70,20 +91,28 @@ def run_multi_drone_simulation(
         engine.add_drone(drone_id=f"D{i}", x=start_x, y=start_y, gps_noise=0.03, camera_noise=0.03)
 
     viz = None
-    if visualize:
-        from visualization import Visualizer
+    from visualization import Visualizer
 
-        viz = Visualizer(
-            sim_map,
-            spill,
-            communication_radius=None if fully_connected else engine.communication_radius,
-            show_communication_radius=not fully_connected,
-        )
+    viz = Visualizer(
+        sim_map,
+        spill,
+        communication_radius=None if fully_connected else engine.communication_radius,
+        show_communication_radius=not fully_connected,
+        show_nls_points=show_nls_points,
+    )
+    if visualize:
         plt.show(block=False)
     else:
         print("Visualization disabled. Headless mode (Agg backend).")
 
     print(f"Starting distributed occupancy grid simulation ({max_frames} frames)...")
+    print(f"Oil shape: {oil_shape}")
+    if oil_shape != "circle":
+        print(
+            "Polygon parameters: "
+            f"vertices={polygon_vertices}, r0={polygon_r0}, smoothness={polygon_smoothness}, "
+            f"center=({spill.x0:.2f}, {spill.y0:.2f}), continuous={polygon_continuous}"
+        )
     print(f"Measurement interval: every {measure_every} frames")
     print(f"Consensus iterations per measurement: {engine.consensus_rounds}")
     if fully_connected:
@@ -110,9 +139,9 @@ def run_multi_drone_simulation(
 
     print("Simulation finished.")
 
-    if visualize:
-        print("Saving the final scene to 'final_simulation_state.png'...")
-        plt.savefig("final_simulation_state.png", bbox_inches="tight")
+    viz.render(engine.drones, pause=False)
+    print("Saving the final scene to 'final_simulation_state.png'...")
+    plt.savefig("final_simulation_state.png", bbox_inches="tight")
 
     error_history = np.asarray(engine.error_history, dtype=float)
     fig, ax = plt.subplots(figsize=(12, 5))
@@ -194,6 +223,53 @@ if __name__ == "__main__":
     parser.add_argument("--frames", type=int, default=500, help="Total number of simulation iterations")
     parser.add_argument("--seed", type=int, default=1, help="Random seed for reproducible initialization")
     parser.add_argument(
+        "--num-drones",
+        type=int,
+        default=5,
+        help="Number of drones to initialize in the simulation",
+    )
+    parser.add_argument(
+        "--oil-shape",
+        choices=("circle", "smoothed_polygon"),
+        default="smoothed_polygon",
+        help="Oil spill model to use",
+    )
+    parser.add_argument(
+        "--polygon-vertices",
+        type=int,
+        default=36,
+        help="Number of random vertices used for the smoothed polygon spill",
+    )
+    parser.add_argument(
+        "--polygon-r0",
+        type=float,
+        default=2.5,
+        help="Mean radius of the smoothed polygon spill",
+    )
+    parser.add_argument(
+        "--polygon-smoothness",
+        type=float,
+        default=0.2,
+        help="Spline smoothing factor for the polygon spill",
+    )
+    parser.add_argument(
+        "--polygon-x0",
+        type=float,
+        default=None,
+        help="Optional x coordinate of the polygon center",
+    )
+    parser.add_argument(
+        "--polygon-y0",
+        type=float,
+        default=None,
+        help="Optional y coordinate of the polygon center",
+    )
+    parser.add_argument(
+        "--polygon-continuous",
+        action="store_true",
+        help="Return a continuous signed field instead of a binary mask for the polygon spill",
+    )
+    parser.add_argument(
         "--fully-connected",
         action="store_true",
         help="Disable range-based communication and use a fully connected consensus graph",
@@ -215,13 +291,27 @@ if __name__ == "__main__":
         default=3,
         help="Perform a new sensing update every N frames",
     )
+    parser.add_argument(
+        "--show-nls-points",
+        action="store_true",
+        help="Visualize the edge points used for local NLS fitting (in red)",
+    )
     args = parser.parse_args()
 
     run_multi_drone_simulation(
         visualize=args.visualize,
         max_frames=args.frames,
         seed=args.seed,
+        num_drones=args.num_drones,
+        oil_shape=args.oil_shape,
         fully_connected=(args.fully_connected and not args.range_based),
         communication_radius_cells=args.communication_radius_cells,
         measure_every=args.measure_every,
+        show_nls_points=args.show_nls_points,
+        polygon_vertices=args.polygon_vertices,
+        polygon_r0=args.polygon_r0,
+        polygon_smoothness=args.polygon_smoothness,
+        polygon_x0=args.polygon_x0,
+        polygon_y0=args.polygon_y0,
+        polygon_continuous=args.polygon_continuous,
     )

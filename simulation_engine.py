@@ -52,6 +52,16 @@ class SimulationEngine:
         self.communication_radius_cells = int(communication_radius_cells)
         self.communication_radius = float(self.communication_radius_cells * 0.5 * (dx + dy))
 
+        # Motion-control parameters for the hybrid boundary-following policy.
+        self.max_speed = 0.12
+        self.exploration_speed = 0.08
+        self.k_t = 1.0
+        self.k_n = 1.5
+        self.boundary_tracking_oil_fraction = 0.5
+        self.boundary_lock_distance = max(0.15, 2.0 * self.resolution)
+        self.boundary_lock_gain = 3.0
+        self.boundary_error_cap = max(0.15, 3.0 * self.resolution)
+
         self.drones = []
         self.frame = 0
         self.error_history = []
@@ -150,6 +160,182 @@ class SimulationEngine:
         for drone_id, value in snapshot.items():
             self._current_measurement_trace[drone_id].append(value)
 
+    @staticmethod
+    def _normalize_vector(vector):
+        vec = np.asarray(vector, dtype=float)
+        norm = float(np.linalg.norm(vec))
+        if norm <= 1e-12:
+            return None, norm
+        return vec / norm, norm
+
+    def _clip_command(self, command, max_speed):
+        vec = np.asarray(command, dtype=float)
+        speed = float(np.linalg.norm(vec))
+        if speed <= 1e-12:
+            return np.zeros(2, dtype=float)
+        if speed > max_speed:
+            vec = vec * (max_speed / speed)
+        return vec
+
+    @staticmethod
+    def _random_unit_direction():
+        angle = np.random.uniform(0.0, 2.0 * np.pi)
+        return np.array([np.cos(angle), np.sin(angle)], dtype=float)
+
+    @staticmethod
+    def _principal_tangent(points):
+        pts = np.asarray(points, dtype=float)
+        if pts.ndim != 2 or pts.shape[0] < 3:
+            return None, None, None
+
+        centroid = np.mean(pts, axis=0)
+        centered = pts - centroid
+        cov = np.cov(centered.T)
+        if not np.all(np.isfinite(cov)):
+            return None, None, None
+
+        vals, vecs = np.linalg.eigh(cov)
+        tangent = vecs[:, int(np.argmax(vals))]
+        tangent_norm = float(np.linalg.norm(tangent))
+        if tangent_norm <= 1e-12:
+            return None, None, None
+        tangent = tangent / tangent_norm
+        normal = np.array([-tangent[1], tangent[0]], dtype=float)
+        normal_norm = float(np.linalg.norm(normal))
+        if normal_norm <= 1e-12:
+            return None, None, None
+        normal = normal / normal_norm
+        return centroid, tangent, normal
+
+    def _bounce_exploration_command(self, drone):
+        direction = np.asarray(getattr(drone, "exploration_direction", None), dtype=float)
+        if direction.size != 2:
+            direction = self._random_unit_direction()
+        else:
+            direction, norm = self._normalize_vector(direction)
+            if direction is None:
+                direction = self._random_unit_direction()
+
+        command = direction * self.exploration_speed
+        next_x = drone.x + command[0]
+        next_y = drone.y + command[1]
+        bounced = False
+
+        if next_x < self.sim_map.xlim[0] or next_x > self.sim_map.xlim[1]:
+            direction[0] *= -1.0
+            bounced = True
+        if next_y < self.sim_map.ylim[0] or next_y > self.sim_map.ylim[1]:
+            direction[1] *= -1.0
+            bounced = True
+
+        if bounced:
+            direction, _ = self._normalize_vector(direction)
+            if direction is None:
+                direction = self._random_unit_direction()
+            command = direction * self.exploration_speed
+        drone.exploration_direction = direction
+        return command
+
+    def _boundary_tracking_command(self, drone):
+        points = getattr(drone, "last_nls_points", None)
+        centroid = None
+        tangent = None
+        normal = None
+
+        if points is not None:
+            centroid, tangent, normal = self._principal_tangent(points)
+
+        if centroid is None or tangent is None or normal is None:
+            target_point = getattr(drone, "last_boundary_anchor_point", None)
+            if target_point is None:
+                target_point = drone.last_edge_point
+            if target_point is None:
+                return None
+
+            edge_point = np.asarray(target_point, dtype=float)
+            position = np.array([drone.x, drone.y], dtype=float)
+            offset = position - edge_point
+            normal, distance = self._normalize_vector(offset)
+            if normal is None:
+                return None
+
+            tangent = np.array([normal[1], -normal[0]], dtype=float)
+            oil_fraction = drone.last_oil_fraction
+            if oil_fraction is None or not np.isfinite(oil_fraction):
+                oil_fraction = self.boundary_tracking_oil_fraction
+
+            distance_error = float(np.clip(distance - self.boundary_lock_distance, -self.boundary_error_cap, self.boundary_error_cap))
+            tangent_scale = np.clip(self.boundary_lock_distance / max(distance, self.boundary_lock_distance), 0.35, 1.0)
+            normal_gain = self.k_n * (float(oil_fraction) - self.boundary_tracking_oil_fraction)
+            normal_gain += self.boundary_lock_gain * distance_error
+
+            command = (self.k_t * tangent_scale) * tangent - normal_gain * normal
+            return self._clip_command(command, self.max_speed)
+
+        position = np.array([drone.x, drone.y], dtype=float)
+        rel = position - centroid
+        signed_distance = float(np.dot(rel, normal))
+        if signed_distance < 0.0:
+            normal = -normal
+            signed_distance = -signed_distance
+
+        # Keep a persistent tangent orientation by matching the previous command
+        # when possible. This avoids frame-to-frame flipping along the boundary.
+        prev = np.asarray(getattr(drone, "last_control_vector", np.zeros(2, dtype=float)), dtype=float)
+        if float(np.linalg.norm(prev)) > 1e-12 and float(np.dot(prev, tangent)) < 0.0:
+            tangent = -tangent
+
+        oil_fraction = drone.last_oil_fraction
+        if oil_fraction is None or not np.isfinite(oil_fraction):
+            oil_fraction = self.boundary_tracking_oil_fraction
+
+        distance_error = float(np.clip(signed_distance - self.boundary_lock_distance, -self.boundary_error_cap, self.boundary_error_cap))
+        tangent_scale = np.clip(self.boundary_lock_distance / max(signed_distance, self.boundary_lock_distance), 0.35, 1.0)
+        normal_gain = self.k_n * (float(oil_fraction) - self.boundary_tracking_oil_fraction)
+        normal_gain += self.boundary_lock_gain * distance_error
+
+        command = (self.k_t * tangent_scale) * tangent - normal_gain * normal
+        return self._clip_command(command, self.max_speed)
+
+    def _reacquire_command(self, drone):
+        target_point = getattr(drone, "last_boundary_anchor_point", None)
+        if target_point is None:
+            target_point = drone.last_edge_point
+        if target_point is None:
+            return None
+
+        position = np.array([drone.x, drone.y], dtype=float)
+        direction, norm = self._normalize_vector(np.asarray(target_point, dtype=float) - position)
+        if direction is None:
+            return None
+
+        command = direction * self.exploration_speed
+        return self._clip_command(command, self.max_speed)
+
+    def _select_motion_command(self, drone):
+        if drone.edge_detected and drone.last_edge_point is not None:
+            command = self._boundary_tracking_command(drone)
+            if command is not None:
+                drone.last_control_mode = "boundary_tracking"
+                return command
+
+        if not drone.edge_detected and drone.last_edge_point is not None:
+            command = self._reacquire_command(drone)
+            if command is not None:
+                drone.last_control_mode = "reacquire"
+                return command
+
+        drone.last_control_mode = "explore"
+        return self._bounce_exploration_command(drone)
+
+    def _apply_motion(self):
+        for drone in self.drones:
+            command = self._select_motion_command(drone)
+            command = self._clip_command(command, self.max_speed)
+            drone.last_control_vector = np.asarray(command, dtype=float)
+            drone.x = float(np.clip(drone.x + command[0], self.sim_map.xlim[0], self.sim_map.xlim[1]))
+            drone.y = float(np.clip(drone.y + command[1], self.sim_map.ylim[0], self.sim_map.ylim[1]))
+
     def step(self):
         """
         One full iteration:
@@ -212,7 +398,10 @@ class SimulationEngine:
         self.latest_mean_grid = mean_grid
 
         if self.verbose:
-            print(f"  Frame summary: global_disagreement={error:.6f}")
+            mode_summary = ", ".join(f"{d.drone_id}:{d.last_control_mode}" for d in self.drones)
+            print(f"  Frame summary: global_disagreement={error:.6f} | modes: {mode_summary}")
+
+        self._apply_motion()
 
         return error
 

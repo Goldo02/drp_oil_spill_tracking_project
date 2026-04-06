@@ -35,8 +35,14 @@ class Drone:
         self.edge_detected = False
         self.last_edge_point = None
         self.last_edge_points = np.empty((0, 2), dtype=float)
+        self.last_nls_points = np.empty((0, 2), dtype=float)
+        self.last_boundary_anchor_point = None
         self.last_edge_count = 0
         self.last_oil_fraction = None
+        self.last_control_mode = "explore"
+        self.last_control_vector = np.zeros(2, dtype=float)
+        angle = np.random.uniform(0.0, 2.0 * np.pi)
+        self.exploration_direction = np.array([np.cos(angle), np.sin(angle)], dtype=float)
 
     def get_gps_pos(self):
         """Return noisy GPS coordinates."""
@@ -76,71 +82,6 @@ class Drone:
         east = padded[1:-1, 2:]
         return center & (~north | ~south | ~west | ~east)
 
-    @staticmethod
-    def _mean_filter(array, kernel_size=5):
-        """
-        Smooth a 2D array with a simple uniform filter.
-
-        This suppresses isolated noisy pixels that would otherwise create
-        spurious interior edge fragments after thresholding.
-        """
-        if kernel_size <= 1:
-            return np.asarray(array, dtype=float)
-
-        arr = np.asarray(array, dtype=float)
-        pad = kernel_size // 2
-        padded = np.pad(arr, pad_width=pad, mode="edge")
-        smoothed = np.zeros_like(arr, dtype=float)
-
-        for di in range(kernel_size):
-            for dj in range(kernel_size):
-                smoothed += padded[di:di + arr.shape[0], dj:dj + arr.shape[1]]
-
-        return smoothed / float(kernel_size * kernel_size)
-
-    @staticmethod
-    def _largest_connected_component(binary_window):
-        """
-        Keep only the largest 4-connected occupied component.
-
-        This removes small noisy islands and holes that otherwise turn into
-        internal boundary segments after thresholding.
-        """
-        binary = np.asarray(binary_window, dtype=bool)
-        if binary.size == 0:
-            return binary
-
-        visited = np.zeros_like(binary, dtype=bool)
-        best_component = []
-        best_size = 0
-        rows, cols = binary.shape
-
-        for start_r in range(rows):
-            for start_c in range(cols):
-                if not binary[start_r, start_c] or visited[start_r, start_c]:
-                    continue
-
-                stack = [(start_r, start_c)]
-                visited[start_r, start_c] = True
-                component = []
-
-                while stack:
-                    r, c = stack.pop()
-                    component.append((r, c))
-                    for nr, nc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
-                        if 0 <= nr < rows and 0 <= nc < cols and binary[nr, nc] and not visited[nr, nc]:
-                            visited[nr, nc] = True
-                            stack.append((nr, nc))
-
-                if len(component) > best_size:
-                    best_size = len(component)
-                    best_component = component
-
-        filtered = np.zeros_like(binary, dtype=bool)
-        for r, c in best_component:
-            filtered[r, c] = True
-        return filtered
-
     def sense(self, world_field, x_coords, y_coords, occupancy_threshold=0.5):
         """
         Detect boundary pixels in the local camera window and return them in
@@ -158,26 +99,21 @@ class Drone:
         if local_field.size == 0:
             self.edge_detected = False
             self.last_edge_points = np.empty((0, 2), dtype=float)
-            self.last_edge_point = None
+            self.last_nls_points = np.empty((0, 2), dtype=float)
             self.last_edge_count = 0
             self.last_oil_fraction = None
             return self.last_edge_points
 
-        # Smooth the noisy camera field before thresholding so isolated noisy
-        # pixels do not create fake interior segments.
-        local_field = self._mean_filter(local_field, kernel_size=5)
-
         # The drone already works in the global frame, so boundary points can
         # be mapped directly into the shared occupancy grid.
         binary_window = local_field >= occupancy_threshold
-        binary_window = self._largest_connected_component(binary_window)
         boundary = self._boundary_mask(binary_window)
         rows, cols = np.where(boundary)
 
         if rows.size == 0:
             self.edge_detected = False
             self.last_edge_points = np.empty((0, 2), dtype=float)
-            self.last_edge_point = None
+            self.last_nls_points = np.empty((0, 2), dtype=float)
             self.last_edge_count = 0
             self.last_oil_fraction = float(np.mean(binary_window))
             return self.last_edge_points
@@ -204,6 +140,15 @@ class Drone:
 
         self.edge_detected = True
         self.last_edge_points = filtered_points
+        self.last_nls_points = filtered_points.copy()
+        current_anchor = np.mean(filtered_points, axis=0)
+        if self.last_boundary_anchor_point is None:
+            self.last_boundary_anchor_point = current_anchor
+        else:
+            self.last_boundary_anchor_point = (
+                0.8 * np.asarray(self.last_boundary_anchor_point, dtype=float)
+                + 0.2 * current_anchor
+            )
         self.last_edge_count = int(filtered_points.shape[0])
         self.last_oil_fraction = float(np.mean(binary_window))
 
