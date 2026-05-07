@@ -207,6 +207,98 @@ class SimulationEngine:
         normal = normal / normal_norm
         return centroid, tangent, normal
 
+    def _interpolate_world_value(self, position):
+        pos = np.asarray(position, dtype=float)
+        if pos.shape != (2,) or not np.all(np.isfinite(pos)):
+            return None
+
+        x_coords = np.asarray(self.sim_map.x_coords, dtype=float)
+        y_coords = np.asarray(self.sim_map.y_coords, dtype=float)
+        field = np.asarray(self.world_field, dtype=float)
+        if field.ndim != 2 or field.shape != (x_coords.size, y_coords.size):
+            return None
+
+        x = float(np.clip(pos[0], x_coords[0], x_coords[-1]))
+        y = float(np.clip(pos[1], y_coords[0], y_coords[-1]))
+
+        i1 = int(np.searchsorted(x_coords, x, side="right"))
+        j1 = int(np.searchsorted(y_coords, y, side="right"))
+        i0 = max(0, min(i1 - 1, x_coords.size - 1))
+        j0 = max(0, min(j1 - 1, y_coords.size - 1))
+        i1 = max(0, min(i1, x_coords.size - 1))
+        j1 = max(0, min(j1, y_coords.size - 1))
+
+        if i0 == i1 and x_coords.size > 1:
+            i0 = max(0, i1 - 1)
+        if j0 == j1 and y_coords.size > 1:
+            j0 = max(0, j1 - 1)
+
+        x0 = float(x_coords[i0])
+        x1 = float(x_coords[i1])
+        y0 = float(y_coords[j0])
+        y1 = float(y_coords[j1])
+
+        q00 = float(field[i0, j0])
+        q10 = float(field[i1, j0])
+        q01 = float(field[i0, j1])
+        q11 = float(field[i1, j1])
+        if not np.all(np.isfinite([q00, q10, q01, q11])):
+            return None
+
+        if abs(x1 - x0) <= 1e-12 and abs(y1 - y0) <= 1e-12:
+            return q00
+        if abs(x1 - x0) <= 1e-12:
+            wy = (y - y0) / max(y1 - y0, 1e-12)
+            return (1.0 - wy) * q00 + wy * q01
+        if abs(y1 - y0) <= 1e-12:
+            wx = (x - x0) / max(x1 - x0, 1e-12)
+            return (1.0 - wx) * q00 + wx * q10
+
+        wx = (x - x0) / (x1 - x0)
+        wy = (y - y0) / (y1 - y0)
+        return (
+            (1.0 - wx) * (1.0 - wy) * q00
+            + wx * (1.0 - wy) * q10
+            + (1.0 - wx) * wy * q01
+            + wx * wy * q11
+        )
+
+    def _estimate_local_gradient(self, position):
+        pos = np.asarray(position, dtype=float)
+        if pos.shape != (2,) or not np.all(np.isfinite(pos)):
+            return None
+
+        dx = self.sim_map.x_coords[1] - self.sim_map.x_coords[0] if len(self.sim_map.x_coords) > 1 else self.resolution
+        dy = self.sim_map.y_coords[1] - self.sim_map.y_coords[0] if len(self.sim_map.y_coords) > 1 else self.resolution
+        hx = max(abs(float(dx)), self.resolution, 1e-3)
+        hy = max(abs(float(dy)), self.resolution, 1e-3)
+
+        # Use short orthogonal averaging strips around the query point to smooth
+        # the finite-difference estimate and reduce chattering near noisy edges.
+        y_offsets = (-0.5 * hy, 0.0, 0.5 * hy)
+        x_offsets = (-0.5 * hx, 0.0, 0.5 * hx)
+
+        dcdx_samples = []
+        for y_offset in y_offsets:
+            c_plus = self._interpolate_world_value(pos + np.array([hx, y_offset], dtype=float))
+            c_minus = self._interpolate_world_value(pos - np.array([hx, -y_offset], dtype=float))
+            if c_plus is None or c_minus is None:
+                return None
+            dcdx_samples.append((c_plus - c_minus) / (2.0 * hx))
+
+        dcdy_samples = []
+        for x_offset in x_offsets:
+            c_plus = self._interpolate_world_value(pos + np.array([x_offset, hy], dtype=float))
+            c_minus = self._interpolate_world_value(pos - np.array([-x_offset, hy], dtype=float))
+            if c_plus is None or c_minus is None:
+                return None
+            dcdy_samples.append((c_plus - c_minus) / (2.0 * hy))
+
+        gradient = np.array([np.mean(dcdx_samples), np.mean(dcdy_samples)], dtype=float)
+        if not np.all(np.isfinite(gradient)):
+            return None
+        return gradient
+
     def _bounce_exploration_command(self, drone):
         direction = np.asarray(getattr(drone, "exploration_direction", None), dtype=float)
         if direction.size != 2:
@@ -237,62 +329,44 @@ class SimulationEngine:
         return command
 
     def _boundary_tracking_command(self, drone):
-        points = getattr(drone, "last_nls_points", None)
-        centroid = None
-        tangent = None
-        normal = None
-
-        if points is not None:
-            centroid, tangent, normal = self._principal_tangent(points)
-
-        if centroid is None or tangent is None or normal is None:
-            target_point = getattr(drone, "last_boundary_anchor_point", None)
-            if target_point is None:
-                target_point = drone.last_edge_point
-            if target_point is None:
-                return None
-
-            edge_point = np.asarray(target_point, dtype=float)
-            position = np.array([drone.x, drone.y], dtype=float)
-            offset = position - edge_point
-            normal, distance = self._normalize_vector(offset)
-            if normal is None:
-                return None
-
-            tangent = np.array([normal[1], -normal[0]], dtype=float)
-            oil_fraction = drone.last_oil_fraction
-            if oil_fraction is None or not np.isfinite(oil_fraction):
-                oil_fraction = self.boundary_tracking_oil_fraction
-
-            distance_error = float(np.clip(distance - self.boundary_lock_distance, -self.boundary_error_cap, self.boundary_error_cap))
-            tangent_scale = np.clip(self.boundary_lock_distance / max(distance, self.boundary_lock_distance), 0.35, 1.0)
-            normal_gain = self.k_n * (float(oil_fraction) - self.boundary_tracking_oil_fraction)
-            normal_gain += self.boundary_lock_gain * distance_error
-
-            command = (self.k_t * tangent_scale) * tangent - normal_gain * normal
-            return self._clip_command(command, self.max_speed)
-
         position = np.array([drone.x, drone.y], dtype=float)
-        rel = position - centroid
-        signed_distance = float(np.dot(rel, normal))
-        if signed_distance < 0.0:
-            normal = -normal
-            signed_distance = -signed_distance
+        local_concentration = self._interpolate_world_value(position)
+        if local_concentration is None:
+            return None
 
-        # Keep a persistent tangent orientation by matching the previous command
-        # when possible. This avoids frame-to-frame flipping along the boundary.
-        prev = np.asarray(getattr(drone, "last_control_vector", np.zeros(2, dtype=float)), dtype=float)
-        if float(np.linalg.norm(prev)) > 1e-12 and float(np.dot(prev, tangent)) < 0.0:
-            tangent = -tangent
+        gradient = self._estimate_local_gradient(position)
+        normal, gradient_norm = self._normalize_vector(gradient)
+        if normal is None or gradient_norm <= 1e-8:
+            return None
 
-        oil_fraction = drone.last_oil_fraction
-        if oil_fraction is None or not np.isfinite(oil_fraction):
-            oil_fraction = self.boundary_tracking_oil_fraction
+        # The previous controller was an orbit-following law: it built the
+        # normal from `position - center` and regulated a radial distance to an
+        # implicit circle. That works only when the spill boundary is well
+        # approximated by a center/radius geometry.
+        #
+        # This controller is contour-following instead. The local field
+        # gradient points in the direction of steepest concentration increase,
+        # so its normalized version is the contour normal. Rotating that normal
+        # by 90 degrees produces a tangent direction that moves along the
+        # `c(x, y) = occupancy_threshold` level set for arbitrary spill shapes.
+        tangent = np.array([-normal[1], normal[0]], dtype=float)
+        tangent, tangent_norm = self._normalize_vector(tangent)
+        if tangent is None or tangent_norm <= 1e-12:
+            return None
 
-        distance_error = float(np.clip(signed_distance - self.boundary_lock_distance, -self.boundary_error_cap, self.boundary_error_cap))
-        tangent_scale = np.clip(self.boundary_lock_distance / max(signed_distance, self.boundary_lock_distance), 0.35, 1.0)
-        normal_gain = self.k_n * (float(oil_fraction) - self.boundary_tracking_oil_fraction)
-        normal_gain += self.boundary_lock_gain * distance_error
+        concentration_error = float(local_concentration - self.occupancy_threshold)
+        # Concentration error lives in field-value units, not meters, so clamp
+        # it independently from the legacy radial-distance tuning constants.
+        bounded_error = float(np.clip(concentration_error, -1.0, 1.0))
+        tangent_scale = 1.0
+        if abs(bounded_error) > 0.1:
+            tangent_scale = 0.35
+
+        normal_gain = self.k_n * bounded_error
+        if bounded_error > 0.0:
+            normal_gain += 0.5 * self.boundary_lock_gain * bounded_error
+        else:
+            normal_gain += self.boundary_lock_gain * bounded_error
 
         command = (self.k_t * tangent_scale) * tangent - normal_gain * normal
         return self._clip_command(command, self.max_speed)

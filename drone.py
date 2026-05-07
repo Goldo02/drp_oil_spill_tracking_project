@@ -68,6 +68,25 @@ class Drone:
             y_coords[j_min:j_max],
         )
 
+    def _padded_camera_coordinates(self, x_coords, y_coords, field_shape):
+        """
+        Return coordinate vectors aligned with the padded camera output.
+
+        `CameraSensor.sense()` pads the sampled field to a fixed square window
+        near world boundaries. We rebuild the matching coordinate axes here so
+        row/column indices from the sensed image can always be mapped back into
+        world coordinates without shape mismatches.
+        """
+        dx = x_coords[1] - x_coords[0] if len(x_coords) > 1 else 1.0
+        dy = y_coords[1] - y_coords[0] if len(y_coords) > 1 else 1.0
+        nx, ny = int(field_shape[0]), int(field_shape[1])
+        x_offsets = np.arange(nx, dtype=float) - 0.5 * (nx - 1)
+        y_offsets = np.arange(ny, dtype=float) - 0.5 * (ny - 1)
+
+        local_x_coords = self.x + x_offsets * dx
+        local_y_coords = self.y + y_offsets * dy
+        return local_x_coords.astype(float), local_y_coords.astype(float)
+
     @staticmethod
     def _boundary_mask(binary_window):
         """Mark occupied cells that touch free space in the local window."""
@@ -90,10 +109,10 @@ class Drone:
         # The camera introduces measurement noise, so the boundary estimate
         # can move slightly from one sensing cycle to the next.
         local_field = self.camera.sense(world_field, self.x, self.y, x_coords, y_coords)
-        _, local_x_coords, local_y_coords = self._camera_window(
-            world_field,
+        local_x_coords, local_y_coords = self._padded_camera_coordinates(
             x_coords,
             y_coords,
+            local_field.shape,
         )
 
         if local_field.size == 0:
