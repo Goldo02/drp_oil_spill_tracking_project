@@ -1,147 +1,109 @@
 import numpy as np
-import cv2
 
-
-def _to_uint8_grayscale(image: np.ndarray) -> np.ndarray:
-    """Convert an image to a single-channel uint8 array for processing."""
-    img = np.asarray(image)
-
-    if img.ndim == 3 and img.shape[2] == 3:
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    elif img.ndim == 3 and img.shape[2] == 1:
-        img = img[:, :, 0]
-
-    if img.dtype != np.uint8:
-        img = img.astype(np.float32)
-        if img.size > 0 and float(np.nanmax(img)) <= 1.0:
-            img = img * 255.0
-        img = np.clip(img, 0, 255).astype(np.uint8)
-
-    return img
-
-
-def extract_outer_boundary(points: np.ndarray, num_bins: int = 180) -> np.ndarray:
-    """
-    Refine a set of points to a 1-pixel wide exterior shell using polar discretization.
-    """
-    if points.size == 0 or len(points) < 5:
-        return points
-
-    # points are (row, col) coordinates => y, x
-    rows = points[:, 0]
-    cols = points[:, 1]
-
-    # center is mean of points
-    cy = np.mean(rows)
-    cx = np.mean(cols)
-
-    # Polar coordinates
-    dy = rows - cy
-    dx = cols - cx
-    r = np.sqrt(dx**2 + dy**2)
-    theta = np.arctan2(dy, dx)
-
-    bins = ((theta + np.pi) / (2 * np.pi) * num_bins).astype(int)
-    bins = np.clip(bins, 0, num_bins - 1)
-
-    idx_sorted = np.lexsort((-r, bins))
-    bins_sorted = bins[idx_sorted]
-
-    _, first_occurrences = np.unique(bins_sorted, return_index=True)
-    filtered_indices = idx_sorted[first_occurrences]
-
-    boundary_points = points[filtered_indices]
-
-    # Outlier rejection
-    if len(boundary_points) > 10:
-        br = np.sqrt((boundary_points[:, 0] - cy) ** 2 + (boundary_points[:, 1] - cx) ** 2)
-        med = np.median(br)
-        mad = np.median(np.abs(br - med))
-        if mad > 0:
-            mask = np.abs(br - med) < 3.0 * mad
-            boundary_points = boundary_points[mask]
-
-    return boundary_points
+try:
+    from scipy.ndimage import gaussian_filter, binary_erosion
+except ImportError:
+    gaussian_filter = None
+    binary_erosion = None
 
 
 def detect_edges(
-    image: np.ndarray,
-    threshold1: int = 30,
-    threshold2: int = 90,
-    blur_kernel: tuple[int, int] = (5, 5),
-    blur_sigma: float = 1.2,
-    apply_morphology: bool = True,
-) -> np.ndarray:
+    image,
+    threshold=0.5,
+    sigma=1.0,
+    **kwargs,
+):
     """
-    Isolates the oil spill boundary by thresholding and topological analysis.
-    This replaces standard Canny detection to avoid rectangular FOV artifacts.
+    Detect edges (oil spill boundary contour) in a local sensor measurement.
+
+    Directly uses the gradient/isoline of the smoothed concentration field
+    without Canny:
+    1. Smooths the noisy measurement field with a light Gaussian filter.
+    2. Finds the single-pixel boundary where concentration crosses the threshold.
+    3. Rejects empty regions (no false edges in clean water or solid oil).
+
+    Parameters
+    ----------
+    image : np.ndarray
+        2D local camera measurement array (values in [0, 1]).
+    threshold : float, optional
+        Occupancy/boundary threshold (default 0.5).
+    sigma : float, optional
+        Gaussian smoothing scale to suppress sensor noise (default 1.0).
+
+    Returns
+    -------
+    np.ndarray
+        Boolean 2D array of detected edge pixels (same shape as `image`).
     """
-    # 1) Robust Smoothing
-    # We use a significant blur to suppress sensor noise before thresholding
-    smoothed = cv2.GaussianBlur(image.astype(np.float32), (11, 11), 1.5)
+    image = np.asarray(image, dtype=float)
 
-    # 2) Binary Segmentation (Thresholding Oil vs Water)
-    # The oil is modeled as 1.0, water as 0.0. 0.5 is a robust threshold.
-    _, binary = cv2.threshold(smoothed, 0.5, 1.0, cv2.THRESH_BINARY)
-    binary = (binary * 255).astype(np.uint8)
+    if image.ndim != 2 or image.size == 0:
+        return np.zeros_like(image, dtype=bool)
 
-    # 3) Extract Boundary using Canny on the smoothed binary image
-    # This guarantees a single, clean transition line.
-    edges = cv2.Canny(binary, 50, 150)
+    # Return empty if the window has no significant variation (e.g. all empty water or all solid oil)
+    val_min = float(np.min(image))
+    val_max = float(np.max(image))
+    if val_max - val_min < 0.15:
+        return np.zeros_like(image, dtype=bool)
 
-    # Store images for extract_edge_points to leverage for FOV-clipping
-    detect_edges._last_gray = binary
+    # Handle legacy threshold arguments if provided
+    if "threshold1" in kwargs:
+        t1 = kwargs["threshold1"]
+        if 0.0 < float(t1) < 1.0:
+            threshold = float(t1)
 
-    return edges.astype(np.uint8)
+    threshold = float(threshold)
+
+    # 1. Smooth the measurement to eliminate high-frequency sensor noise
+    if gaussian_filter is not None and sigma > 0.0:
+        smoothed = gaussian_filter(image, sigma=float(sigma))
+    else:
+        smoothed = image
+
+    # 2. Binary mask of the detected spill region
+    mask = smoothed >= threshold
+
+    # 3. Extract the single-pixel boundary contour
+    if binary_erosion is not None:
+        eroded = binary_erosion(mask, border_value=True)
+        edges = mask ^ eroded
+    else:
+        padded = np.pad(mask, 1, mode="edge")
+        eroded = (
+            padded[1:-1, 1:-1]
+            & padded[:-2, 1:-1]
+            & padded[2:, 1:-1]
+            & padded[1:-1, :-2]
+            & padded[1:-1, 2:]
+        )
+        edges = mask & ~eroded
+
+    return edges
 
 
-def extract_edge_points(edges: np.ndarray, debug: bool = False) -> np.ndarray:
-    """Return coordinates of the primary oil-water arc, ignoring FOV-boundary clipped edges."""
+def extract_edge_points(edges):
+    """
+    Convert a binary edge image into point coordinates.
 
-    h, w = edges.shape
+    Parameters
+    ----------
+    edges : np.ndarray
+        Binary edge image.
 
-    # 1) Find all external contours in the edge image
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    Returns
+    -------
+    np.ndarray
+        Array with shape `(N, 2)` where each point is `[row, column]`.
+    """
+    edges = np.asarray(edges, dtype=bool)
 
-    if not contours:
-        return np.empty((0, 2))
+    if edges.ndim != 2 or edges.size == 0:
+        return np.empty((0, 2), dtype=float)
 
-    # Combined Point Cloud from all external contours
-    all_contour_points = []
-    for cnt in contours:
-        # contour is (N, 1, 2) [x, y]
-        pts = cnt.reshape(-1, 2)
+    rows, cols = np.nonzero(edges)
 
-        # 2) FOV CLIP FILTER: Remove points that are exactly on the image border
-        # False edges from sensor limits always occur at the perimeter (row 0, row h-1, etc.)
-        # We use a 3-pixel margin for safety.
-        mask = (pts[:, 1] > 2) & (pts[:, 1] < h - 3) & \
-               (pts[:, 0] > 2) & (pts[:, 0] < w - 3)
+    if len(rows) == 0:
+        return np.empty((0, 2), dtype=float)
 
-        clipped_pts = pts[mask]
-        if clipped_pts.size > 0:
-            all_contour_points.append(clipped_pts)
-
-    if not all_contour_points:
-        return np.empty((0, 2))
-
-    # Merge valid arcs
-    points_merged = np.vstack(all_contour_points)
-
-    # Swap (x, y) -> (row, col)
-    res_points = np.column_stack([points_merged[:, 1], points_merged[:, 0]])
-
-    # 3) Final refinement: extract the outermost shell of the detected arc
-    # This helps if small internal 'bubbles' survived.
-    final_points = extract_outer_boundary(res_points)
-
-    if debug:
-        import matplotlib.pyplot as plt
-        plt.figure("Contour Refinement Debug", figsize=(6, 6))
-        plt.scatter(res_points[:, 1], res_points[:, 0], c='red', s=5, label='Filtered Arcs')
-        plt.scatter(final_points[:, 1], final_points[:, 0], c='green', s=10, label='Final Boundary')
-        plt.gca().invert_yaxis()
-        plt.axis('equal')
-        plt.show()
-
-    return final_points
+    return np.column_stack((rows, cols)).astype(float)
