@@ -1,3 +1,5 @@
+import os
+
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -427,12 +429,72 @@ class Visualizer:
             control_arrow
         )
 
-    def save_final_state(self, filename="final_simulation_state.png"):
-        """Salva lo stato visivo finale della simulazione."""
-        self.fig.savefig(filename, bbox_inches="tight")
-        print(f"Final simulation state saved to {filename}.")
+    def _ensure_output_dir(self, directory="./tmp_output"):
+        """Create a target directory for PNG exports and return its absolute path."""
+        output_dir = os.path.abspath(directory)
+        os.makedirs(output_dir, exist_ok=True)
+        return output_dir
 
-    def plot_consensus_convergence(self, engine, filename="consensus_convergence.png"):
+    def _output_path(self, filename, directory="./tmp_output"):
+        """Build an output path under the requested directory."""
+        return os.path.join(self._ensure_output_dir(directory), filename)
+
+    def save_final_state(self, filename="final_simulation_state.png", directory="./tmp_output"):
+        """Salva lo stato visivo finale della simulazione."""
+        output_path = self._output_path(filename, directory)
+        self.fig.savefig(output_path, bbox_inches="tight")
+        print(f"Final simulation state saved to {output_path}.")
+
+    def save_final_occupancy_grid_per_robot(
+        self,
+        drones,
+        directory="./tmp_output",
+        filename_prefix="final_occupancy_grid_robot",
+        alpha=1.0,
+    ):
+        """Save the final local occupancy grid of every drone to PNG files."""
+        if drones is None:
+            return
+
+        output_dir = self._ensure_output_dir(directory)
+
+        for drone in drones:
+            grid = np.asarray(getattr(drone, "grid", np.zeros((1, 1))), dtype=float)
+            if grid.size == 0:
+                continue
+
+            binary_grid = (grid >= 0.5).astype(float)
+            fig, ax = plt.subplots(figsize=(8, 7))
+            im = ax.imshow(
+                binary_grid.T,
+                origin="lower",
+                cmap="Greys",
+                alpha=float(alpha),
+                vmin=0.0,
+                vmax=1.0,
+            )
+
+            ax.set_title(f"Final Occupancy Grid - Drone {drone.drone_id}")
+            ax.set_xlabel("Grid X")
+            ax.set_ylabel("Grid Y")
+            fig.colorbar(im, ax=ax)
+            fig.tight_layout()
+
+            output_path = os.path.join(
+                output_dir,
+                f"{filename_prefix}_{drone.drone_id}.png",
+            )
+            fig.savefig(
+                output_path,
+                bbox_inches="tight",
+                facecolor="white",
+                transparent=False,
+            )
+            plt.close(fig)
+
+        print(f"Per-drone final occupancy grids saved to {output_dir}.")
+
+    def plot_consensus_convergence(self, engine, filename="consensus_convergence.png", directory="./tmp_output"):
         """Genera e salva il grafico della convergenza del consenso."""
         error_history = np.asarray(engine.error_history, dtype=float)
         measurement_history = engine.measurement_consensus_history
@@ -483,21 +545,29 @@ class Visualizer:
             ax.grid(True, alpha=0.3)
 
         fig.tight_layout()
-        fig.savefig(filename, bbox_inches="tight")
+        output_path = self._output_path(filename, directory)
+        fig.savefig(output_path, bbox_inches="tight")
         plt.close(fig)
-        print(f"Consensus convergence plot saved to {filename}.")
+        print(f"Consensus convergence plot saved to {output_path}.")
 
-    def plot_final_occupancy_grid(self, final_grid, filename="final_occupancy_grid.png"):
+    def plot_final_occupancy_grid(
+        self,
+        final_grid,
+        filename="final_occupancy_grid.png",
+        directory="./tmp_output",
+        alpha=1.0,
+    ):
         """Genera e salva la griglia di occupazione finale unificata."""
-        max_value = float(np.max(final_grid)) if final_grid.size else 1.0
+        binary_grid = (np.asarray(final_grid, dtype=float) >= 0.5).astype(float)
 
         fig, ax = plt.subplots(figsize=(8, 7))
         im = ax.imshow(
-            final_grid.T,
+            binary_grid.T,
             origin="lower",
             cmap="Greys",
+            alpha=float(alpha),
             vmin=0.0,
-            vmax=max(1.0, max_value),
+            vmax=1.0,
         )
 
         ax.set_title("Final Occupancy Grid")
@@ -506,9 +576,10 @@ class Visualizer:
         fig.colorbar(im, ax=ax)
 
         fig.tight_layout()
-        fig.savefig(filename, bbox_inches="tight")
+        output_path = self._output_path(filename, directory)
+        fig.savefig(output_path, bbox_inches="tight", facecolor="white", transparent=False)
         plt.close(fig)
-        print(f"Final occupancy grid saved to {filename}.")
+        print(f"Final occupancy grid saved to {output_path}.")
 
     # ======================================================================
     # RENDER

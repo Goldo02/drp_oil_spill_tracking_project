@@ -60,11 +60,7 @@ class SimulationEngine:
             occupancy_threshold
         )
 
-        self.temporal_alpha = (
-            float(temporal_alpha)
-            if temporal_alpha is not None
-            else None
-        )
+        self.temporal_alpha = None
 
         self.consensus_rounds = max(
             1,
@@ -227,7 +223,7 @@ class SimulationEngine:
 
         for drone in self.drones:
 
-            edge_points = drone.sense(
+            edge_points = drone.sense( 
                 self.world_field,
                 self.sim_map.x_coords,
                 self.sim_map.y_coords,
@@ -238,7 +234,7 @@ class SimulationEngine:
                 x_min=self.x_min,
                 y_min=self.y_min,
                 resolution=self.resolution,
-                alpha=self.temporal_alpha,
+                alpha=None,
             )
 
     # ==================================================================
@@ -486,7 +482,7 @@ class SimulationEngine:
             5. distributed control;
             6. drone motion.
         """
-
+        
         self.frame += 1
 
         measurement_frame = (

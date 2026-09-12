@@ -288,14 +288,25 @@ def run_simulation(
     # 1. Render e salvataggio dello stato finale dello scenario
     final_data = engine.get_visualization_data()
     visualizer.render(final_data, pause=False)
-    visualizer.save_final_state("final_simulation_state.png")
+    output_dir = "./tmp_output"
+    visualizer.save_final_state("final_simulation_state.png", directory=output_dir)
 
     # 2. Generazione e salvataggio del grafico di convergenza del consenso
-    visualizer.plot_consensus_convergence(engine, "consensus_convergence.png")
+    visualizer.plot_consensus_convergence(engine, "consensus_convergence.png", directory=output_dir)
 
     # 3. Generazione e salvataggio della griglia di occupazione finale
     final_grid = engine.compute_mean_grid()
-    visualizer.plot_final_occupancy_grid(final_grid, "final_occupancy_grid.png")
+    visualizer.plot_final_occupancy_grid(
+        final_grid,
+        "final_occupancy_grid.png",
+        directory=output_dir,
+        alpha=1.0,
+    )
+    visualizer.save_final_occupancy_grid_per_robot(
+        engine.drones,
+        directory=output_dir,
+        alpha=1.0,
+    )
 
     # ==================================================================
     # FINAL DIAGNOSTICS

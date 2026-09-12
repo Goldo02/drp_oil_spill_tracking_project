@@ -331,32 +331,10 @@ class Drone:
         alpha=None,
     ):
         """
-        Fuse detected edge points into the local occupancy grid.
+        Fuse detected edge points into the local occupancy grid as a binary map.
 
-        Parameters
-        ----------
-        edge_points : array-like
-            Boundary points in global coordinates.
-
-        x_min, y_min : float
-            Origin of the occupancy grid.
-
-        resolution : float
-            Occupancy-grid resolution.
-
-        alpha : float or None
-            Temporal smoothing parameter.
-
-            If None:
-                grid += measurement
-
-            Otherwise:
-                grid = (1-alpha) * grid + alpha * measurement
-
-        Returns
-        -------
-        int
-            Number of valid measurements inserted into the grid.
+        Temporal smoothing is intentionally disabled: occupancy is represented as
+        either 0 (empty) or 1 (occupied), without alpha-based blending.
         """
 
         if edge_points is None:
@@ -406,33 +384,16 @@ class Drone:
             return 0
 
         # --------------------------------------------------------------
-        # Direct accumulation
+        # Binary occupancy update: a cell becomes occupied if it has been seen
+        # at least once; no temporal fusion / alpha blending is used.
         # --------------------------------------------------------------
 
-        if alpha is None:
+        self.grid = np.maximum(
+            self.grid,
+            measurement_grid,
+        )
 
-            self.grid += (
-                measurement_grid
-            )
-
-        # --------------------------------------------------------------
-        # Exponential temporal smoothing
-        # --------------------------------------------------------------
-
-        else:
-
-            alpha = float(
-                np.clip(
-                    alpha,
-                    0.0,
-                    1.0,
-                )
-            )
-
-            self.grid = (
-                (1.0 - alpha) * self.grid
-                + alpha * measurement_grid
-            )
+        self.grid = (self.grid > 0.0).astype(float)
 
         return valid_updates
 
@@ -496,6 +457,8 @@ class Drone:
             grids,
             axis=0,
         )
+
+        self.grid = (self.grid >= 0.5).astype(float)
 
         return self.grid
 
