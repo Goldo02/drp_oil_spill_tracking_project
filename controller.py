@@ -520,6 +520,44 @@ class Controller:
             action
         )
 
+    def _grid_target(self, drone):
+        """Return the nearest occupied cell in the consensus grid in world coordinates."""
+        grid = np.asarray(
+            getattr(drone, "grid", np.zeros((1, 1), dtype=float)),
+            dtype=float,
+        )
+
+        if grid.size == 0:
+            return None
+
+        occupied = np.argwhere(grid > self.occupancy_threshold)
+        if occupied.size == 0:
+            return None
+
+        grid_bounds = getattr(drone, "grid_bounds", None)
+        if grid_bounds is None:
+            return None
+
+        x_min, x_max, y_min, y_max = grid_bounds
+        if x_max <= x_min or y_max <= y_min:
+            return None
+
+        occupied_points = []
+        for ix, iy in occupied:
+            x = x_min + (ix + 0.5) * self.resolution
+            y = y_min + (iy + 0.5) * self.resolution
+            occupied_points.append(np.array([x, y], dtype=float))
+
+        if not occupied_points:
+            return None
+
+        occupied_points = np.asarray(occupied_points, dtype=float)
+        deltas = occupied_points - np.asarray([drone.x, drone.y], dtype=float)
+        distances = np.linalg.norm(deltas, axis=1)
+        best_idx = int(np.argmin(distances))
+
+        return occupied_points[best_idx]
+
     def compute_actions(
         self,
         drones,
@@ -530,6 +568,12 @@ class Controller:
         """
         Compute one action for every drone.
 
+        The decision is driven by the local consensus occupancy grid: if the
+        consensus map contains occupied boundary cells, the drone stays in
+        boundary_tracking and heads toward the closest occupied target. This
+        applies even when the local sensor flag is false but the map received
+        from neighbors contains the boundary information.
+
         Returns
         -------
         dict
@@ -539,81 +583,34 @@ class Controller:
         actions = {}
 
         for drone in drones:
+            target = self._grid_target(drone)
+            should_track_boundary = target is not None
 
-            action = None
+            if should_track_boundary:
+                drone.last_control_mode = "boundary_tracking"
 
-            if (
-                getattr(
+                action = self._boundary_tracking_action(
                     drone,
-                    "edge_detected",
-                    False,
-                )
-                and getattr(
-                    drone,
-                    "last_edge_point",
-                    None,
-                )
-                is not None
-            ):
-
-                action = (
-                    self._boundary_tracking_action(
-                        drone,
-                        world_field,
-                        x_coords,
-                        y_coords,
-                    )
+                    world_field,
+                    x_coords,
+                    y_coords,
                 )
 
-                if action is not None:
-                    drone.last_control_mode = (
-                        "boundary_tracking"
-                    )
-
-            if action is None:
-
-                target = getattr(
-                    drone,
-                    "last_edge_point",
-                    None,
-                )
-
-                if target is not None:
-
+                if action is None:
                     direction = self._normalize(
-                        np.asarray(target)
-                        - np.array(
-                            [drone.x, drone.y]
-                        )
+                        np.asarray(target, dtype=float)
+                        - np.array([drone.x, drone.y], dtype=float)
                     )
-
                     if direction is not None:
+                        action = direction * self.exploration_speed
+                    else:
+                        action = self._exploration_action(drone)
+                        drone.last_control_mode = "explore"
 
-                        action = (
-                            direction
-                            * self.exploration_speed
-                        )
+            else:
+                action = self._exploration_action(drone)
+                drone.last_control_mode = "explore"
 
-                        drone.last_control_mode = (
-                            "reacquire"
-                        )
-
-            if action is None:
-
-                action = (
-                    self._exploration_action(
-                        drone
-                    )
-                )
-
-                drone.last_control_mode = (
-                    "explore"
-                )
-
-            actions[
-                drone.drone_id
-            ] = self._clip_action(
-                action
-            )
+            actions[drone.drone_id] = self._clip_action(action)
 
         return actions
