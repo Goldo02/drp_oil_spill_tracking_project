@@ -117,6 +117,11 @@ class Drone:
             self._random_unit_direction()
         )
 
+        # Multi-hop known positions dictionary {drone_id: [x, y]}
+        self.known_positions = {
+            self.drone_id: np.array([self.x, self.y], dtype=float)
+        }
+
     # ==================================================================
     # STATE
     # ==================================================================
@@ -567,6 +572,11 @@ class Drone:
                 y_bounds[0],
                 y_bounds[1],
             )
+        )
+
+        self.known_positions[self.drone_id] = np.array(
+            [self.x, self.y],
+            dtype=float,
         )
 
         return command
