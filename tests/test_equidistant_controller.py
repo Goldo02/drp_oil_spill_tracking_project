@@ -197,7 +197,7 @@ class TestEquidistantController(unittest.TestCase):
         self.assertGreater(k_t_accelerate, self.controller.k_t)
 
     # ==================================================================
-    # 5. STATE MACHINE ACTIONS IN COMPUTE_ACTIONS
+    # 5. STATE MACHINE ACTIONS & SETTLING PHASE IN COMPUTE_ACTIONS
     # ==================================================================
 
     def test_state_transitions_in_compute_actions(self):
@@ -211,7 +211,7 @@ class TestEquidistantController(unittest.TestCase):
         drone_track = Drone("D_trk", 0.0, 0.0, grid_shape, grid_bounds)
         drone_track.grid[20:30, 25] = 1.0  # Open line
 
-        # 3. Drone with closed polygon -> equi_distant
+        # 3. Drone with closed polygon -> settling on first step, equi_distant after settling
         drone_eq = Drone("D_eq", 0.0, 1.5, grid_shape, grid_bounds)
         for ix in range(50):
             for iy in range(50):
@@ -224,7 +224,7 @@ class TestEquidistantController(unittest.TestCase):
         x_coords = np.linspace(-2.5, 2.5, 50)
         y_coords = np.linspace(-2.5, 2.5, 50)
 
-        # Execute compute_actions
+        # Step 1: initial closure triggers settling phase
         self.controller.compute_actions(
             [drone_explore, drone_track, drone_eq],
             world_field,
@@ -234,7 +234,59 @@ class TestEquidistantController(unittest.TestCase):
 
         self.assertEqual(drone_explore.last_control_mode, "explore")
         self.assertEqual(drone_track.last_control_mode, "boundary_tracking")
+        self.assertEqual(drone_eq.last_control_mode, "settling")
+
+        # Advance through remaining settling steps
+        for _ in range(self.controller.settling_steps - 1):
+            self.controller.compute_actions(
+                [drone_explore, drone_track, drone_eq],
+                world_field,
+                x_coords,
+                y_coords,
+            )
+            self.assertEqual(drone_eq.last_control_mode, "settling")
+
+        # Next step: transitions into equi_distant
+        self.controller.compute_actions(
+            [drone_explore, drone_track, drone_eq],
+            world_field,
+            x_coords,
+            y_coords,
+        )
         self.assertEqual(drone_eq.last_control_mode, "equi_distant")
+
+    def test_settling_synchronization_phase(self):
+        controller = Controller(
+            sim_map=self.sim_map,
+            communication_radius=3.0,
+            settling_steps=15,
+        )
+        grid_shape = (50, 50)
+        grid_bounds = (-2.5, 2.5, -2.5, 2.5)
+
+        drone = Drone("D_sync", 0.0, 1.5, grid_shape, grid_bounds)
+        for ix in range(50):
+            for iy in range(50):
+                x = -2.5 + (ix + 0.5) * 0.1
+                y = -2.5 + (iy + 0.5) * 0.1
+                if 1.4 <= np.hypot(x, y) <= 1.6:
+                    drone.grid[ix, iy] = 1.0
+
+        world_field = np.zeros((50, 50), dtype=float)
+        x_coords = np.linspace(-2.5, 2.5, 50)
+        y_coords = np.linspace(-2.5, 2.5, 50)
+
+        # First 15 steps must be in "settling" with kt = 0.0
+        for step in range(15):
+            controller.compute_actions([drone], world_field, x_coords, y_coords)
+            self.assertEqual(drone.last_control_mode, "settling")
+            self.assertEqual(drone.last_kt, 0.0)
+            self.assertEqual(drone.settling_counter, 15 - 1 - step)
+
+        # Step 16: simultaneous activation of "equi_distant"
+        controller.compute_actions([drone], world_field, x_coords, y_coords)
+        self.assertEqual(drone.last_control_mode, "equi_distant")
+        self.assertEqual(drone.settling_counter, 0)
 
 
 if __name__ == "__main__":

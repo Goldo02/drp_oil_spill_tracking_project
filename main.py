@@ -436,7 +436,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--communication-radius-cells",
         type=int,
-        default=205,
+        default=250,
     )
 
     parser.add_argument(

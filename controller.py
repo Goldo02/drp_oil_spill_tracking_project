@@ -24,6 +24,7 @@ class Controller:
         occupancy_threshold=0.5,
         resolution=0.1,
         k_spacing=1.5,
+        settling_steps=20,
     ):
         self.sim_map = sim_map
 
@@ -50,6 +51,7 @@ class Controller:
         self.k_t = 1.0
         self.k_n = 1.5
         self.k_spacing = float(k_spacing)
+        self.settling_steps = int(settling_steps)
 
         self.boundary_lock_gain = 3.0
 
@@ -882,16 +884,39 @@ class Controller:
                 is_closed = self.is_polygon_closed(drone.grid)
 
                 if is_closed:
-                    drone.last_control_mode = "equi_distant"
-                    ring_info = self.compute_ring_ordering(drone, drones)
-                    action = self._equidistant_action(
-                        drone,
-                        ring_info,
-                        world_field,
-                        x_coords,
-                        y_coords,
-                    )
+                    # Initialize settling counter if not set
+                    if getattr(drone, "settling_counter", None) is None:
+                        drone.settling_counter = self.settling_steps
+
+                    if drone.settling_counter > 0:
+                        # Transient settling/synchronization phase
+                        drone.settling_counter -= 1
+                        drone.last_control_mode = "settling"
+                        drone.last_kt = 0.0
+
+                        # Hold position on the boundary contour without tangential displacement
+                        action = self._boundary_tracking_action(
+                            drone,
+                            world_field,
+                            x_coords,
+                            y_coords,
+                            k_t=0.0,
+                        )
+                        if action is None:
+                            action = np.zeros(2, dtype=float)
+                    else:
+                        # Full equidistant spacing control
+                        drone.last_control_mode = "equi_distant"
+                        ring_info = self.compute_ring_ordering(drone, drones)
+                        action = self._equidistant_action(
+                            drone,
+                            ring_info,
+                            world_field,
+                            x_coords,
+                            y_coords,
+                        )
                 else:
+                    drone.settling_counter = None
                     drone.last_control_mode = "boundary_tracking"
                     action = self._boundary_tracking_action(
                         drone,
@@ -913,6 +938,7 @@ class Controller:
                             drone.last_control_mode = "explore"
 
             else:
+                drone.settling_counter = None
                 action = self._exploration_action(drone)
                 drone.last_control_mode = "explore"
 
@@ -933,6 +959,9 @@ class Controller:
 
             if is_closed:
                 ring_info = self.compute_ring_ordering(drone, drones)
+                settling_left = getattr(drone, "settling_counter", 0)
+                kt_val = getattr(drone, "last_kt", 0.0 if mode == "settling" else self.k_t)
+
                 if ring_info is not None:
                     com = ring_info["center_of_mass"]
                     angles_str = ", ".join(
@@ -941,12 +970,11 @@ class Controller:
                     )
                     pred_id = ring_info["pred"]["drone_id"]
                     succ_id = ring_info["succ"]["drone_id"]
-                    kt_val = getattr(drone, "last_kt", self.k_t)
 
                     print(f"  CoM: ({com[0]:.3f}, {com[1]:.3f}) | Sorted Angles: [{angles_str}]")
-                    print(f"  Predecessor: {pred_id} | Successor: {succ_id} | Tangential Gain (kt): {kt_val:.3f}")
+                    print(f"  Predecessor: {pred_id} | Successor: {succ_id} | Tangential Gain (kt): {kt_val:.3f} | Settling Remaining: {settling_left}")
                 else:
-                    print("  Ring info: None (no ring ordering computed)")
+                    print(f"  Ring info: None | Tangential Gain (kt): {kt_val:.3f} | Settling Remaining: {settling_left}")
             else:
                 print(f"  Boundary closed: False | Tangential Gain (kt): {self.k_t:.3f}")
         print("-------------------------------------------------------\n")
