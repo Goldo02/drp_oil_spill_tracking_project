@@ -139,7 +139,7 @@ def run_simulation(
 
         occupancy_threshold=0.5,
         temporal_alpha=0.05,
-        consensus_rounds=10,
+        consensus_rounds=0,
 
         dt=dt,
 
@@ -151,26 +151,8 @@ def run_simulation(
     # ==================================================================
 
     initial_radius = spill.radius
-
-    for i in range(num_drones):
-
-        start_x = np.random.uniform(
-            sim_map.xlim[0],
-            sim_map.xlim[1],
-        )
-
-        start_y = np.random.uniform(
-            sim_map.ylim[0],
-            sim_map.ylim[1],
-        )
-
-        engine.add_drone(
-            drone_id=f"D{i}",
-            x=start_x,
-            y=start_y,
-            gps_noise=0.03,
-            camera_noise=0.03,
-        )
+    engine.initialize_world_boundary()
+    engine.spawn_drones_on_boundary(num_drones)
 
     # ==================================================================
     # VISUALIZATION
@@ -230,19 +212,13 @@ def run_simulation(
     )
 
     print(
-        f"Consensus iterations per measurement: "
-        f"{engine.consensus_rounds}"
+        "Consensus: disabled"
     )
 
-    if fully_connected:
-        print(
-            "Mode: fully connected consensus"
-        )
-    else:
-        print(
-            "Mode: range-based communication "
-            f"(Rc={communication_radius:.2f})"
-        )
+    print(
+        "Mode: local-only control "
+        f"(Rc={communication_radius:.2f})"
+    )
 
     # ==================================================================
     # RUN
@@ -291,10 +267,7 @@ def run_simulation(
     output_dir = "./tmp_output"
     visualizer.save_final_state("final_simulation_state.png", directory=output_dir)
 
-    # 2. Generazione e salvataggio del grafico di convergenza del consenso
-    visualizer.plot_consensus_convergence(engine, "consensus_convergence.png", directory=output_dir)
-
-    # 3. Generazione e salvataggio della griglia di occupazione finale
+    # 2. Generazione e salvataggio della griglia di occupazione finale
     final_grid = engine.compute_mean_grid()
     visualizer.plot_final_occupancy_grid(
         final_grid,
@@ -320,7 +293,7 @@ def run_simulation(
     if error_history.size:
 
         print(
-            "\n=== FINAL CONSENSUS RESULTS ==="
+            "\n=== FINAL RESULTS ==="
         )
 
         print(

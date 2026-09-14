@@ -39,13 +39,20 @@ class Visualizer:
         # Figure
         # ------------------------------------------------------------------
 
-        self.fig, self.ax = plt.subplots(
-            figsize=(10, 8)
+        self.fig, (self.ax, self.ring_ax) = plt.subplots(
+            1,
+            2,
+            figsize=(16, 7),
         )
 
         self.ax.set_xlim(sim_map.xlim)
         self.ax.set_ylim(sim_map.ylim)
         self.ax.set_aspect("equal")
+
+        self.ring_ax.set_aspect("equal")
+        self.ring_ax.set_xlabel("Boundary x [m]")
+        self.ring_ax.set_ylabel("Boundary y [m]")
+        self.ring_ax.set_title("1D Voronoi boundary partition")
 
         if self.show_communication_radius:
             self.ax.set_title(
@@ -77,6 +84,9 @@ class Visualizer:
         self.edge_markers = {}
         self.nls_markers = {}
         self.control_arrows = {}
+        self.centroid_markers = {}
+        self.voronoi_ring_artists = []
+        self.ring_color_map = {}
 
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
@@ -191,6 +201,171 @@ class Visualizer:
                 self.control_arrows[drone_id].remove()
 
             del self.control_arrows[drone_id]
+
+        if drone_id in self.centroid_markers:
+            for artist in self.centroid_markers[drone_id]:
+                if artist is not None:
+                    artist.remove()
+
+            del self.centroid_markers[drone_id]
+
+    def _drone_color(self, drone_id):
+        """Return a deterministic color for a drone ID."""
+        if drone_id not in self.ring_color_map:
+            palette = plt.get_cmap("tab10")
+            ids = sorted(self.ring_color_map.keys())
+            idx = len(ids) % 10
+            self.ring_color_map[drone_id] = palette(idx)
+        return self.ring_color_map[drone_id]
+
+    def update_ring_partition(self, drones):
+        """Draw the 1D Voronoi partition as a line with one colored cell per drone."""
+        for artist in self.voronoi_ring_artists:
+            if artist is not None:
+                try:
+                    artist.remove()
+                except Exception:
+                    pass
+        self.voronoi_ring_artists = []
+
+        self.ring_ax.clear()
+        self.ring_ax.set_xlim(-0.5, 1.0)
+        self.ring_ax.set_ylim(-0.8, 0.8)
+        self.ring_ax.set_aspect("auto")
+        self.ring_ax.set_xlabel("Boundary arc index")
+        self.ring_ax.set_ylabel("Cell")
+        self.ring_ax.set_title("1D Voronoi boundary partition")
+        self.ring_ax.set_yticks([])
+
+        if drones is None:
+            return
+
+        canonical_assignment = None
+        canonical_points = None
+        canonical_ring = None
+
+        for drone in drones:
+            ring_data = getattr(drone, "last_ring_info", None)
+            if ring_data is None or "occupied_points" not in ring_data:
+                continue
+
+            occupied = np.asarray(ring_data["occupied_points"], dtype=float)
+            if occupied.size == 0:
+                continue
+
+            assigned = np.asarray(
+                ring_data.get("assigned_drone_indices", np.zeros(len(occupied), dtype=int)),
+                dtype=int,
+            )
+            if assigned.size == 0:
+                continue
+
+            if canonical_assignment is None:
+                canonical_assignment = assigned
+                canonical_points = occupied
+                canonical_ring = ring_data.get("ring", [])
+                break
+
+        if canonical_assignment is None:
+            return
+
+        n_points = len(canonical_assignment)
+        if n_points == 0:
+            return
+
+        self.ring_ax.set_xlim(-0.5, n_points - 0.5)
+
+        cell_colors = []
+        cell_indices = []
+        for drone in drones:
+            ring_data = getattr(drone, "last_ring_info", None)
+            if ring_data is None or "occupied_points" not in ring_data:
+                continue
+
+            occupied = np.asarray(ring_data["occupied_points"], dtype=float)
+            if occupied.size == 0:
+                continue
+
+            assigned = np.asarray(
+                ring_data.get("assigned_drone_indices", np.zeros(len(occupied), dtype=int)),
+                dtype=int,
+            )
+            if assigned.size == 0:
+                continue
+
+            current_idx = int(ring_data.get("current_idx", 0))
+            cell_mask = assigned == current_idx
+            if not np.any(cell_mask):
+                cell_mask = np.ones_like(assigned, dtype=bool)
+
+            drone_color = self._drone_color(drone.drone_id)
+            points_x = np.flatnonzero(cell_mask)
+            if points_x.size == 0:
+                continue
+
+            y = np.zeros(points_x.size, dtype=float)
+            point_colors = np.tile(np.asarray(drone_color, dtype=float), (points_x.size, 1))
+            sc = self.ring_ax.scatter(
+                points_x,
+                y,
+                s=60,
+                c=point_colors,
+                alpha=0.9,
+                edgecolors="black",
+                linewidths=0.3,
+                zorder=2,
+            )
+            self.voronoi_ring_artists.append(sc)
+            cell_colors.append(drone_color)
+            cell_indices.append(points_x)
+
+            target_centroid = getattr(drone, "target_centroid", None)
+            if target_centroid is not None:
+                tc = np.asarray(target_centroid, dtype=float)
+                if tc.shape == (2,) and np.all(np.isfinite(tc)):
+                    target_idx = None
+                    if canonical_ring:
+                        for entry in canonical_ring:
+                            if entry.get("drone_id") == drone.drone_id:
+                                target_idx = entry.get("target_chain_index")
+                                break
+                    if target_idx is None:
+                        target_idx = float(np.median(points_x))
+                    sc_tc = self.ring_ax.scatter(
+                        [float(target_idx)],
+                        [0.0],
+                        s=90,
+                        c=[drone_color],
+                        marker="*",
+                        edgecolors="black",
+                        linewidths=0.8,
+                        zorder=5,
+                    )
+                    self.voronoi_ring_artists.append(sc_tc)
+                    self.ring_ax.text(
+                        float(target_idx) + 0.12,
+                        0.10,
+                        f"{drone.drone_id}",
+                        color=drone_color,
+                        fontsize=8,
+                        fontweight="bold",
+                        zorder=6,
+                    )
+
+        if canonical_assignment.size > 1:
+            separator_positions = np.where(np.diff(canonical_assignment) != 0)[0] + 0.5
+            if separator_positions.size:
+                self.ring_ax.vlines(
+                    separator_positions,
+                    -0.55,
+                    0.55,
+                    colors="black",
+                    linewidths=0.9,
+                    alpha=0.75,
+                    zorder=1,
+                )
+
+        self.ring_ax.hlines(0.0, -0.5, max(n_points - 0.5, 0.5), colors="gray", linewidths=0.8, alpha=0.35, zorder=0)
 
     def update_drone(self, drone):
         """
@@ -429,6 +604,37 @@ class Visualizer:
             control_arrow
         )
 
+        # ------------------------------------------------------------------
+        # Target centroid marker (1D Boundary Voronoi)
+        # ------------------------------------------------------------------
+        centroid_artists = []
+        target_centroid = getattr(drone, "target_centroid", None)
+        if target_centroid is not None:
+            tc = np.asarray(target_centroid, dtype=float)
+            if tc.shape == (2,) and np.all(np.isfinite(tc)):
+                c_marker = self.ax.scatter(
+                    [tc[0]],
+                    [tc[1]],
+                    s=80,
+                    c="gold",
+                    marker="*",
+                    edgecolors="black",
+                    linewidths=0.8,
+                    zorder=7,
+                )
+                c_label = self.ax.text(
+                    tc[0] + 0.12,
+                    tc[1] + 0.12,
+                    f"C_{drone_id}",
+                    fontsize=7,
+                    color="goldenrod",
+                    fontweight="bold",
+                    zorder=8,
+                )
+                centroid_artists.extend([c_marker, c_label])
+
+        self.centroid_markers[drone_id] = centroid_artists
+
     def _ensure_output_dir(self, directory="./tmp_output"):
         """Create a target directory for PNG exports and return its absolute path."""
         output_dir = os.path.abspath(directory)
@@ -495,60 +701,8 @@ class Visualizer:
         print(f"Per-drone final occupancy grids saved to {output_dir}.")
 
     def plot_consensus_convergence(self, engine, filename="consensus_convergence.png", directory="./tmp_output"):
-        """Genera e salva il grafico della convergenza del consenso."""
-        error_history = np.asarray(engine.error_history, dtype=float)
-        measurement_history = engine.measurement_consensus_history
-
-        fig, ax = plt.subplots(figsize=(12, 5))
-
-        if measurement_history:
-            color_cycle = plt.cm.tab10(
-                np.linspace(0, 1, max(1, len(engine.drones)))
-            )
-
-            for measure_idx, cycle_trace in enumerate(measurement_history, start=1):
-                cycle_length = len(next(iter(cycle_trace.values())))
-                x_values = np.linspace(measure_idx - 1.0, measure_idx, cycle_length)
-
-                for drone_idx, drone in enumerate(engine.drones):
-                    drone_id = drone.drone_id
-                    y_values = np.asarray(cycle_trace[drone_id], dtype=float)
-
-                    ax.plot(
-                        x_values,
-                        y_values,
-                        color=color_cycle[drone_idx % len(color_cycle)],
-                        linewidth=1.8,
-                        marker="o",
-                        markersize=3,
-                        alpha=0.9,
-                        label=drone_id if measure_idx == 1 else None,
-                    )
-
-            measurement_count = len(measurement_history)
-            ax.set_xlim(0, measurement_count)
-            ax.set_xticks(np.arange(0, measurement_count + 1, 1))
-            ax.set_title("Consensus Convergence Between Measurements")
-            ax.set_xlabel("Number of measurements + 1")
-            ax.set_ylabel("Grid disagreement error")
-            ax.grid(True, alpha=0.3)
-            ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
-        else:
-            ax.plot(
-                np.arange(1, len(error_history) + 1),
-                error_history,
-                linewidth=2.0,
-            )
-            ax.set_title("Consensus Disagreement Error")
-            ax.set_xlabel("Iteration")
-            ax.set_ylabel("Error")
-            ax.grid(True, alpha=0.3)
-
-        fig.tight_layout()
-        output_path = self._output_path(filename, directory)
-        fig.savefig(output_path, bbox_inches="tight")
-        plt.close(fig)
-        print(f"Consensus convergence plot saved to {output_path}.")
+        """Disabled: inter-robot consensus is intentionally not used in this baseline."""
+        return None
 
     def plot_final_occupancy_grid(
         self,
@@ -618,6 +772,8 @@ class Visualizer:
         # Update drones.
         for drone in drones:
             self.update_drone(drone)
+
+        self.update_ring_partition(drones)
 
         self.fig.canvas.draw_idle()
         self.fig.canvas.flush_events()

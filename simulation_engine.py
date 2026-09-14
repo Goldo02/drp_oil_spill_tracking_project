@@ -35,7 +35,7 @@ class SimulationEngine:
         fully_connected=False,
         occupancy_threshold=0.5,
         temporal_alpha=0.05,
-        consensus_rounds=10,
+        consensus_rounds=0,
         dt=1.0,
         verbose=True,
     ):
@@ -47,7 +47,17 @@ class SimulationEngine:
         self.y_min = float(y_min)
         self.y_max = float(y_max)
 
+        # The robot occupancy grid must share the same physical domain as the
+        # underlying simulation map. Otherwise the indices of the grid and the
+        # continuous world coordinates refer to different coordinate systems.
+        if hasattr(self.sim_map, "xlim"):
+            self.x_min, self.x_max = map(float, self.sim_map.xlim)
+        if hasattr(self.sim_map, "ylim"):
+            self.y_min, self.y_max = map(float, self.sim_map.ylim)
+
         self.resolution = float(resolution)
+        if hasattr(self.sim_map, "dx") and float(self.sim_map.dx) > 0.0:
+            self.resolution = float(abs(self.sim_map.dx))
         self.dt = float(dt)
 
         self.sensor_size = int(sensor_size)
@@ -63,7 +73,7 @@ class SimulationEngine:
         self.temporal_alpha = None
 
         self.consensus_rounds = max(
-            1,
+            0,
             int(consensus_rounds),
         )
 
@@ -214,40 +224,102 @@ class SimulationEngine:
 
         return drone
 
+    def initialize_world_boundary(self):
+        """Precompute the closed boundary contour and force the controller to use it immediately."""
+        x_coords = getattr(self.sim_map, "x_coords", None)
+        y_coords = getattr(self.sim_map, "y_coords", None)
+        if x_coords is None:
+            x_coords = np.linspace(self.x_min, self.x_max, self.Nx)
+        if y_coords is None:
+            y_coords = np.linspace(self.y_min, self.y_max, self.Ny)
+
+        self.world_boundary_points = self.controller.initialize_known_boundary(
+            self.world_field,
+            x_coords=x_coords,
+            y_coords=y_coords,
+            force_closed=True,
+        )
+        return self.world_boundary_points.copy()
+
+    def spawn_drones_on_boundary(self, num_drones, rng=None):
+        """Spawn drones directly on random boundary contour points, not in open space."""
+        if num_drones <= 0:
+            return []
+
+        boundary_points = np.asarray(self.world_boundary_points, dtype=float)
+        if boundary_points.size == 0:
+            boundary_points = self.initialize_world_boundary()
+
+        if boundary_points.size == 0:
+            return []
+
+        if rng is None:
+            rng = np.random.default_rng()
+
+        if len(boundary_points) >= num_drones:
+            idx = rng.choice(len(boundary_points), size=num_drones, replace=False)
+        else:
+            idx = rng.choice(len(boundary_points), size=num_drones, replace=True)
+
+        self.drones = []
+        source_x = np.asarray(getattr(self.sim_map, "x_coords", np.linspace(self.x_min, self.x_max, self.world_field.shape[0])), dtype=float)
+        source_y = np.asarray(getattr(self.sim_map, "y_coords", np.linspace(self.y_min, self.y_max, self.world_field.shape[1])), dtype=float)
+        contour_grid = self.controller.build_boundary_grid(
+            self.world_field,
+            source_x,
+            source_y,
+        )
+
+        target_x = np.linspace(self.x_min, self.x_max, self.Nx)
+        target_y = np.linspace(self.y_min, self.y_max, self.Ny)
+        resampled_contour = np.zeros(self.grid_shape, dtype=float)
+        for ix, x in enumerate(target_x):
+            xi = int(np.argmin(np.abs(source_x - x)))
+            for iy, y in enumerate(target_y):
+                yi = int(np.argmin(np.abs(source_y - y)))
+                resampled_contour[ix, iy] = contour_grid[xi, yi]
+
+        for drone_idx, point_idx in enumerate(idx):
+            x, y = boundary_points[int(point_idx)]
+            drone = self.add_drone(
+                drone_id=f"D{drone_idx}",
+                x=float(x),
+                y=float(y),
+                gps_noise=0.03,
+                camera_noise=0.03,
+            )
+            drone.grid = resampled_contour.copy()
+            drone.settling_counter = 0
+            drone.last_control_mode = "equi_distant"
+
+        for drone in self.drones:
+            drone.known_positions = {
+                other.drone_id: np.array([other.x, other.y], dtype=float)
+                for other in self.drones
+            }
+
+        return list(self.drones)
+
     # ==================================================================
     # SENSING
     # ==================================================================
 
     def _perform_measurement(self):
-        """Perform sensing and local grid updates."""
+        """No sensing updates in this no-consensus baseline; local occupancy grids remain frozen."""
 
         for drone in self.drones:
-
-            edge_points = drone.sense( 
-                self.world_field,
-                self.sim_map.x_coords,
-                self.sim_map.y_coords,
-            )
-
-            drone.update_grid(
-                edge_points=edge_points,
-                x_min=self.x_min,
-                y_min=self.y_min,
-                resolution=self.resolution,
-                alpha=None,
-            )
+            # Sensor-driven occupancy updates are intentionally disabled.
+            # Each robot keeps its local grid fixed to the initial contour state.
+            continue
 
     # ==================================================================
     # CONSENSUS
     # ==================================================================
 
     def _perform_consensus(self):
-        """Run the configured number of consensus iterations."""
+        """Consensus is intentionally disabled for this baseline."""
 
-        for _ in range(self.consensus_rounds):
-            self.controller.consensus_step(
-                self.drones
-            )
+        return None
 
     # ==================================================================
     # DIAGNOSTICS
@@ -352,6 +424,45 @@ class SimulationEngine:
         print(
             f"    per-drone: {ordered}"
         )
+
+    def _print_control_snapshot(self, header):
+        if not self.verbose:
+            return
+
+        if not self.drones:
+            return
+
+        print(f"{header}")
+        for drone in self.drones:
+            pos = np.asarray([drone.x, drone.y], dtype=float)
+            target = getattr(drone, "target_centroid", None)
+            if target is not None:
+                target = np.asarray(target, dtype=float)
+                target_str = f"target=({target[0]:.3f}, {target[1]:.3f})"
+            else:
+                target_str = "target=None"
+
+            action = np.asarray(
+                getattr(drone, "last_control_vector", np.zeros(2, dtype=float)),
+                dtype=float,
+            )
+            action_str = f"action=({action[0]:.3f}, {action[1]:.3f})"
+            speed = float(np.linalg.norm(action))
+
+            ring_info = getattr(drone, "last_ring_info", None)
+            if ring_info is not None:
+                current = ring_info.get("current", {})
+                theta = current.get("angle", np.nan)
+                ring_str = f"theta={theta:.3f}"
+            else:
+                ring_str = "theta=NA"
+
+            mode = getattr(drone, "last_control_mode", "unknown")
+            print(
+                f"    {drone.drone_id}: pos=({pos[0]:.3f}, {pos[1]:.3f}), "
+                f"mode={mode}, {target_str}, {ring_str}, "
+                f"{action_str}, speed={speed:.3f}"
+            )
 
     # ==================================================================
     # MEASUREMENT HISTORY
@@ -477,10 +588,9 @@ class SimulationEngine:
         Order:
             1. update environment;
             2. sensing;
-            3. consensus;
-            4. diagnostics;
-            5. distributed control;
-            6. drone motion.
+            3. diagnostics;
+            4. local control;
+            5. drone motion.
         """
         
         self.frame += 1
@@ -496,7 +606,7 @@ class SimulationEngine:
             frame_type = (
                 "measurement"
                 if measurement_frame
-                else "consensus"
+                else "cycle"
             )
 
             print(
@@ -528,26 +638,6 @@ class SimulationEngine:
 
             if self.verbose:
                 self._print_sensor_status()
-
-        # --------------------------------------------------------------
-        # Consensus
-        # --------------------------------------------------------------
-
-        for round_idx in range(
-            self.consensus_rounds
-        ):
-
-            self.controller.consensus_step(
-                self.drones
-            )
-
-            self._record_measurement_trace()
-
-            self._print_error_snapshot(
-                f"  Consensus iteration "
-                f"{round_idx + 1}/"
-                f"{self.consensus_rounds}"
-            )
 
         # --------------------------------------------------------------
         # Diagnostics
@@ -584,6 +674,10 @@ class SimulationEngine:
                 f"global_disagreement="
                 f"{error:.6f} | "
                 f"modes: {mode_summary}"
+            )
+
+            self._print_control_snapshot(
+                "  Control snapshot"
             )
 
         return error

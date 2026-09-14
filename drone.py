@@ -122,6 +122,9 @@ class Drone:
             self.drone_id: np.array([self.x, self.y], dtype=float)
         }
 
+        # 1D Boundary Voronoi target centroid
+        self.target_centroid = None
+
     # ==================================================================
     # STATE
     # ==================================================================
@@ -403,7 +406,7 @@ class Drone:
         return valid_updates
 
     # ==================================================================
-    # LOCAL CONSENSUS
+    # LOCAL CONSENSUS (DISABLED)
     # ==================================================================
 
     def consensus_update(
@@ -411,61 +414,12 @@ class Drone:
         neighbors,
         own_grid=None,
     ):
-        """
-        Perform one local consensus operation.
+        """No-op: inter-drone grid averaging is intentionally disabled."""
 
-        The Controller decides which drones participate in the consensus.
-        This method only performs the averaging operation.
-
-        Parameters
-        ----------
-        neighbors : iterable
-            Neighboring Drone objects.
-
-        own_grid : np.ndarray or None
-            Optional snapshot of this drone's grid.
-
-        Returns
-        -------
-        np.ndarray
-            Updated local grid.
-        """
-
-        if own_grid is None:
-            base_grid = self.grid
-        else:
-            base_grid = np.asarray(
-                own_grid,
-                dtype=float,
-            )
-
-        grids = [
-            np.asarray(
-                base_grid,
-                dtype=float,
-            )
-        ]
-
-        for neighbor in neighbors:
-
-            grids.append(
-                np.asarray(
-                    neighbor.grid,
-                    dtype=float,
-                )
-            )
-
-        if len(grids) == 1:
-            return self.grid
-
-        self.grid = np.mean(
-            grids,
-            axis=0,
-        )
-
-        self.grid = (self.grid >= 0.5).astype(float)
-
-        return self.grid
+        return np.asarray(
+            self.grid,
+            dtype=float,
+        ).copy()
 
     # ==================================================================
     # DYNAMICS
