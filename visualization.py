@@ -267,7 +267,41 @@ class Visualizer:
                 break
 
         if canonical_assignment is None:
-            return
+            # Fallback: try to build a canonical ring assignment from any
+            # drone's `known_boundary_points` if available. This allows the
+            # 1D partition plot to show something even when `last_ring_info`
+            # is not provided by the simulation.
+            boundary_pts = None
+            for drone in drones:
+                kb = getattr(drone, "known_boundary_points", None)
+                if kb is not None and len(kb) > 0:
+                    boundary_pts = np.asarray(kb, dtype=float)
+                    break
+
+            if boundary_pts is None or boundary_pts.size == 0:
+                return
+
+            n_points = len(boundary_pts)
+            # compute each drone's nearest boundary index
+            drone_indices = []
+            drone_ids = []
+            for drone in drones:
+                pos = np.array([drone.x, drone.y], dtype=float)
+                dists = np.linalg.norm(boundary_pts - pos, axis=1)
+                idx = int(np.argmin(dists))
+                drone_indices.append(idx)
+                drone_ids.append(drone.drone_id)
+
+            # Build canonical_assignment using circular distance to nearest drone index
+            canonical_assignment = np.zeros(n_points, dtype=object)
+            for j in range(n_points):
+                # circular distances
+                diffs = np.abs((np.array(drone_indices, dtype=float) - float(j) + n_points / 2.0) % n_points - n_points / 2.0)
+                nearest = int(np.argmin(diffs))
+                canonical_assignment[j] = drone_ids[nearest]
+
+            canonical_points = boundary_pts
+            canonical_ring = []
 
         n_points = len(canonical_assignment)
         if n_points == 0:
@@ -353,8 +387,10 @@ class Visualizer:
                     )
 
         if canonical_assignment.size > 1:
-            separator_positions = np.where(np.diff(canonical_assignment) != 0)[0] + 0.5
-            if separator_positions.size:
+            # canonical_assignment may contain non-numeric IDs (strings). Compute
+            # separator positions by scanning for value changes to avoid numpy.diff
+            separator_positions = [i + 0.5 for i in range(canonical_assignment.size - 1) if canonical_assignment[i] != canonical_assignment[i + 1]]
+            if len(separator_positions):
                 self.ring_ax.vlines(
                     separator_positions,
                     -0.55,
@@ -734,6 +770,140 @@ class Visualizer:
         fig.savefig(output_path, bbox_inches="tight", facecolor="white", transparent=False)
         plt.close(fig)
         print(f"Final occupancy grid saved to {output_path}.")
+
+    def get_ring_partition_info(self, drones):
+        """
+        Extract canonical ring partition information used by the 1D plot.
+
+        Returns a dict with keys:
+        - n_points: number of ring points
+        - canonical_assignment: array of assigned drone indices per ring point
+        - canonical_points: coordinates of ring points
+        - canonical_ring: optional ring metadata
+        - per_drone: mapping drone_id -> {indices: np.ndarray, target_idx: float|None}
+        """
+        if drones is None:
+            return None
+
+        canonical_assignment = None
+        canonical_points = None
+        canonical_ring = None
+
+        for drone in drones:
+            ring_data = getattr(drone, "last_ring_info", None)
+            if ring_data is None or "occupied_points" not in ring_data:
+                continue
+
+            occupied = np.asarray(ring_data["occupied_points"], dtype=float)
+            if occupied.size == 0:
+                continue
+
+            assigned = np.asarray(
+                ring_data.get("assigned_drone_indices", np.zeros(len(occupied), dtype=int)),
+                dtype=int,
+            )
+            if assigned.size == 0:
+                continue
+
+            canonical_assignment = assigned
+            canonical_points = occupied
+            canonical_ring = ring_data.get("ring", [])
+            break
+
+        if canonical_assignment is None:
+            return None
+
+        info = {
+            "n_points": int(canonical_assignment.size),
+            "canonical_assignment": canonical_assignment,
+            "canonical_points": canonical_points,
+            "canonical_ring": canonical_ring,
+            "per_drone": {},
+        }
+
+        for drone in drones:
+            ring_data = getattr(drone, "last_ring_info", None)
+            if ring_data is None or "occupied_points" not in ring_data:
+                continue
+
+            occupied = np.asarray(ring_data["occupied_points"], dtype=float)
+            if occupied.size == 0:
+                continue
+
+            assigned = np.asarray(
+                ring_data.get("assigned_drone_indices", np.zeros(len(occupied), dtype=int)),
+                dtype=int,
+            )
+            if assigned.size == 0:
+                continue
+
+            current_idx = int(ring_data.get("current_idx", 0))
+            cell_mask = assigned == current_idx
+            if not np.any(cell_mask):
+                # fallback: all indices
+                indices = np.flatnonzero(np.ones_like(assigned, dtype=bool))
+            else:
+                indices = np.flatnonzero(cell_mask)
+
+            # find target index from canonical_ring metadata if available
+            target_idx = None
+            if canonical_ring:
+                for entry in canonical_ring:
+                    if entry.get("drone_id") == drone.drone_id:
+                        target_idx = entry.get("target_chain_index")
+                        break
+
+            if target_idx is None:
+                if indices.size:
+                    target_idx = float(np.median(indices))
+                else:
+                    target_idx = None
+
+            info["per_drone"][drone.drone_id] = {
+                "indices": indices,
+                "target_idx": target_idx,
+            }
+
+        return info
+
+    def print_voronoi_targets(self, drones):
+        """Stampa su console i target Voronoi calcolati per ogni drone (1D/2D)."""
+        if drones is None:
+            print("No drones provided.")
+            return
+
+        info = self.get_ring_partition_info(drones)
+
+        for drone in drones:
+            tid = getattr(drone, "drone_id", None)
+            tc = getattr(drone, "target_centroid", None)
+            if tc is None:
+                tc_str = "None"
+            else:
+                tc = np.asarray(tc, dtype=float)
+                tc_str = np.array2string(tc, precision=3, separator=", ")
+
+            per = None
+            if info is not None:
+                per = info["per_drone"].get(tid, None)
+
+            idxs = per["indices"] if per is not None else None
+            t_idx = per["target_idx"] if per is not None else None
+
+            print(f"Drone {tid}: target_centroid={tc_str}, target_idx={t_idx}, assigned_points_count={None if idxs is None else len(idxs)}")
+
+    def save_ring_partition_image(self, drones, filename="voronoi_ring.png", directory="./tmp_output", dpi=150):
+        """Salva il grafico 1D (ring partition) su file PNG."""
+        # Update the ring partition plot to ensure axes artists are current
+        self.update_ring_partition(drones)
+
+        output_path = self._output_path(filename, directory)
+        try:
+            # Save the full figure; ring_ax is part of self.fig
+            self.fig.savefig(output_path, bbox_inches="tight", dpi=dpi)
+            print(f"Ring partition image saved to {output_path}.")
+        except Exception as e:
+            print(f"Failed to save ring partition image: {e}")
 
     # ======================================================================
     # RENDER
