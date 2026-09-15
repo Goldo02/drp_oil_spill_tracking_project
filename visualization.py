@@ -254,8 +254,8 @@ class Visualizer:
                 continue
 
             assigned = np.asarray(
-                ring_data.get("assigned_drone_indices", np.zeros(len(occupied), dtype=int)),
-                dtype=int,
+                ring_data.get("assigned_drone_indices", np.zeros(len(occupied), dtype=object)),
+                dtype=object,
             )
             if assigned.size == 0:
                 continue
@@ -307,84 +307,131 @@ class Visualizer:
         if n_points == 0:
             return
 
-        self.ring_ax.set_xlim(-0.5, n_points - 0.5)
+        x_margin = max(2.0, 0.03 * float(n_points))
+        self.ring_ax.set_xlim(-x_margin, n_points - 1 + x_margin)
 
         cell_colors = []
         cell_indices = []
+        # For each drone, prefer per-drone `last_ring_info`; otherwise fall back
+        # to the canonical assignment determined above so drones are visible
+        # on the 1D ring even when they don't carry individual ring metadata.
         for drone in drones:
+            # determine assignment array and occupied points to use
             ring_data = getattr(drone, "last_ring_info", None)
-            if ring_data is None or "occupied_points" not in ring_data:
+            if ring_data is not None and "occupied_points" in ring_data:
+                occupied = np.asarray(ring_data["occupied_points"], dtype=float)
+                assigned = np.asarray(
+                    ring_data.get("assigned_drone_indices", np.zeros(len(occupied), dtype=object)),
+                    dtype=object,
+                )
+            else:
+                # fallback to canonical arrays
+                occupied = canonical_points
+                assigned = canonical_assignment
+
+            if occupied is None or occupied.size == 0:
                 continue
 
-            occupied = np.asarray(ring_data["occupied_points"], dtype=float)
-            if occupied.size == 0:
-                continue
-
-            assigned = np.asarray(
-                ring_data.get("assigned_drone_indices", np.zeros(len(occupied), dtype=int)),
-                dtype=int,
-            )
-            if assigned.size == 0:
-                continue
-
-            current_idx = int(ring_data.get("current_idx", 0))
-            cell_mask = assigned == current_idx
+            cell_mask = np.array([a == drone.drone_id for a in assigned], dtype=bool)
             if not np.any(cell_mask):
-                cell_mask = np.ones_like(assigned, dtype=bool)
+                continue
 
             drone_color = self._drone_color(drone.drone_id)
             points_x = np.flatnonzero(cell_mask)
             if points_x.size == 0:
                 continue
 
-            y = np.zeros(points_x.size, dtype=float)
-            point_colors = np.tile(np.asarray(drone_color, dtype=float), (points_x.size, 1))
-            sc = self.ring_ax.scatter(
+            contiguous_runs = np.split(
                 points_x,
-                y,
-                s=60,
-                c=point_colors,
-                alpha=0.9,
-                edgecolors="black",
-                linewidths=0.3,
-                zorder=2,
+                np.where(np.diff(points_x) > 1)[0] + 1,
             )
-            self.voronoi_ring_artists.append(sc)
+            for run in contiguous_runs:
+                if run.size == 0:
+                    continue
+                segment = self.ring_ax.hlines(
+                    0.0,
+                    float(run[0]) - 0.5,
+                    float(run[-1]) + 0.5,
+                    colors=[drone_color],
+                    linewidths=8.0,
+                    alpha=0.95,
+                    zorder=2,
+                )
+                self.voronoi_ring_artists.append(segment)
             cell_colors.append(drone_color)
             cell_indices.append(points_x)
 
-            target_centroid = getattr(drone, "target_centroid", None)
-            if target_centroid is not None:
-                tc = np.asarray(target_centroid, dtype=float)
-                if tc.shape == (2,) and np.all(np.isfinite(tc)):
-                    target_idx = None
-                    if canonical_ring:
-                        for entry in canonical_ring:
-                            if entry.get("drone_id") == drone.drone_id:
-                                target_idx = entry.get("target_chain_index")
-                                break
-                    if target_idx is None:
-                        target_idx = float(np.median(points_x))
-                    sc_tc = self.ring_ax.scatter(
-                        [float(target_idx)],
-                        [0.0],
-                        s=90,
-                        c=[drone_color],
-                        marker="*",
-                        edgecolors="black",
-                        linewidths=0.8,
-                        zorder=5,
-                    )
-                    self.voronoi_ring_artists.append(sc_tc)
-                    self.ring_ax.text(
-                        float(target_idx) + 0.12,
-                        0.10,
-                        f"{drone.drone_id}",
-                        color=drone_color,
-                        fontsize=8,
-                        fontweight="bold",
-                        zorder=6,
-                    )
+            # target centroid: prefer canonical_ring entry then per-drone target_centroid
+            target_idx = None
+            seed_idx = None
+            if canonical_ring:
+                for entry in canonical_ring:
+                    if entry.get("drone_id") == drone.drone_id:
+                        seed_idx = entry.get("seed_index")
+                        # some ring generators expose a target_chain_index
+                        target_idx = entry.get("target_chain_index")
+                        if target_idx is None and "target_centroid" in entry and canonical_points is not None:
+                            # find nearest canonical point to the target centroid
+                            tc = np.asarray(entry["target_centroid"], dtype=float)
+                            dists = np.linalg.norm(canonical_points - tc.reshape(1,2), axis=1)
+                            target_idx = float(np.argmin(dists))
+                        break
+
+            if target_idx is None:
+                # try per-drone attribute
+                target_centroid = getattr(drone, "target_centroid", None)
+                if target_centroid is not None and canonical_points is not None:
+                    tc = np.asarray(target_centroid, dtype=float)
+                    dists = np.linalg.norm(canonical_points - tc.reshape(1,2), axis=1)
+                    target_idx = float(np.argmin(dists)) if dists.size else float(np.median(points_x))
+
+            if target_idx is None:
+                target_idx = float(np.median(points_x))
+
+            # Larger star for the target centroid
+            sc_tc = self.ring_ax.scatter(
+                [float(target_idx)],
+                [0.0],
+                s=180,
+                c=[drone_color],
+                marker="*",
+                edgecolors="black",
+                linewidths=1.2,
+                zorder=6,
+            )
+            self.voronoi_ring_artists.append(sc_tc)
+
+            if seed_idx is None:
+                seed_idx = target_idx
+
+            # Small marker above the axis representing the drone projection on the 1D ring
+            drone_marker_y = 0.22
+            dm = self.ring_ax.scatter(
+                [float(seed_idx)],
+                [drone_marker_y],
+                s=120,
+                c=[drone_color],
+                marker="o",
+                edgecolors="black",
+                linewidths=0.8,
+                zorder=7,
+            )
+            self.voronoi_ring_artists.append(dm)
+
+            # Label with white background for readability
+            txt = self.ring_ax.text(
+                float(seed_idx),
+                drone_marker_y + 0.08,
+                f"{drone.drone_id}",
+                color="black",
+                fontsize=9,
+                fontweight="bold",
+                ha="center",
+                va="bottom",
+                zorder=8,
+            )
+            txt.set_bbox(dict(facecolor="white", edgecolor="none", alpha=0.8, pad=0.6))
+            self.voronoi_ring_artists.append(txt)
 
         if canonical_assignment.size > 1:
             # canonical_assignment may contain non-numeric IDs (strings). Compute
@@ -413,6 +460,7 @@ class Visualizer:
         self._remove_drone_artists(drone_id)
 
         patches = []
+        drone_color = self._drone_color(drone_id)
 
         # ------------------------------------------------------------------
         # Communication radius
@@ -441,7 +489,7 @@ class Visualizer:
             (drone.x, drone.y),
             numVertices=6,
             radius=0.15,
-            color="royalblue",
+            color=drone_color,
             zorder=5,
         )
 
@@ -652,7 +700,7 @@ class Visualizer:
                     [tc[0]],
                     [tc[1]],
                     s=80,
-                    c="gold",
+                    c=[drone_color],
                     marker="*",
                     edgecolors="black",
                     linewidths=0.8,
@@ -663,7 +711,7 @@ class Visualizer:
                     tc[1] + 0.12,
                     f"C_{drone_id}",
                     fontsize=7,
-                    color="goldenrod",
+                    color=drone_color,
                     fontweight="bold",
                     zorder=8,
                 )
@@ -799,8 +847,8 @@ class Visualizer:
                 continue
 
             assigned = np.asarray(
-                ring_data.get("assigned_drone_indices", np.zeros(len(occupied), dtype=int)),
-                dtype=int,
+                ring_data.get("assigned_drone_indices", np.zeros(len(occupied), dtype=object)),
+                dtype=object,
             )
             if assigned.size == 0:
                 continue
@@ -831,19 +879,16 @@ class Visualizer:
                 continue
 
             assigned = np.asarray(
-                ring_data.get("assigned_drone_indices", np.zeros(len(occupied), dtype=int)),
-                dtype=int,
+                ring_data.get("assigned_drone_indices", np.zeros(len(occupied), dtype=object)),
+                dtype=object,
             )
             if assigned.size == 0:
                 continue
 
-            current_idx = int(ring_data.get("current_idx", 0))
-            cell_mask = assigned == current_idx
-            if not np.any(cell_mask):
-                # fallback: all indices
-                indices = np.flatnonzero(np.ones_like(assigned, dtype=bool))
-            else:
-                indices = np.flatnonzero(cell_mask)
+            cell_mask = np.array([owner == drone.drone_id for owner in assigned], dtype=bool)
+            indices = np.flatnonzero(cell_mask)
+            if indices.size == 0:
+                continue
 
             # find target index from canonical_ring metadata if available
             target_idx = None

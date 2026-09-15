@@ -1,3 +1,5 @@
+import heapq
+
 import numpy as np
 
 
@@ -51,6 +53,125 @@ class Controller:
         self.repulsion_gain = float(repulsion_gain)
 
     # ------------------------------------------------------------------
+    # 1D VORONOI / MULTI-SOURCE SHORTEST PATH
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def multi_source_shortest_path_voronoi(points, seeds, is_closed):
+        """Assign every boundary point to the closest seed along the boundary.
+
+        Parameters
+        ----------
+        points : array-like, shape (N, 2)
+            Ordered boundary coordinates.
+        seeds : iterable of dict
+            Each seed must expose ``robot_id`` and ``index``.
+        is_closed : bool
+            If True, connect the last boundary point back to the first one.
+
+        Returns
+        -------
+        tuple[np.ndarray, np.ndarray]
+            ``owner`` stores the owning robot ID for every boundary index.
+            ``distances`` stores the arc distance from the owning seed.
+        """
+        boundary = np.asarray(points, dtype=float)
+        if boundary.ndim != 2 or boundary.shape[1] != 2:
+            raise ValueError("points must be an (N, 2) array")
+
+        n_points = int(boundary.shape[0])
+        distances = np.full(n_points, np.inf, dtype=float)
+        owner = np.empty(n_points, dtype=object)
+        owner[:] = None
+
+        if n_points == 0:
+            return owner, distances
+
+        pq = []
+        for order, seed in enumerate(seeds):
+            if seed is None:
+                continue
+
+            robot_id = seed.get("robot_id") if isinstance(seed, dict) else getattr(seed, "robot_id", None)
+            index = seed.get("index") if isinstance(seed, dict) else getattr(seed, "index", None)
+            if robot_id is None or index is None:
+                continue
+
+            index = int(index)
+            if not 0 <= index < n_points:
+                continue
+
+            if 0.0 < distances[index]:
+                distances[index] = 0.0
+                owner[index] = robot_id
+                heapq.heappush(pq, (0.0, index, order, robot_id))
+
+        while pq:
+            current_dist, u, seed_order, robot_id = heapq.heappop(pq)
+            if current_dist > distances[u]:
+                continue
+
+            if is_closed:
+                neighbors = ((u - 1) % n_points, (u + 1) % n_points)
+            elif u == 0:
+                neighbors = (1,) if n_points > 1 else ()
+            elif u == n_points - 1:
+                neighbors = (u - 1,)
+            else:
+                neighbors = (u - 1, u + 1)
+
+            for v in neighbors:
+                weight = float(np.linalg.norm(boundary[u] - boundary[v]))
+                new_dist = current_dist + weight
+                if new_dist < distances[v]:
+                    distances[v] = new_dist
+                    owner[v] = robot_id
+                    heapq.heappush(pq, (new_dist, v, seed_order, robot_id))
+
+        return owner, distances
+
+    @staticmethod
+    def _nearest_boundary_index(boundary_points, position):
+        boundary = np.asarray(boundary_points, dtype=float)
+        pos = np.asarray(position, dtype=float).reshape(1, 2)
+        dists = np.linalg.norm(boundary - pos, axis=1)
+        return int(np.argmin(dists))
+
+    @staticmethod
+    def _cell_target_index(boundary_points, indices, seed_index, is_closed):
+        """Return a boundary index near the 1D arc midpoint of a Voronoi cell."""
+        indices = np.asarray(indices, dtype=int)
+        if indices.size == 0:
+            return int(seed_index)
+
+        boundary = np.asarray(boundary_points, dtype=float)
+        if indices.size == 1:
+            return int(indices[0])
+
+        if is_closed:
+            n_points = int(boundary.shape[0])
+            offsets = (
+                (indices - int(seed_index) + n_points / 2.0)
+                % n_points
+                - n_points / 2.0
+            )
+            ordered = indices[np.argsort(offsets)]
+        else:
+            ordered = np.sort(indices)
+
+        cumulative = np.zeros(ordered.size, dtype=float)
+        for idx in range(1, ordered.size):
+            previous_idx = int(ordered[idx - 1])
+            current_idx = int(ordered[idx])
+            cumulative[idx] = cumulative[idx - 1] + float(
+                np.linalg.norm(boundary[current_idx] - boundary[previous_idx])
+            )
+
+        midpoint = 0.5 * cumulative[-1]
+        target_pos = int(np.searchsorted(cumulative, midpoint, side="left"))
+        return int(ordered[min(target_pos, ordered.size - 1)])
+
+    # ------------------------------------------------------------------
     # BOUNDARY / INITIALIZATION HELPERS
     # ------------------------------------------------------------------
 
@@ -70,6 +191,9 @@ class Controller:
             pts = arr.copy()
             self.known_boundary_points = pts
             self.known_boundary_initialized = True
+            self.known_boundary_closed = bool(force_closed) or (
+                pts.shape[0] > 1 and np.linalg.norm(pts[0] - pts[-1]) < 1e-6
+            )
             return self.known_boundary_points.copy()
 
         # Case B: given an occupancy grid -> extract contour points
@@ -270,6 +394,99 @@ class Controller:
             drone.known_positions = {getattr(drone, 'drone_id', i): np.array([drone.x, drone.y], dtype=float)}
 
     # ------------------------------------------------------------------
+    # BOUNDARY ORDERING / CIRCULAR HELPERS
+    # ------------------------------------------------------------------
+
+    def _ensure_ordered_closed_boundary(self):
+        """Ensure `self.known_boundary_points` is an ordered closed loop.
+
+        This performs a greedy nearest-neighbour trace to order boundary
+        points so that indices 0..N-1 follow the contour sequentially and
+        the last point is adjacent to the first. If ordering cannot be
+        improved (e.g. few points), the array is left as-is.
+        """
+        pts = np.asarray(self.known_boundary_points, dtype=float)
+        n = pts.shape[0]
+        if n <= 2:
+            return
+
+        # Compute nearest-neighbour distances to estimate typical spacing
+        # (exclude self-distance)
+        dists = np.full((n,), np.inf, dtype=float)
+        for i in range(n):
+            diff = pts - pts[i:i+1]
+            dist2 = np.einsum('ij,ij->i', diff, diff)
+            dist2[i] = np.inf
+            dists[i] = float(np.sqrt(np.min(dist2)))
+
+        median_nn = float(np.median(dists)) if np.isfinite(dists).all() else 0.0
+        if median_nn <= 0:
+            return
+
+        # Greedy nearest-neighbour ordering
+        visited = np.zeros(n, dtype=bool)
+        order = [0]
+        visited[0] = True
+        for _ in range(1, n):
+            cur = order[-1]
+            # distances to unvisited
+            unvisited_idx = np.nonzero(~visited)[0]
+            diffs = pts[unvisited_idx] - pts[cur:cur+1]
+            dd = np.einsum('ij,ij->i', diffs, diffs)
+            nearest_pos = int(np.argmin(dd))
+            nearest = unvisited_idx[nearest_pos]
+            order.append(nearest)
+            visited[nearest] = True
+
+        ordered = pts[order]
+        # Check closedness (last neighboring first) using threshold relative to median
+        last_to_first = float(np.linalg.norm(ordered[0] - ordered[-1]))
+        if last_to_first <= 3.0 * median_nn:
+            self.known_boundary_points = ordered.copy()
+            self.known_boundary_closed = True
+        else:
+            # if not closed, keep original but mark closedness conservatively
+            self.known_boundary_points = pts.copy()
+            self.known_boundary_closed = False
+
+    def _mod_index(self, idx, n):
+        return int(idx % n)
+
+    def _circular_signed_distance(self, a, b, n):
+        """Return signed shortest distance from a to b on a circular index set of length n.
+
+        Value in range (-n/2, n/2].
+        """
+        diff = (b - a) % n
+        if diff > n / 2.0:
+            diff -= n
+        return diff
+
+    def _circular_midpoint(self, a, b, n):
+        """Return the midpoint index (float) between indices a and b along the shortest arc."""
+        sd = self._circular_signed_distance(a, b, n)
+        return (a + sd / 2.0) % n
+
+    def _indices_in_arc(self, start, end, n):
+        """Return integer indices j in 0..n-1 that lie in the closed arc [start, end]
+
+        Arc is taken in the positive modular direction from `start` to `end`.
+        Both `start` and `end` may be floats; inclusion is decided by modular
+        arithmetic comparing (j - start) % n to arc_length=(end - start) % n.
+        """
+        arc_len = (end - start) % n
+        if arc_len == 0:
+            # full circle -> all indices
+            return np.arange(n, dtype=int)
+
+        indices = []
+        for j in range(n):
+            rel = (j - start) % n
+            if rel <= arc_len + 1e-9:
+                indices.append(j)
+        return np.array(indices, dtype=int)
+
+    # ------------------------------------------------------------------
     # CONTROL STUBS (intentionally left for user re-implementation)
     # ------------------------------------------------------------------
 
@@ -334,152 +551,86 @@ class Controller:
 
     def _compute_voronoi_target(self, drones):
         """
-        Compute the 1D Arc-Index Voronoi target centroid for each drone 
-        along the closed boundary, based on its `known_positions`.
+        Compute MSSP 1D Voronoi target centroids for all drones.
         """
-        if self.known_boundary_points is None or len(self.known_boundary_points) == 0:
-            return
-
-        n_boundary = len(self.known_boundary_points)
-        boundary_pts = np.asarray(self.known_boundary_points, dtype=float)
-
         for drone in drones:
-            # 1. Get the positions known by this specific drone (from multi-hop)
-            known_pos = drone.known_positions
-
-            # Step 1: Find the closest boundary index (s_i) for each known drone
-            drone_indices = {}
-            for d_id, pos in known_pos.items():
-                distances = np.linalg.norm(boundary_pts - pos, axis=1)
-                drone_indices[d_id] = int(np.argmin(distances))
-            
-            # Step 2: Sort drones along the ring based on their s index
-            sorted_drones = sorted(drone_indices.items(), key=lambda item: item[1])
-            drone_ids_order = [d_id for d_id, s in sorted_drones]
-
-            my_id = getattr(drone, 'drone_id', 0)
-            if my_id not in drone_ids_order:
-                drone.target_centroid = np.array([drone.x, drone.y], dtype=float)
-                continue
-
-            my_rank = drone_ids_order.index(my_id)
-            M = len(sorted_drones)
-
-            # Edge case: if only one drone is known/active
-            if M == 1:
-                drone.target_centroid = boundary_pts[drone_indices[my_id]]
-                continue
-
-            # Step 3: Define Voronoi cell boundaries (midpoints between adjacent drones on the ring)
-            prev_rank = (my_rank - 1) % M
-            next_rank = (my_rank + 1) % M
-
-            s_prev = sorted_drones[prev_rank][1]
-            s_curr = sorted_drones[my_rank][1]
-            s_next = sorted_drones[next_rank][1]
-
-            # Handle wrap-around for the closed loop
-            if s_next < s_prev:
-                s_next += n_boundary
-            if s_curr < s_prev:
-                s_curr += n_boundary
-
-            cell_start = (s_prev + s_curr) / 2.0
-            cell_end = (s_curr + s_next) / 2.0
-
-            # Step 4: Extract boundary points belonging to this cell and compute geometric centroid
-            cell_indices = []
-            s_idx = int(np.floor(cell_start))
-            s_end_idx = int(np.ceil(cell_end))
-
-            for idx in range(s_idx, s_end_idx + 1):
-                cell_indices.append(idx % n_boundary)
-
-            cell_points = boundary_pts[cell_indices]
-            
-            if len(cell_points) > 0:
-                drone.target_centroid = np.mean(cell_points, axis=0)
-            else:
-                drone.target_centroid = boundary_pts[drone_indices[my_id]]
+            self.compute_ring_ordering(drone, drones)
 
     def compute_ring_ordering(self, current_drone, drones):
-        """Compute simple angular ordering around center-of-mass from drone.known_positions.
+        """Compute 1D Voronoi partitioning with Multi-Source Dijkstra.
 
-        Returns a dict compatible with tests: keys `N`, `current`, `succ`, `pred`, `center_of_mass`.
+        Returns a dict compatible with tests: keys `N`, `current`, `succ`, `pred`, `center_of_mass`, `occupied_points`, `assigned_drone_indices`, `ring`.
         """
-        # Prefer to extract the ring from the current drone's local grid if available
-        grid = getattr(current_drone, 'grid', None)
-        occupied_points = []
-        if grid is not None and np.asarray(grid).size > 0:
-            g = np.asarray(grid, dtype=float)
-            occ_idx = np.argwhere(g >= self.occupancy_threshold)
-            if occ_idx.size > 0:
-                # map indices to coordinates using current_drone.grid_bounds
-                x_min, x_max, y_min, y_max = current_drone.grid_bounds
-                Nx, Ny = current_drone.grid_shape
-                x_coords = np.linspace(x_min, x_max, Nx)
-                y_coords = np.linspace(y_min, y_max, Ny)
-                pts = np.column_stack((x_coords[occ_idx[:, 0]], y_coords[occ_idx[:, 1]]))
-                if pts.size > 0:
-                    # order by angle around center-of-mass
-                    com = np.mean(pts, axis=0)
-                    angles = np.arctan2(pts[:, 1] - com[1], pts[:, 0] - com[0])
-                    order = np.argsort(angles)
-                    occupied_points = pts[order]
-                else:
-                    occupied_points = np.empty((0, 2), dtype=float)
+        if self.known_boundary_points is None or len(self.known_boundary_points) == 0:
+            grid = getattr(current_drone, 'grid', None)
+            if grid is not None and np.asarray(grid).size > 0:
+                try:
+                    x_min, x_max, y_min, y_max = current_drone.grid_bounds
+                    Nx, Ny = current_drone.grid_shape
+                    x_coords = np.linspace(x_min, x_max, Nx)
+                    y_coords = np.linspace(y_min, y_max, Ny)
+                    self.initialize_known_boundary(grid, x_coords=x_coords, y_coords=y_coords)
+                except Exception:
+                    pass
 
-        # fallback: if no occupied_points, try to use known_boundary_points
-        if len(occupied_points) == 0 and hasattr(self, 'known_boundary_points') and self.known_boundary_points is not None and len(self.known_boundary_points) > 0:
-            occupied_points = np.asarray(self.known_boundary_points, dtype=float)
-
-        if len(occupied_points) == 0:
+        if self.known_boundary_points is None or len(self.known_boundary_points) == 0:
             return None
 
-        # Build canonical assignment: find nearest ring index for each drone
+        # Ensure strict sequential ordering
+        self._ensure_ordered_closed_boundary()
+        occupied_points = np.asarray(self.known_boundary_points, dtype=float)
+        n_pts = int(occupied_points.shape[0])
+        if n_pts == 0:
+            return None
+
         known = getattr(current_drone, 'known_positions', None)
         if known is None or len(known) == 0:
-            known = {d.drone_id: np.array([d.x, d.y], dtype=float) for d in drones}
+            known = {getattr(d, 'drone_id', 0): np.array([d.x, d.y], dtype=float) for d in drones}
 
-        drone_ids = list(known.keys())
-        drone_pos = [np.asarray(known[i], dtype=float) for i in drone_ids]
+        seeds = []
+        for drone_id, position in known.items():
+            seed_idx = self._nearest_boundary_index(occupied_points, position)
+            seeds.append({'robot_id': drone_id, 'index': seed_idx})
 
-        # For each drone, find nearest occupied_points index
-        n_pts = len(occupied_points)
-        drone_indices = []
-        for p in drone_pos:
-            dists = np.linalg.norm(occupied_points - p.reshape(1, 2), axis=1)
-            drone_indices.append(int(np.argmin(dists)))
+        seeds.sort(key=lambda seed: int(seed['index']))
+        ordered_ids = [seed['robot_id'] for seed in seeds]
 
-        # sort drones by their index along the ring to form ordering
-        sorted_idx = np.argsort(drone_indices)
-        ordered_ids = [drone_ids[i] for i in sorted_idx]
+        M = len(ordered_ids)
+        if M == 0:
+            return None
 
-        # build ring entries with cell assignment per drone
+        is_closed = bool(self.known_boundary_closed)
+        assigned, distances = self.multi_source_shortest_path_voronoi(
+            occupied_points,
+            seeds,
+            is_closed=is_closed,
+        )
+
         ring = []
-        assigned = np.empty(n_pts, dtype=object)
-        for j in range(n_pts):
-            # pick nearest drone by circular distance
-            diffs = np.abs((np.array(drone_indices, dtype=float) - float(j) + n_pts / 2.0) % n_pts - n_pts / 2.0)
-            nearest = int(np.argmin(diffs))
-            assigned[j] = drone_ids[nearest]
-
-        # For each ordered drone, compute its cell indices and centroid
+        seed_by_id = {seed['robot_id']: int(seed['index']) for seed in seeds}
         for did in ordered_ids:
             mask = np.array([a == did for a in assigned])
             indices = np.flatnonzero(mask)
-            cell_pts = occupied_points[indices] if indices.size else np.empty((0,2), dtype=float)
+            cell_pts = occupied_points[indices] if indices.size else np.empty((0, 2), dtype=float)
             vor_size = int(indices.size)
             if vor_size > 0:
-                target_centroid = np.mean(cell_pts, axis=0)
+                target_chain_index = self._cell_target_index(
+                    occupied_points,
+                    indices,
+                    seed_by_id[did],
+                    is_closed,
+                )
+                target_centroid = occupied_points[target_chain_index]
             else:
-                # fallback: nearest boundary point
-                idx_nearest = drone_indices[drone_ids.index(did)]
-                target_centroid = occupied_points[idx_nearest]
+                target_centroid = occupied_points[seed_by_id[did]]
+                target_chain_index = seed_by_id[did]
 
             ring.append({
                 'drone_id': did,
+                'seed_index': seed_by_id[did],
                 'target_centroid': target_centroid,
+                'target_chain_index': target_chain_index,
+                'indices': indices,
                 'voronoi_cell_size': vor_size,
             })
 
@@ -492,37 +643,54 @@ class Controller:
         # Identify current/pred/succ for current_drone
         cur_id = getattr(current_drone, 'drone_id', None)
         if cur_id not in ordered_ids:
-            # try to insert current into ordering based on its nearest index
             ordered_ids.append(cur_id)
 
         idx_in_order = ordered_ids.index(cur_id)
         pred_idx = (idx_in_order - 1) % len(ordered_ids)
         succ_idx = (idx_in_order + 1) % len(ordered_ids)
 
+        # Compute center of mass for reference/logging purposes only (does not affect ordering)
+        com = np.mean(occupied_points, axis=0)
+        cur_pos = np.array([current_drone.x, current_drone.y], dtype=float)
+        cur_angle = float(np.arctan2(cur_pos[1] - com[1], cur_pos[0] - com[0]))
+
         res = {
             'N': len(ordered_ids),
             'occupied_points': occupied_points,
             'assigned_drone_indices': assigned,
+            'distances': distances,
+            'seeds': seeds,
+            'is_closed': is_closed,
             'ring': ring,
-            'current': {'drone_id': cur_id, 'angle': float(np.arctan2(current_drone.y - np.mean(occupied_points[:,1]), current_drone.x - np.mean(occupied_points[:,0])))},
+            'current': {'drone_id': cur_id, 'angle': cur_angle},
             'pred': {'drone_id': ordered_ids[pred_idx]},
             'succ': {'drone_id': ordered_ids[succ_idx]},
-            'center_of_mass': np.mean(occupied_points, axis=0),
+            'center_of_mass': com,
         }
+
+        for entry in ring:
+            if entry['drone_id'] == cur_id:
+                res['current'].update({
+                    'seed_index': entry['seed_index'],
+                    'target_centroid': entry['target_centroid'],
+                    'target_chain_index': entry['target_chain_index'],
+                    'voronoi_cell_size': entry['voronoi_cell_size'],
+                })
+                res['current_idx'] = entry['drone_id']
+                break
+
+        current_drone.last_ring_info = res
 
         return res
 
 
     def compute_actions(self, drones, world_field=None, x_coords=None, y_coords=None):
-        """Return a dictionary of zeroed actions and set drone modes to 'idle',
-        after updating the multi-hop network and computing Voronoi targets.
-        """
+        """Update communication/Voronoi diagnostics while keeping robots fixed."""
         actions = {}
         
         # Ensure initial attributes exist on all drones
         for drone in drones:
-            if not hasattr(drone, 'known_boundary_points'):
-                drone.known_boundary_points = self.known_boundary_points.copy()
+            drone.known_boundary_points = self.known_boundary_points.copy()
             if not hasattr(drone, 'known_positions'):
                 drone.known_positions = {getattr(drone, 'drone_id', 0): np.array([drone.x, drone.y], dtype=float)}
 
@@ -531,75 +699,19 @@ class Controller:
 
         # 2. Compute the 1D Voronoi target centroid for each drone
         self._compute_voronoi_target(drones)
+        for drone in drones:
+            drone.known_boundary_points = self.known_boundary_points.copy()
 
-        # 3. Determine control mode per-drone and compute actions
+        # 3. Keep every robot static. The mode records what is being inspected,
+        # while the zero action guarantees no physical movement is applied.
         for drone in drones:
             drone_id = getattr(drone, 'drone_id', None)
 
-            # ensure known_positions exists
             if not hasattr(drone, 'known_positions') or drone.known_positions is None:
                 drone.known_positions = {drone_id: np.array([drone.x, drone.y], dtype=float)}
 
-
-            # If the local drone grid contains a closed polygon -> equidistant mode
-            grid = getattr(drone, 'grid', None)
-            if grid is not None and np.asarray(grid).size > 0 and self.is_polygon_closed(grid):
-                drone.last_control_mode = 'equi_distant'
-                ring_info = self.compute_ring_ordering(drone, drones) or {}
-                action = self._equidistant_action(drone, ring_info, world_field, x_coords, y_coords)
-                actions[drone_id] = self._clip_action(action)
-                continue
-
-            # If the global world_field contains a closed polygon -> equidistant mode
-            if world_field is not None and self.is_polygon_closed(world_field):
-                # switching to equidistant
-                drone.last_control_mode = 'equi_distant'
-                ring_info = self.compute_ring_ordering(drone, drones) or {}
-                action = self._equidistant_action(drone, ring_info, world_field, x_coords, y_coords)
-                actions[drone_id] = self._clip_action(action)
-                continue
-
-            # If the local drone grid contains an occupied cell -> boundary tracking
-            grid = getattr(drone, 'grid', None)
-            if grid is not None and np.any(np.asarray(grid, dtype=float) >= self.occupancy_threshold):
-                drone.last_control_mode = 'boundary_tracking'
-                # compute centroid of occupied cells in drone.grid mapped to x_coords/y_coords
-                try:
-                    g = np.asarray(grid, dtype=float)
-                    occupied_idx = np.argwhere(g >= self.occupancy_threshold)
-                    if occupied_idx.size:
-                        # use provided coords if available
-                        if x_coords is None or y_coords is None:
-                            # fallback to index space
-                            target = np.mean(occupied_idx, axis=0)
-                            tx, ty = float(target[0]), float(target[1])
-                        else:
-                            # occupied_idx are (ix,iy) mapping to x_coords[ix], y_coords[iy]
-                            xs = np.asarray(x_coords, dtype=float)[occupied_idx[:, 0]]
-                            ys = np.asarray(y_coords, dtype=float)[occupied_idx[:, 1]]
-                            tx, ty = float(np.mean(xs)), float(np.mean(ys))
-                        desired = np.array([tx, ty], dtype=float)
-                        action = desired - np.array([drone.x, drone.y], dtype=float)
-                        # if computed action is zero (e.g., drone already at centroid)
-                        # provide a small exploratory/tangential push so robots don't freeze
-                        if float(np.linalg.norm(action)) <= 1e-6:
-                            explor = getattr(drone, 'exploration_direction', None)
-                            if explor is None:
-                                action = np.array([0.02, 0.0], dtype=float)
-                            else:
-                                explor = np.asarray(explor, dtype=float)
-                                ne = explor / (np.linalg.norm(explor) + 1e-12)
-                                action = 0.02 * ne
-
-                        actions[drone_id] = self._clip_action(action)
-                    else:
-                        actions[drone_id] = np.zeros(2, dtype=float)
-                except Exception:
-                    actions[drone_id] = np.zeros(2, dtype=float)
-                continue
-
-            # Default idle
-            drone.last_control_mode = 'idle'
+            drone.last_control_mode = 'voronoi_static'
+            drone.last_control_vector = np.zeros(2, dtype=float)
             actions[drone_id] = np.zeros(2, dtype=float)
 
         return actions
@@ -628,45 +740,12 @@ class Controller:
         return action
 
     def _boundary_tracking_action(self, *args, **kwargs):
-        """Basic boundary tracking: move toward provided target centroid if present."""
-        # legacy compatibility wrapper
-        if len(args) >= 1:
-            drone = args[0]
-            tc = getattr(drone, 'target_centroid', None)
-            if tc is not None:
-                action = np.asarray(tc, dtype=float) - np.array([drone.x, drone.y], dtype=float)
-                return self._clip_action(action)
+        """Temporarily disabled: robots must remain static."""
         return np.zeros(2, dtype=float)
 
     def _equidistant_action(self, drone, ring_info, world_field, x_coords, y_coords):
-        """Simple equidistant controller that moves toward the assigned target centroid
-        and adds a small tangential component to avoid stalling.
-        """
-        # prefer ring_info current target_centroid if present
-        tc = None
-        if ring_info and isinstance(ring_info, dict):
-            tc = ring_info.get('current', {}).get('target_centroid', None)
-        if tc is None:
-            tc = getattr(drone, 'target_centroid', None)
-        if tc is None:
-            return np.zeros(2, dtype=float)
-
-        pos = np.array([drone.x, drone.y], dtype=float)
-        desired = np.asarray(tc, dtype=float)
-        primary = desired - pos
-
-        # tangential push based on ring center if available
-        center = np.array(ring_info.get('center_of_mass', [0.0, 0.0]), dtype=float) if ring_info else np.zeros(2, dtype=float)
-        radial = pos - center
-        tang = np.array([-radial[1], radial[0]], dtype=float)
-        tang_norm = self._normalize(tang)
-
-        if tang_norm is None:
-            action = primary
-        else:
-            action = primary + 0.08 * tang_norm
-
-        return self._clip_action(action)
+        """Temporarily disabled: robots must remain static."""
+        return np.zeros(2, dtype=float)
 
     def _compute_repulsion(self, drone):
         """Compute simple inter-drone repulsion based on `d_safe` and `repulsion_gain`.
