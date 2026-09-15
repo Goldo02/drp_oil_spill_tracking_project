@@ -324,30 +324,10 @@ class Visualizer:
         x_margin = max(0.25, 0.03 * float(total_boundary_length))
         self.ring_ax.set_xlim(-x_margin, float(total_boundary_length) + x_margin)
 
-        cell_colors = []
-        cell_indices = []
-        # For each drone, prefer per-drone `last_ring_info`; otherwise fall back
-        # to the canonical assignment determined above so drones are visible
-        # on the 1D ring even when they don't carry individual ring metadata.
+        # Draw one canonical partition, then overlay each drone's own current
+        # seed and Lloyd target so both panels use the same per-drone metadata.
         for drone in drones:
-            # determine assignment array and occupied points to use
-            ring_data = getattr(drone, "last_ring_info", None)
-            if ring_data is not None and "occupied_points" in ring_data:
-                occupied = np.asarray(ring_data["occupied_points"], dtype=float)
-                assigned = np.asarray(
-                    ring_data.get("assigned_drone_indices", np.zeros(len(occupied), dtype=object)),
-                    dtype=object,
-                )
-            else:
-                # fallback to canonical arrays
-                occupied = canonical_points
-                assigned = canonical_assignment
-            arc_lengths = canonical_arc_lengths
-
-            if occupied is None or occupied.size == 0:
-                continue
-
-            cell_mask = np.array([a == drone.drone_id for a in assigned], dtype=bool)
+            cell_mask = np.array([a == drone.drone_id for a in canonical_assignment], dtype=bool)
             if not np.any(cell_mask):
                 continue
 
@@ -365,32 +345,38 @@ class Visualizer:
                     continue
                 segment = self.ring_ax.hlines(
                     0.0,
-                    float(arc_lengths[run[0]]),
-                    float(arc_lengths[run[-1]]),
+                    float(canonical_arc_lengths[run[0]]),
+                    float(canonical_arc_lengths[run[-1]]),
                     colors=[drone_color],
                     linewidths=8.0,
                     alpha=0.95,
                     zorder=2,
                 )
                 self.voronoi_ring_artists.append(segment)
-            cell_colors.append(drone_color)
-            cell_indices.append(points_x)
 
-            # target centroid: prefer canonical_ring entry then per-drone target_centroid
+            # Target/seed marker: prefer the drone's own current partition,
+            # then fall back to the canonical partition used for colored cells.
             target_idx = None
             seed_idx = None
             target_arc = None
             seed_arc = None
-            if canonical_ring:
+
+            ring_data = getattr(drone, "last_ring_info", None)
+            if isinstance(ring_data, dict):
+                current = ring_data.get("current", {})
+                seed_idx = current.get("seed_index")
+                seed_arc = current.get("seed_arc_length")
+                target_idx = current.get("target_chain_index")
+                target_arc = current.get("target_arc_length")
+
+            if target_arc is None and canonical_ring:
                 for entry in canonical_ring:
                     if entry.get("drone_id") == drone.drone_id:
                         seed_idx = entry.get("seed_index")
                         seed_arc = entry.get("seed_arc_length")
-                        # some ring generators expose a target_chain_index
                         target_idx = entry.get("target_chain_index")
                         target_arc = entry.get("target_arc_length")
                         if target_idx is None and "target_centroid" in entry and canonical_points is not None:
-                            # find nearest canonical point to the target centroid
                             tc = np.asarray(entry["target_centroid"], dtype=float)
                             dists = np.linalg.norm(canonical_points - tc.reshape(1,2), axis=1)
                             target_idx = float(np.argmin(dists))

@@ -736,7 +736,18 @@ class Controller:
             # Apply the accumulated knowledge updates to each drone
             for i, drone in enumerate(drones):
                 if pending_updates[i]:
-                    drone.known_positions.update(pending_updates[i])
+                    drone_id = getattr(drone, 'drone_id', 0)
+                    for known_id, position in pending_updates[i].items():
+                        if known_id == drone_id:
+                            continue
+                        drone.known_positions[known_id] = np.asarray(
+                            position,
+                            dtype=float,
+                        )
+                    drone.known_positions[drone_id] = np.array(
+                        [drone.x, drone.y],
+                        dtype=float,
+                    )
 
     def _compute_voronoi_target(self, drones):
         """
@@ -754,6 +765,8 @@ class Controller:
         ):
             return
 
+        boundary = np.asarray(self.known_boundary_points, dtype=float)
+        self._ensure_ordered_closed_boundary()
         boundary = np.asarray(self.known_boundary_points, dtype=float)
         is_closed = bool(self.known_boundary_closed)
         arc_lengths, total_length = self._boundary_arc_lengths(
@@ -883,12 +896,6 @@ class Controller:
                 'cell_arc_length': cell_arc_length,
             })
 
-        # Set target_centroid on drone objects where appropriate
-        for entry in ring:
-            for d in drones:
-                if getattr(d, 'drone_id', None) == entry['drone_id']:
-                    d.target_centroid = np.asarray(entry['target_centroid'], dtype=float)
-
         # Identify current/pred/succ for current_drone
         cur_id = getattr(current_drone, 'drone_id', None)
         if cur_id not in ordered_ids:
@@ -931,6 +938,12 @@ class Controller:
                     'cell_arc_length': entry['cell_arc_length'],
                 })
                 res['current_idx'] = entry['drone_id']
+                current_drone.target_centroid = np.asarray(
+                    entry['target_centroid'],
+                    dtype=float,
+                )
+                current_drone.boundary_s = float(entry['seed_arc_length'])
+                current_drone.boundary_index = int(entry['seed_index'])
                 break
 
         current_drone.last_ring_info = res
@@ -1038,7 +1051,9 @@ class Controller:
         ):
             boundary = np.asarray(boundary, dtype=float)
             arc_lengths = np.asarray(arc_lengths, dtype=float)
-            current_arc = getattr(drone, 'boundary_s', None)
+            current_arc = current.get('seed_arc_length')
+            if current_arc is None:
+                current_arc = getattr(drone, 'boundary_s', None)
             if current_arc is None:
                 current_arc, _, _ = self._arc_length_at_position(
                     boundary,

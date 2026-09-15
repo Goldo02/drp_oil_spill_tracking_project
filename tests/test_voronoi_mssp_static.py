@@ -116,3 +116,82 @@ def test_closed_lloyd_targets_split_boundary_by_arc_midpoints():
         total_length,
     )
     np.testing.assert_allclose(targets["B"]["target_arc_length"], 2.25)
+
+
+def test_compute_ring_ordering_does_not_overwrite_other_drone_targets():
+    controller = Controller(
+        sim_map=None,
+        communication_radius=100.0,
+    )
+    controller.initialize_known_boundary(
+        np.array([[float(i), 0.0] for i in range(5)], dtype=float),
+        force_closed=False,
+    )
+
+    drone_a = StaticDrone("A", 0.0, 0.0)
+    drone_b = StaticDrone("B", 4.0, 0.0)
+    drone_a.known_positions = {
+        "A": np.array([0.0, 0.0], dtype=float),
+        "B": np.array([2.0, 0.0], dtype=float),
+    }
+    drone_b.known_positions = {
+        "A": np.array([0.0, 0.0], dtype=float),
+        "B": np.array([4.0, 0.0], dtype=float),
+    }
+
+    controller.compute_ring_ordering(drone_a, [drone_a, drone_b])
+    np.testing.assert_allclose(drone_a.target_centroid, [0.5, 0.0])
+
+    controller.compute_ring_ordering(drone_b, [drone_a, drone_b])
+
+    np.testing.assert_allclose(drone_a.target_centroid, [0.5, 0.0])
+    np.testing.assert_allclose(drone_b.target_centroid, [3.0, 0.0])
+
+
+def test_equidistant_action_uses_current_seed_arc_from_ring_info():
+    controller = Controller(
+        sim_map=None,
+        communication_radius=100.0,
+    )
+    points = np.array([[float(i), 0.0] for i in range(6)], dtype=float)
+    controller.initialize_known_boundary(points, force_closed=False)
+    arc_lengths, total_length = controller._boundary_arc_lengths(points, is_closed=False)
+
+    drone = StaticDrone("A", 2.0, 0.0)
+    drone.max_speed = 0.12
+    drone.boundary_s = 0.0
+    ring_info = {
+        "occupied_points": points,
+        "arc_lengths": arc_lengths,
+        "total_boundary_length": total_length,
+        "is_closed": False,
+        "current": {
+            "seed_arc_length": 2.0,
+            "target_arc_length": 1.0,
+            "target_centroid": np.array([1.0, 0.0], dtype=float),
+        },
+    }
+
+    action = controller._equidistant_action(
+        drone,
+        ring_info,
+        world_field=None,
+        x_coords=None,
+        y_coords=None,
+    )
+
+    np.testing.assert_allclose(action, [-0.12, 0.0])
+
+
+def test_multihop_does_not_overwrite_a_drone_own_current_position():
+    controller = Controller(
+        sim_map=None,
+        communication_radius=100.0,
+    )
+    drone_a = StaticDrone("A", 1.0, 0.0)
+    drone_b = StaticDrone("B", 2.0, 0.0)
+    drone_b.known_positions["A"] = np.array([-9.0, 0.0], dtype=float)
+
+    controller._update_multihop_positions([drone_a, drone_b])
+
+    np.testing.assert_allclose(drone_a.known_positions["A"], [1.0, 0.0])
