@@ -116,6 +116,39 @@ def test_closed_lloyd_targets_split_boundary_by_arc_midpoints():
         total_length,
     )
     np.testing.assert_allclose(targets["B"]["target_arc_length"], 2.25)
+    np.testing.assert_allclose(targets["B"]["cell_start_arc_length"], 1.0)
+    np.testing.assert_allclose(targets["B"]["cell_end_arc_length"], 3.5)
+
+
+def test_closed_geodesic_cell_boundaries_are_midpoints_between_adjacent_seeds():
+    controller = Controller(
+        sim_map=None,
+        communication_radius=100.0,
+    )
+    points = np.array([[float(i), 0.0] for i in range(10)], dtype=float)
+    arc_lengths, total_length = Controller._boundary_arc_lengths(points, is_closed=True)
+    seeds = [
+        {"robot_id": "A", "index": 0, "arc_length": arc_lengths[0]},
+        {"robot_id": "B", "index": 3, "arc_length": arc_lengths[3]},
+        {"robot_id": "C", "index": 7, "arc_length": arc_lengths[7]},
+    ]
+
+    targets = controller._lloyd_targets_from_seed_arcs(
+        seeds,
+        total_length,
+        is_closed=True,
+    )
+
+    ordered = sorted(seeds, key=lambda seed: seed["arc_length"])
+    for left_seed, right_seed in zip(ordered, ordered[1:] + ordered[:1]):
+        left_s = float(left_seed["arc_length"])
+        right_s = float(right_seed["arc_length"])
+        gap = (right_s - left_s) % total_length
+        boundary = float(targets[right_seed["robot_id"]]["cell_start_arc_length"])
+        dist_from_left = (boundary - left_s) % total_length
+        dist_from_right = (right_s - boundary) % total_length
+        np.testing.assert_allclose(dist_from_left, 0.5 * gap)
+        np.testing.assert_allclose(dist_from_right, 0.5 * gap)
 
 
 def test_compute_ring_ordering_does_not_overwrite_other_drone_targets():
@@ -195,3 +228,18 @@ def test_multihop_does_not_overwrite_a_drone_own_current_position():
     controller._update_multihop_positions([drone_a, drone_b])
 
     np.testing.assert_allclose(drone_a.known_positions["A"], [1.0, 0.0])
+
+
+def test_multihop_refreshes_stale_neighbor_positions_with_current_values():
+    controller = Controller(
+        sim_map=None,
+        communication_radius=100.0,
+    )
+    drone_a = StaticDrone("A", 1.0, 0.0)
+    drone_b = StaticDrone("B", 2.0, 0.0)
+    drone_c = StaticDrone("C", 3.0, 0.0)
+    drone_a.known_positions["C"] = np.array([-9.0, 0.0], dtype=float)
+
+    controller._update_multihop_positions([drone_a, drone_b, drone_c])
+
+    np.testing.assert_allclose(drone_a.known_positions["C"], [3.0, 0.0])

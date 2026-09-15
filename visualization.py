@@ -3,6 +3,7 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 
+from controller import Controller
 from matplotlib.patches import Circle, RegularPolygon, Rectangle
 
 
@@ -321,38 +322,156 @@ class Visualizer:
         if total_boundary_length is None or not np.isfinite(float(total_boundary_length)):
             total_boundary_length = float(canonical_arc_lengths[-1]) if n_points > 1 else 1.0
 
+        global_ring = []
+        if (
+            canonical_points is not None
+            and canonical_arc_lengths is not None
+            and total_boundary_length is not None
+            and float(total_boundary_length) > 1e-12
+        ):
+            is_closed = True
+            for drone in drones:
+                ring_data = getattr(drone, "last_ring_info", None)
+                if isinstance(ring_data, dict):
+                    is_closed = bool(ring_data.get("is_closed", True))
+                    break
+
+            seeds = []
+            for drone in drones:
+                seed_s, seed_point, seed_idx = Controller._arc_length_at_position(
+                    canonical_points,
+                    canonical_arc_lengths,
+                    np.array([drone.x, drone.y], dtype=float),
+                    float(total_boundary_length),
+                    is_closed,
+                )
+                seeds.append({
+                    "robot_id": drone.drone_id,
+                    "index": seed_idx,
+                    "arc_length": seed_s,
+                    "position_on_boundary": seed_point,
+                })
+
+            targets = Controller._lloyd_targets_from_seed_arcs(
+                seeds,
+                float(total_boundary_length),
+                is_closed,
+            )
+            for seed in sorted(seeds, key=lambda item: float(item["arc_length"])):
+                drone_id = seed["robot_id"]
+                target_data = targets.get(drone_id, {})
+                target_arc = float(
+                    target_data.get("target_arc_length", seed["arc_length"])
+                )
+                target_point = Controller._point_at_arc_length(
+                    canonical_points,
+                    canonical_arc_lengths,
+                    target_arc,
+                    float(total_boundary_length),
+                    is_closed,
+                )
+                global_ring.append({
+                    "drone_id": drone_id,
+                    "seed_index": int(seed["index"]),
+                    "seed_arc_length": float(seed["arc_length"]),
+                    "target_centroid": target_point,
+                    "target_chain_index": int(
+                        np.argmin(
+                            np.linalg.norm(
+                                canonical_points - target_point.reshape(1, 2),
+                                axis=1,
+                            )
+                        )
+                    ),
+                    "target_arc_length": target_arc,
+                    "cell_start_arc_length": float(
+                        target_data.get("cell_start_arc_length", target_arc)
+                    ),
+                    "cell_end_arc_length": float(
+                        target_data.get("cell_end_arc_length", target_arc)
+                    ),
+                    "cell_arc_length": float(target_data.get("cell_arc_length", 0.0)),
+                })
+
+        if global_ring:
+            canonical_ring = global_ring
+
         x_margin = max(0.25, 0.03 * float(total_boundary_length))
         self.ring_ax.set_xlim(-x_margin, float(total_boundary_length) + x_margin)
 
         # Draw one canonical partition, then overlay each drone's own current
         # seed and Lloyd target so both panels use the same per-drone metadata.
+        use_geodesic_cells = bool(canonical_ring) and all(
+            "cell_start_arc_length" in entry and "cell_end_arc_length" in entry
+            for entry in canonical_ring
+        )
+
+        geodesic_entries_by_id = {}
+        geodesic_boundaries = []
+        if use_geodesic_cells:
+            geodesic_entries_by_id = {
+                entry.get("drone_id"): entry
+                for entry in canonical_ring
+            }
+            for entry in canonical_ring:
+                start = float(entry["cell_start_arc_length"]) % float(total_boundary_length)
+                geodesic_boundaries.append(start)
+
         for drone in drones:
-            cell_mask = np.array([a == drone.drone_id for a in canonical_assignment], dtype=bool)
-            if not np.any(cell_mask):
-                continue
-
             drone_color = self._drone_color(drone.drone_id)
-            points_x = np.flatnonzero(cell_mask)
-            if points_x.size == 0:
-                continue
+            points_x = np.array([], dtype=int)
 
-            contiguous_runs = np.split(
-                points_x,
-                np.where(np.diff(points_x) > 1)[0] + 1,
-            )
-            for run in contiguous_runs:
-                if run.size == 0:
+            if use_geodesic_cells and drone.drone_id in geodesic_entries_by_id:
+                entry = geodesic_entries_by_id[drone.drone_id]
+                start = float(entry["cell_start_arc_length"]) % float(total_boundary_length)
+                end = float(entry["cell_end_arc_length"]) % float(total_boundary_length)
+                cell_len = float(entry.get("cell_arc_length", 0.0))
+                if cell_len >= float(total_boundary_length) - 1e-9:
+                    segments = [(0.0, float(total_boundary_length))]
+                elif start <= end:
+                    segments = [(start, end)]
+                else:
+                    segments = [(start, float(total_boundary_length)), (0.0, end)]
+
+                for left, right in segments:
+                    if right - left <= 1e-12:
+                        continue
+                    segment = self.ring_ax.hlines(
+                        0.0,
+                        left,
+                        right,
+                        colors=[drone_color],
+                        linewidths=8.0,
+                        alpha=0.95,
+                        zorder=2,
+                    )
+                    self.voronoi_ring_artists.append(segment)
+            else:
+                cell_mask = np.array([a == drone.drone_id for a in canonical_assignment], dtype=bool)
+                if not np.any(cell_mask):
                     continue
-                segment = self.ring_ax.hlines(
-                    0.0,
-                    float(canonical_arc_lengths[run[0]]),
-                    float(canonical_arc_lengths[run[-1]]),
-                    colors=[drone_color],
-                    linewidths=8.0,
-                    alpha=0.95,
-                    zorder=2,
+
+                points_x = np.flatnonzero(cell_mask)
+                if points_x.size == 0:
+                    continue
+
+                contiguous_runs = np.split(
+                    points_x,
+                    np.where(np.diff(points_x) > 1)[0] + 1,
                 )
-                self.voronoi_ring_artists.append(segment)
+                for run in contiguous_runs:
+                    if run.size == 0:
+                        continue
+                    segment = self.ring_ax.hlines(
+                        0.0,
+                        float(canonical_arc_lengths[run[0]]),
+                        float(canonical_arc_lengths[run[-1]]),
+                        colors=[drone_color],
+                        linewidths=8.0,
+                        alpha=0.95,
+                        zorder=2,
+                    )
+                    self.voronoi_ring_artists.append(segment)
 
             # Target/seed marker: prefer the drone's own current partition,
             # then fall back to the canonical partition used for colored cells.
@@ -361,13 +480,21 @@ class Visualizer:
             target_arc = None
             seed_arc = None
 
-            ring_data = getattr(drone, "last_ring_info", None)
-            if isinstance(ring_data, dict):
-                current = ring_data.get("current", {})
-                seed_idx = current.get("seed_index")
-                seed_arc = current.get("seed_arc_length")
-                target_idx = current.get("target_chain_index")
-                target_arc = current.get("target_arc_length")
+            if drone.drone_id in geodesic_entries_by_id:
+                entry = geodesic_entries_by_id[drone.drone_id]
+                seed_idx = entry.get("seed_index")
+                seed_arc = entry.get("seed_arc_length")
+                target_idx = entry.get("target_chain_index")
+                target_arc = entry.get("target_arc_length")
+
+            if target_arc is None:
+                ring_data = getattr(drone, "last_ring_info", None)
+                if isinstance(ring_data, dict):
+                    current = ring_data.get("current", {})
+                    seed_idx = current.get("seed_index")
+                    seed_arc = current.get("seed_arc_length")
+                    target_idx = current.get("target_chain_index")
+                    target_arc = current.get("target_arc_length")
 
             if target_arc is None and canonical_ring:
                 for entry in canonical_ring:
@@ -391,7 +518,7 @@ class Visualizer:
                     target_idx = float(np.argmin(dists)) if dists.size else float(np.median(points_x))
 
             if target_idx is None:
-                target_idx = float(np.median(points_x))
+                target_idx = float(np.median(points_x)) if points_x.size else 0.0
             if target_arc is None:
                 target_arc = float(canonical_arc_lengths[int(target_idx)])
 
@@ -442,7 +569,23 @@ class Visualizer:
             txt.set_bbox(dict(facecolor="white", edgecolor="none", alpha=0.8, pad=0.6))
             self.voronoi_ring_artists.append(txt)
 
-        if canonical_assignment.size > 1:
+        if use_geodesic_cells and geodesic_boundaries:
+            separator_positions = sorted(
+                {
+                    round(float(boundary) % float(total_boundary_length), 9)
+                    for boundary in geodesic_boundaries
+                }
+            )
+            self.ring_ax.vlines(
+                separator_positions,
+                -0.55,
+                0.55,
+                colors="black",
+                linewidths=0.9,
+                alpha=0.75,
+                zorder=1,
+            )
+        elif canonical_assignment.size > 1:
             # canonical_assignment may contain non-numeric IDs (strings). Compute
             # separator positions by scanning for value changes to avoid numpy.diff
             separator_positions = [

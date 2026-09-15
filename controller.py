@@ -263,6 +263,8 @@ class Controller:
             targets[only["robot_id"]] = {
                 "target_arc_length": float(only["arc_length"]),
                 "cell_arc_length": float(total_length),
+                "cell_start_arc_length": 0.0,
+                "cell_end_arc_length": float(total_length),
             }
             return targets
 
@@ -277,10 +279,13 @@ class Controller:
                 right_gap = (next_s - curr_s) % length
                 cell_len = 0.5 * (left_gap + right_gap)
                 cell_start = (curr_s - 0.5 * left_gap) % length
+                cell_end = (curr_s + 0.5 * right_gap) % length
                 target_s = (cell_start + 0.5 * cell_len) % length
                 targets[seed["robot_id"]] = {
                     "target_arc_length": float(target_s),
                     "cell_arc_length": float(cell_len),
+                    "cell_start_arc_length": float(cell_start),
+                    "cell_end_arc_length": float(cell_end),
                 }
             return targets
 
@@ -295,6 +300,8 @@ class Controller:
             targets[seed["robot_id"]] = {
                 "target_arc_length": 0.5 * (left + right),
                 "cell_arc_length": float(max(0.0, right - left)),
+                "cell_start_arc_length": float(left),
+                "cell_end_arc_length": float(right),
             }
         return targets
 
@@ -709,12 +716,18 @@ class Controller:
         If two drones are within range, they share and merge their `known_positions` 
         dictionaries, propagating information across the network (multi-hop).
         """
-        # 1. Ensure every drone registers its own current real position first
+        # 1. Start each communication cycle from current measurements only.
+        # Without timestamps, keeping old dictionaries can reintroduce stale
+        # positions through neighbors and corrupt the 1D geodesic partition.
+        current_positions = {
+            getattr(drone, 'drone_id', 0): np.array([drone.x, drone.y], dtype=float)
+            for drone in drones
+        }
         for drone in drones:
             drone_id = getattr(drone, 'drone_id', 0)
-            if not hasattr(drone, 'known_positions'):
-                drone.known_positions = {}
-            drone.known_positions[drone_id] = np.array([drone.x, drone.y], dtype=float)
+            drone.known_positions = {
+                drone_id: current_positions[drone_id].copy(),
+            }
 
         # 2. Multi-hop propagation loop (e.g., 2 iterations to let information travel across neighbors)
         for _ in range(5):
@@ -869,6 +882,12 @@ class Controller:
             vor_size = int(indices.size)
             target_data = lloyd_targets.get(did, {})
             target_arc_length = float(target_data.get('target_arc_length', seed_arc_by_id[did]))
+            cell_start_arc_length = float(
+                target_data.get('cell_start_arc_length', target_arc_length)
+            )
+            cell_end_arc_length = float(
+                target_data.get('cell_end_arc_length', target_arc_length)
+            )
             target_centroid = self._point_at_arc_length(
                 occupied_points,
                 arc_lengths,
@@ -891,6 +910,8 @@ class Controller:
                 'target_centroid': target_centroid,
                 'target_chain_index': target_chain_index,
                 'target_arc_length': target_arc_length,
+                'cell_start_arc_length': cell_start_arc_length,
+                'cell_end_arc_length': cell_end_arc_length,
                 'indices': indices,
                 'voronoi_cell_size': vor_size,
                 'cell_arc_length': cell_arc_length,
@@ -934,6 +955,8 @@ class Controller:
                     'target_centroid': entry['target_centroid'],
                     'target_chain_index': entry['target_chain_index'],
                     'target_arc_length': entry['target_arc_length'],
+                    'cell_start_arc_length': entry['cell_start_arc_length'],
+                    'cell_end_arc_length': entry['cell_end_arc_length'],
                     'voronoi_cell_size': entry['voronoi_cell_size'],
                     'cell_arc_length': entry['cell_arc_length'],
                 })
