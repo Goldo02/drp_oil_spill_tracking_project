@@ -453,9 +453,10 @@ class SimulationEngine:
             if ring_info is not None:
                 current = ring_info.get("current", {})
                 theta = current.get("angle", np.nan)
-                ring_str = f"theta={theta:.3f}"
+                cell_len = current.get("cell_arc_length", np.nan)
+                ring_str = f"theta={theta:.3f}, cell_len={cell_len:.3f}"
             else:
-                ring_str = "theta=NA"
+                ring_str = "theta=NA, cell_len=NA"
 
             mode = getattr(drone, "last_control_mode", "unknown")
             print(
@@ -528,6 +529,13 @@ class SimulationEngine:
                     self.sim_map.ylim,
                 ),
             )
+            if hasattr(self.controller, "project_drone_to_boundary"):
+                self.controller.project_drone_to_boundary(drone)
+
+        if hasattr(self.controller, "_update_multihop_positions"):
+            self.controller._update_multihop_positions(self.drones)
+        if hasattr(self.controller, "_compute_voronoi_target"):
+            self.controller._compute_voronoi_target(self.drones)
 
     # ==================================================================
     # VISUALIZATION

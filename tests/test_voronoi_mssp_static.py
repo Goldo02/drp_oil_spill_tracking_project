@@ -56,7 +56,7 @@ def test_mssp_assigns_closed_boundary_across_wraparound_edge():
     np.testing.assert_allclose(distances[[0, 3]], [0.0, 0.0])
 
 
-def test_compute_actions_updates_voronoi_but_keeps_drones_static():
+def test_compute_actions_updates_voronoi_and_moves_toward_lloyd_target():
     controller = Controller(
         sim_map=None,
         communication_radius=100.0,
@@ -75,9 +75,7 @@ def test_compute_actions_updates_voronoi_but_keeps_drones_static():
 
     assert set(actions) == {"A", "B"}
     for drone in drones:
-        np.testing.assert_allclose(actions[drone.drone_id], [0.0, 0.0])
-        np.testing.assert_allclose(drone.last_control_vector, [0.0, 0.0])
-        assert drone.last_control_mode == "voronoi_static"
+        assert drone.last_control_mode == "lloyd"
         assert drone.last_ring_info["assigned_drone_indices"].tolist() == [
             "A",
             "A",
@@ -86,13 +84,35 @@ def test_compute_actions_updates_voronoi_but_keeps_drones_static():
             "B",
         ]
 
-    np.testing.assert_allclose(drones[0].target_centroid, [1.0, 0.0])
-    np.testing.assert_allclose(drones[1].target_centroid, [3.0, 0.0])
-    assert any(
-        np.allclose(drones[0].target_centroid, point)
-        for point in controller.known_boundary_points
+    np.testing.assert_allclose(drones[0].target_centroid, [0.75, 0.0])
+    np.testing.assert_allclose(drones[1].target_centroid, [2.75, 0.0])
+
+    np.testing.assert_allclose(actions["A"], [0.12, 0.0])
+    np.testing.assert_allclose(actions["B"], [-0.12, 0.0])
+    np.testing.assert_allclose(
+        drones[0].last_ring_info["current"]["target_arc_length"],
+        0.75,
     )
-    assert any(
-        np.allclose(drones[1].target_centroid, point)
-        for point in controller.known_boundary_points
+
+
+def test_closed_lloyd_targets_split_boundary_by_arc_midpoints():
+    points = np.array([[float(i), 0.0] for i in range(8)], dtype=float)
+    arc_lengths, total_length = Controller._boundary_arc_lengths(points, is_closed=True)
+    seeds = [
+        {"robot_id": "A", "index": 0, "arc_length": arc_lengths[0]},
+        {"robot_id": "B", "index": 2, "arc_length": arc_lengths[2]},
+        {"robot_id": "C", "index": 5, "arc_length": arc_lengths[5]},
+    ]
+
+    targets = Controller._lloyd_targets_from_seed_arcs(
+        seeds,
+        total_length,
+        is_closed=True,
     )
+
+    assert set(targets) == {"A", "B", "C"}
+    np.testing.assert_allclose(
+        sum(target["cell_arc_length"] for target in targets.values()),
+        total_length,
+    )
+    np.testing.assert_allclose(targets["B"]["target_arc_length"], 2.25)

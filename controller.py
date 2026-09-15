@@ -5,14 +5,11 @@ import numpy as np
 
 class Controller:
     """
-    Minimal Controller stubbed for user-driven reimplementation.
+    Controller for distributed 1D Voronoi/Lloyd coverage on a known boundary.
 
-    This file intentionally removes all autonomous motion and control logic.
-    Control methods are left as clear TODO stubs for the user to implement.
-
-    The class preserves the minimal data structures and helpers required by
-    other modules in the workspace, and provides a small helper to place
-    drones randomly on a known boundary.
+    The controller keeps the existing multi-hop position exchange, partitions
+    the ordered boundary with Multi-Source Dijkstra, and moves each robot
+    toward the Lloyd target of its current 1D Voronoi cell.
     """
 
     def __init__(
@@ -51,6 +48,7 @@ class Controller:
         # collision avoidance params
         self.d_safe = float(d_safe)
         self.repulsion_gain = float(repulsion_gain)
+        self.constrain_to_boundary = bool(kwargs.get("constrain_to_boundary", True))
 
     # ------------------------------------------------------------------
     # 1D VORONOI / MULTI-SOURCE SHORTEST PATH
@@ -138,6 +136,169 @@ class Controller:
         return int(np.argmin(dists))
 
     @staticmethod
+    def _boundary_arc_lengths(boundary_points, is_closed=False):
+        """Return cumulative arc-length coordinates for ordered boundary points."""
+        boundary = np.asarray(boundary_points, dtype=float)
+        n_points = int(boundary.shape[0])
+        arc_lengths = np.zeros(n_points, dtype=float)
+        if n_points <= 1:
+            return arc_lengths, 0.0
+
+        segment_lengths = np.linalg.norm(np.diff(boundary, axis=0), axis=1)
+        arc_lengths[1:] = np.cumsum(segment_lengths)
+        total_length = float(arc_lengths[-1])
+        if is_closed:
+            total_length += float(np.linalg.norm(boundary[0] - boundary[-1]))
+        return arc_lengths, total_length
+
+    @staticmethod
+    def _owned_arc_length(boundary_points, owner, robot_id, is_closed):
+        """Approximate physical length of a robot's Voronoi cell on the boundary."""
+        boundary = np.asarray(boundary_points, dtype=float)
+        owner = np.asarray(owner, dtype=object)
+        n_points = int(boundary.shape[0])
+        if n_points <= 1:
+            return 0.0
+
+        total = 0.0
+        for idx in range(n_points - 1):
+            if owner[idx] == robot_id and owner[idx + 1] == robot_id:
+                total += float(np.linalg.norm(boundary[idx + 1] - boundary[idx]))
+
+        if is_closed and owner[0] == robot_id and owner[-1] == robot_id:
+            total += float(np.linalg.norm(boundary[0] - boundary[-1]))
+
+        return total
+
+    @staticmethod
+    def _point_at_arc_length(boundary_points, arc_lengths, arc_length, total_length, is_closed):
+        """Interpolate a point on the ordered boundary at a given arc-length coordinate."""
+        boundary = np.asarray(boundary_points, dtype=float)
+        arc_lengths = np.asarray(arc_lengths, dtype=float)
+        n_points = int(boundary.shape[0])
+        if n_points == 0:
+            return np.zeros(2, dtype=float)
+        if n_points == 1 or total_length <= 1e-12:
+            return boundary[0].copy()
+
+        s = float(arc_length)
+        if is_closed:
+            s = s % float(total_length)
+        else:
+            s = float(np.clip(s, 0.0, float(total_length)))
+
+        if s <= arc_lengths[0]:
+            return boundary[0].copy()
+
+        if s >= arc_lengths[-1]:
+            if is_closed:
+                closing_len = float(np.linalg.norm(boundary[0] - boundary[-1]))
+                if closing_len <= 1e-12:
+                    return boundary[0].copy()
+                t = float(np.clip((s - arc_lengths[-1]) / closing_len, 0.0, 1.0))
+                return (1.0 - t) * boundary[-1] + t * boundary[0]
+            return boundary[-1].copy()
+
+        left_idx = int(np.searchsorted(arc_lengths, s, side="right") - 1)
+        right_idx = min(left_idx + 1, n_points - 1)
+        seg_len = float(arc_lengths[right_idx] - arc_lengths[left_idx])
+        if seg_len <= 1e-12:
+            return boundary[left_idx].copy()
+
+        t = float((s - arc_lengths[left_idx]) / seg_len)
+        return (1.0 - t) * boundary[left_idx] + t * boundary[right_idx]
+
+    @staticmethod
+    def _arc_length_at_position(boundary_points, arc_lengths, position, total_length, is_closed):
+        """Project a point onto the boundary and return its arc coordinate and position."""
+        boundary = np.asarray(boundary_points, dtype=float)
+        arc_lengths = np.asarray(arc_lengths, dtype=float)
+        pos = np.asarray(position, dtype=float)
+        n_points = int(boundary.shape[0])
+        if n_points == 0:
+            return 0.0, np.zeros(2, dtype=float), 0
+        if n_points == 1:
+            return 0.0, boundary[0].copy(), 0
+
+        best_dist2 = np.inf
+        best_s = 0.0
+        best_point = boundary[0].copy()
+        best_index = 0
+        segment_count = n_points if is_closed else n_points - 1
+
+        for idx in range(segment_count):
+            next_idx = (idx + 1) % n_points
+            start = boundary[idx]
+            end = boundary[next_idx]
+            vec = end - start
+            seg_len2 = float(np.dot(vec, vec))
+            if seg_len2 <= 1e-12:
+                t = 0.0
+            else:
+                t = float(np.clip(np.dot(pos - start, vec) / seg_len2, 0.0, 1.0))
+            projected = start + t * vec
+            dist2 = float(np.dot(pos - projected, pos - projected))
+            if dist2 < best_dist2:
+                seg_len = float(np.sqrt(seg_len2))
+                s = float(arc_lengths[idx] + t * seg_len)
+                if is_closed and total_length > 1e-12:
+                    s = s % float(total_length)
+                best_dist2 = dist2
+                best_s = s
+                best_point = projected
+                best_index = idx if t < 0.5 else next_idx
+
+        return best_s, best_point, int(best_index)
+
+    @staticmethod
+    def _lloyd_targets_from_seed_arcs(seeds, total_length, is_closed):
+        """Return Lloyd cell centers in arc-length coordinates for a 1D boundary."""
+        if not seeds or total_length <= 1e-12:
+            return {}
+
+        ordered = sorted(seeds, key=lambda seed: float(seed["arc_length"]))
+        targets = {}
+        if len(ordered) == 1:
+            only = ordered[0]
+            targets[only["robot_id"]] = {
+                "target_arc_length": float(only["arc_length"]),
+                "cell_arc_length": float(total_length),
+            }
+            return targets
+
+        if is_closed:
+            length = float(total_length)
+            count = len(ordered)
+            for idx, seed in enumerate(ordered):
+                prev_s = float(ordered[idx - 1]["arc_length"])
+                curr_s = float(seed["arc_length"])
+                next_s = float(ordered[(idx + 1) % count]["arc_length"])
+                left_gap = (curr_s - prev_s) % length
+                right_gap = (next_s - curr_s) % length
+                cell_len = 0.5 * (left_gap + right_gap)
+                cell_start = (curr_s - 0.5 * left_gap) % length
+                target_s = (cell_start + 0.5 * cell_len) % length
+                targets[seed["robot_id"]] = {
+                    "target_arc_length": float(target_s),
+                    "cell_arc_length": float(cell_len),
+                }
+            return targets
+
+        boundaries = [0.0]
+        for left, right in zip(ordered[:-1], ordered[1:]):
+            boundaries.append(0.5 * (float(left["arc_length"]) + float(right["arc_length"])))
+        boundaries.append(float(total_length))
+
+        for idx, seed in enumerate(ordered):
+            left = boundaries[idx]
+            right = boundaries[idx + 1]
+            targets[seed["robot_id"]] = {
+                "target_arc_length": 0.5 * (left + right),
+                "cell_arc_length": float(max(0.0, right - left)),
+            }
+        return targets
+
+    @staticmethod
     def _cell_target_index(boundary_points, indices, seed_index, is_closed):
         """Return a boundary index near the 1D arc midpoint of a Voronoi cell."""
         indices = np.asarray(indices, dtype=int)
@@ -170,6 +331,56 @@ class Controller:
         midpoint = 0.5 * cumulative[-1]
         target_pos = int(np.searchsorted(cumulative, midpoint, side="left"))
         return int(ordered[min(target_pos, ordered.size - 1)])
+
+    @staticmethod
+    def _arc_indices_between(start_index, target_index, n_points, is_closed):
+        """Return boundary indices from start to target along the shortest arc."""
+        start_index = int(start_index)
+        target_index = int(target_index)
+        if start_index == target_index:
+            return np.array([start_index], dtype=int)
+
+        if not is_closed:
+            step = 1 if target_index > start_index else -1
+            return np.arange(start_index, target_index + step, step, dtype=int)
+
+        forward_steps = (target_index - start_index) % n_points
+        backward_steps = (start_index - target_index) % n_points
+        if forward_steps <= backward_steps:
+            return np.array(
+                [(start_index + offset) % n_points for offset in range(forward_steps + 1)],
+                dtype=int,
+            )
+        return np.array(
+            [(start_index - offset) % n_points for offset in range(backward_steps + 1)],
+            dtype=int,
+        )
+
+    @classmethod
+    def _next_boundary_index_toward(cls, boundary_points, start_index, target_index, is_closed, max_step):
+        """Choose the farthest boundary index reachable within one control step."""
+        boundary = np.asarray(boundary_points, dtype=float)
+        path = cls._arc_indices_between(
+            start_index,
+            target_index,
+            int(boundary.shape[0]),
+            is_closed,
+        )
+        if path.size <= 1:
+            return int(path[0])
+
+        traveled = 0.0
+        chosen = int(path[1])
+        for idx in range(1, path.size):
+            previous_idx = int(path[idx - 1])
+            current_idx = int(path[idx])
+            edge_length = float(np.linalg.norm(boundary[current_idx] - boundary[previous_idx]))
+            if traveled + edge_length > max_step:
+                break
+            traveled += edge_length
+            chosen = current_idx
+
+        return int(chosen)
 
     # ------------------------------------------------------------------
     # BOUNDARY / INITIALIZATION HELPERS
@@ -487,29 +698,7 @@ class Controller:
         return np.array(indices, dtype=int)
 
     # ------------------------------------------------------------------
-    # CONTROL STUBS (intentionally left for user re-implementation)
-    # ------------------------------------------------------------------
-
-    def _boundary_tracking_action(self, *args, **kwargs):
-        """TODO: Implement boundary tracking control.
-
-        This method intentionally contains no control logic. Implement the
-        desired behavior in 2D here.
-        """
-        # TODO: implement boundary following control
-        return np.zeros(2, dtype=float)
-
-    def _equidistant_action(self, *args, **kwargs):
-        """TODO: Implement equidistant (1D arc-index) control.
-
-        The user requested that all movement/control logic be removed. Use this
-        method to reintroduce the arc-index-based law when ready.
-        """
-        # TODO: implement arc-index equidistant control
-        return np.zeros(2, dtype=float)
-
-    # ------------------------------------------------------------------
-    # PUBLIC INTERFACE: simplified compute_actions that only sets mode stubs
+    # PUBLIC INTERFACE
     # ------------------------------------------------------------------
 
     def _update_multihop_positions(self, drones):
@@ -556,6 +745,37 @@ class Controller:
         for drone in drones:
             self.compute_ring_ordering(drone, drones)
 
+    def project_drone_to_boundary(self, drone):
+        """Snap a drone state to the nearest point of the known boundary."""
+        if (
+            not self.constrain_to_boundary
+            or self.known_boundary_points is None
+            or len(self.known_boundary_points) == 0
+        ):
+            return
+
+        boundary = np.asarray(self.known_boundary_points, dtype=float)
+        is_closed = bool(self.known_boundary_closed)
+        arc_lengths, total_length = self._boundary_arc_lengths(
+            boundary,
+            is_closed=is_closed,
+        )
+        boundary_s, projected, nearest_idx = self._arc_length_at_position(
+            boundary,
+            arc_lengths,
+            np.array([drone.x, drone.y], dtype=float),
+            total_length,
+            is_closed,
+        )
+        drone.x = float(projected[0])
+        drone.y = float(projected[1])
+        drone.known_positions[drone.drone_id] = np.array(
+            [drone.x, drone.y],
+            dtype=float,
+        )
+        drone.boundary_index = int(nearest_idx)
+        drone.boundary_s = float(boundary_s)
+
     def compute_ring_ordering(self, current_drone, drones):
         """Compute 1D Voronoi partitioning with Multi-Source Dijkstra.
 
@@ -587,51 +807,80 @@ class Controller:
         if known is None or len(known) == 0:
             known = {getattr(d, 'drone_id', 0): np.array([d.x, d.y], dtype=float) for d in drones}
 
+        is_closed = bool(self.known_boundary_closed)
+        arc_lengths, total_boundary_length = self._boundary_arc_lengths(
+            occupied_points,
+            is_closed=is_closed,
+        )
+
         seeds = []
         for drone_id, position in known.items():
-            seed_idx = self._nearest_boundary_index(occupied_points, position)
-            seeds.append({'robot_id': drone_id, 'index': seed_idx})
+            seed_s, projected, seed_idx = self._arc_length_at_position(
+                occupied_points,
+                arc_lengths,
+                position,
+                total_boundary_length,
+                is_closed,
+            )
+            seeds.append({
+                'robot_id': drone_id,
+                'index': seed_idx,
+                'arc_length': seed_s,
+                'position_on_boundary': projected,
+            })
 
-        seeds.sort(key=lambda seed: int(seed['index']))
+        seeds.sort(key=lambda seed: float(seed['arc_length']))
         ordered_ids = [seed['robot_id'] for seed in seeds]
 
         M = len(ordered_ids)
         if M == 0:
             return None
 
-        is_closed = bool(self.known_boundary_closed)
         assigned, distances = self.multi_source_shortest_path_voronoi(
             occupied_points,
             seeds,
             is_closed=is_closed,
         )
+        lloyd_targets = self._lloyd_targets_from_seed_arcs(
+            seeds,
+            total_boundary_length,
+            is_closed,
+        )
 
         ring = []
         seed_by_id = {seed['robot_id']: int(seed['index']) for seed in seeds}
+        seed_arc_by_id = {seed['robot_id']: float(seed['arc_length']) for seed in seeds}
         for did in ordered_ids:
             mask = np.array([a == did for a in assigned])
             indices = np.flatnonzero(mask)
-            cell_pts = occupied_points[indices] if indices.size else np.empty((0, 2), dtype=float)
             vor_size = int(indices.size)
-            if vor_size > 0:
-                target_chain_index = self._cell_target_index(
-                    occupied_points,
-                    indices,
-                    seed_by_id[did],
-                    is_closed,
+            target_data = lloyd_targets.get(did, {})
+            target_arc_length = float(target_data.get('target_arc_length', seed_arc_by_id[did]))
+            target_centroid = self._point_at_arc_length(
+                occupied_points,
+                arc_lengths,
+                target_arc_length,
+                total_boundary_length,
+                is_closed,
+            )
+            target_chain_index = self._nearest_boundary_index(occupied_points, target_centroid)
+            cell_arc_length = float(
+                target_data.get(
+                    'cell_arc_length',
+                    self._owned_arc_length(occupied_points, assigned, did, is_closed),
                 )
-                target_centroid = occupied_points[target_chain_index]
-            else:
-                target_centroid = occupied_points[seed_by_id[did]]
-                target_chain_index = seed_by_id[did]
+            )
 
             ring.append({
                 'drone_id': did,
                 'seed_index': seed_by_id[did],
+                'seed_arc_length': seed_arc_by_id[did],
                 'target_centroid': target_centroid,
                 'target_chain_index': target_chain_index,
+                'target_arc_length': target_arc_length,
                 'indices': indices,
                 'voronoi_cell_size': vor_size,
+                'cell_arc_length': cell_arc_length,
             })
 
         # Set target_centroid on drone objects where appropriate
@@ -659,6 +908,8 @@ class Controller:
             'occupied_points': occupied_points,
             'assigned_drone_indices': assigned,
             'distances': distances,
+            'arc_lengths': arc_lengths,
+            'total_boundary_length': total_boundary_length,
             'seeds': seeds,
             'is_closed': is_closed,
             'ring': ring,
@@ -672,9 +923,12 @@ class Controller:
             if entry['drone_id'] == cur_id:
                 res['current'].update({
                     'seed_index': entry['seed_index'],
+                    'seed_arc_length': entry['seed_arc_length'],
                     'target_centroid': entry['target_centroid'],
                     'target_chain_index': entry['target_chain_index'],
+                    'target_arc_length': entry['target_arc_length'],
                     'voronoi_cell_size': entry['voronoi_cell_size'],
+                    'cell_arc_length': entry['cell_arc_length'],
                 })
                 res['current_idx'] = entry['drone_id']
                 break
@@ -685,7 +939,7 @@ class Controller:
 
 
     def compute_actions(self, drones, world_field=None, x_coords=None, y_coords=None):
-        """Update communication/Voronoi diagnostics while keeping robots fixed."""
+        """Run one distributed Lloyd iteration on the 1D boundary."""
         actions = {}
         
         # Ensure initial attributes exist on all drones
@@ -702,17 +956,25 @@ class Controller:
         for drone in drones:
             drone.known_boundary_points = self.known_boundary_points.copy()
 
-        # 3. Keep every robot static. The mode records what is being inspected,
-        # while the zero action guarantees no physical movement is applied.
+        # 3. Move each robot toward its current Lloyd target.
         for drone in drones:
             drone_id = getattr(drone, 'drone_id', None)
 
             if not hasattr(drone, 'known_positions') or drone.known_positions is None:
                 drone.known_positions = {drone_id: np.array([drone.x, drone.y], dtype=float)}
 
-            drone.last_control_mode = 'voronoi_static'
-            drone.last_control_vector = np.zeros(2, dtype=float)
-            actions[drone_id] = np.zeros(2, dtype=float)
+            drone.last_control_mode = 'lloyd'
+            action = self._equidistant_action(
+                drone,
+                getattr(drone, 'last_ring_info', None),
+                world_field,
+                x_coords,
+                y_coords,
+            )
+            actions[drone_id] = self._clip_action(
+                action,
+                max_speed=getattr(drone, 'max_speed', 0.12),
+            )
 
         return actions
 
@@ -740,12 +1002,81 @@ class Controller:
         return action
 
     def _boundary_tracking_action(self, *args, **kwargs):
-        """Temporarily disabled: robots must remain static."""
+        """Boundary tracking is not used while testing 1D Lloyd coverage."""
         return np.zeros(2, dtype=float)
 
     def _equidistant_action(self, drone, ring_info, world_field, x_coords, y_coords):
-        """Temporarily disabled: robots must remain static."""
-        return np.zeros(2, dtype=float)
+        """Move the drone toward the current Lloyd target along the boundary arc."""
+        target = None
+        target_arc = None
+        boundary = None
+        arc_lengths = None
+        total_length = None
+        is_closed = None
+        if isinstance(ring_info, dict):
+            current = ring_info.get('current', {})
+            target = current.get('target_centroid')
+            target_arc = current.get('target_arc_length')
+            boundary = ring_info.get('occupied_points')
+            arc_lengths = ring_info.get('arc_lengths')
+            total_length = ring_info.get('total_boundary_length')
+            is_closed = bool(ring_info.get('is_closed', self.known_boundary_closed))
+        if target is None:
+            target = getattr(drone, 'target_centroid', None)
+        if target is None:
+            return np.zeros(2, dtype=float)
+
+        max_speed = float(getattr(drone, 'max_speed', 0.12))
+        current_pos = np.array([drone.x, drone.y], dtype=float)
+
+        if (
+            target_arc is not None
+            and boundary is not None
+            and arc_lengths is not None
+            and total_length is not None
+            and float(total_length) > 1e-12
+        ):
+            boundary = np.asarray(boundary, dtype=float)
+            arc_lengths = np.asarray(arc_lengths, dtype=float)
+            current_arc = getattr(drone, 'boundary_s', None)
+            if current_arc is None:
+                current_arc, _, _ = self._arc_length_at_position(
+                    boundary,
+                    arc_lengths,
+                    current_pos,
+                    float(total_length),
+                    bool(is_closed),
+                )
+
+            if bool(is_closed):
+                signed_error = (
+                    (float(target_arc) - float(current_arc) + 0.5 * float(total_length))
+                    % float(total_length)
+                    - 0.5 * float(total_length)
+                )
+            else:
+                signed_error = float(target_arc) - float(current_arc)
+
+            step = float(np.clip(
+                float(self.k_t) * signed_error,
+                -max_speed,
+                max_speed,
+            ))
+            if abs(step) <= 1e-12:
+                return np.zeros(2, dtype=float)
+
+            next_arc = float(current_arc) + step
+            next_point = self._point_at_arc_length(
+                boundary,
+                arc_lengths,
+                next_arc,
+                float(total_length),
+                bool(is_closed),
+            )
+            return self._clip_action(next_point - current_pos, max_speed=max_speed)
+
+        action = float(self.k_t) * (np.asarray(target, dtype=float) - current_pos)
+        return self._clip_action(action, max_speed=max_speed)
 
     def _compute_repulsion(self, drone):
         """Compute simple inter-drone repulsion based on `d_safe` and `repulsion_gain`.

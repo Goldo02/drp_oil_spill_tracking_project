@@ -232,7 +232,7 @@ class Visualizer:
         self.ring_ax.set_xlim(-0.5, 1.0)
         self.ring_ax.set_ylim(-0.8, 0.8)
         self.ring_ax.set_aspect("auto")
-        self.ring_ax.set_xlabel("Boundary arc index")
+        self.ring_ax.set_xlabel("Boundary arc length [m]")
         self.ring_ax.set_ylabel("Cell")
         self.ring_ax.set_title("1D Voronoi boundary partition")
         self.ring_ax.set_yticks([])
@@ -243,6 +243,8 @@ class Visualizer:
         canonical_assignment = None
         canonical_points = None
         canonical_ring = None
+        canonical_arc_lengths = None
+        total_boundary_length = None
 
         for drone in drones:
             ring_data = getattr(drone, "last_ring_info", None)
@@ -264,6 +266,8 @@ class Visualizer:
                 canonical_assignment = assigned
                 canonical_points = occupied
                 canonical_ring = ring_data.get("ring", [])
+                canonical_arc_lengths = ring_data.get("arc_lengths")
+                total_boundary_length = ring_data.get("total_boundary_length")
                 break
 
         if canonical_assignment is None:
@@ -302,13 +306,23 @@ class Visualizer:
 
             canonical_points = boundary_pts
             canonical_ring = []
+            canonical_arc_lengths = np.arange(n_points, dtype=float)
+            total_boundary_length = float(max(n_points - 1, 1))
 
         n_points = len(canonical_assignment)
         if n_points == 0:
             return
 
-        x_margin = max(2.0, 0.03 * float(n_points))
-        self.ring_ax.set_xlim(-x_margin, n_points - 1 + x_margin)
+        if canonical_arc_lengths is None:
+            canonical_arc_lengths = np.arange(n_points, dtype=float)
+        canonical_arc_lengths = np.asarray(canonical_arc_lengths, dtype=float)
+        if canonical_arc_lengths.size != n_points:
+            canonical_arc_lengths = np.arange(n_points, dtype=float)
+        if total_boundary_length is None or not np.isfinite(float(total_boundary_length)):
+            total_boundary_length = float(canonical_arc_lengths[-1]) if n_points > 1 else 1.0
+
+        x_margin = max(0.25, 0.03 * float(total_boundary_length))
+        self.ring_ax.set_xlim(-x_margin, float(total_boundary_length) + x_margin)
 
         cell_colors = []
         cell_indices = []
@@ -328,6 +342,7 @@ class Visualizer:
                 # fallback to canonical arrays
                 occupied = canonical_points
                 assigned = canonical_assignment
+            arc_lengths = canonical_arc_lengths
 
             if occupied is None or occupied.size == 0:
                 continue
@@ -350,8 +365,8 @@ class Visualizer:
                     continue
                 segment = self.ring_ax.hlines(
                     0.0,
-                    float(run[0]) - 0.5,
-                    float(run[-1]) + 0.5,
+                    float(arc_lengths[run[0]]),
+                    float(arc_lengths[run[-1]]),
                     colors=[drone_color],
                     linewidths=8.0,
                     alpha=0.95,
@@ -364,12 +379,16 @@ class Visualizer:
             # target centroid: prefer canonical_ring entry then per-drone target_centroid
             target_idx = None
             seed_idx = None
+            target_arc = None
+            seed_arc = None
             if canonical_ring:
                 for entry in canonical_ring:
                     if entry.get("drone_id") == drone.drone_id:
                         seed_idx = entry.get("seed_index")
+                        seed_arc = entry.get("seed_arc_length")
                         # some ring generators expose a target_chain_index
                         target_idx = entry.get("target_chain_index")
+                        target_arc = entry.get("target_arc_length")
                         if target_idx is None and "target_centroid" in entry and canonical_points is not None:
                             # find nearest canonical point to the target centroid
                             tc = np.asarray(entry["target_centroid"], dtype=float)
@@ -387,10 +406,12 @@ class Visualizer:
 
             if target_idx is None:
                 target_idx = float(np.median(points_x))
+            if target_arc is None:
+                target_arc = float(canonical_arc_lengths[int(target_idx)])
 
             # Larger star for the target centroid
             sc_tc = self.ring_ax.scatter(
-                [float(target_idx)],
+                [float(target_arc)],
                 [0.0],
                 s=180,
                 c=[drone_color],
@@ -403,11 +424,13 @@ class Visualizer:
 
             if seed_idx is None:
                 seed_idx = target_idx
+            if seed_arc is None:
+                seed_arc = float(canonical_arc_lengths[int(seed_idx)])
 
             # Small marker above the axis representing the drone projection on the 1D ring
             drone_marker_y = 0.22
             dm = self.ring_ax.scatter(
-                [float(seed_idx)],
+                [float(seed_arc)],
                 [drone_marker_y],
                 s=120,
                 c=[drone_color],
@@ -420,7 +443,7 @@ class Visualizer:
 
             # Label with white background for readability
             txt = self.ring_ax.text(
-                float(seed_idx),
+                float(seed_arc),
                 drone_marker_y + 0.08,
                 f"{drone.drone_id}",
                 color="black",
@@ -436,7 +459,11 @@ class Visualizer:
         if canonical_assignment.size > 1:
             # canonical_assignment may contain non-numeric IDs (strings). Compute
             # separator positions by scanning for value changes to avoid numpy.diff
-            separator_positions = [i + 0.5 for i in range(canonical_assignment.size - 1) if canonical_assignment[i] != canonical_assignment[i + 1]]
+            separator_positions = [
+                0.5 * (canonical_arc_lengths[i] + canonical_arc_lengths[i + 1])
+                for i in range(canonical_assignment.size - 1)
+                if canonical_assignment[i] != canonical_assignment[i + 1]
+            ]
             if len(separator_positions):
                 self.ring_ax.vlines(
                     separator_positions,
@@ -448,7 +475,7 @@ class Visualizer:
                     zorder=1,
                 )
 
-        self.ring_ax.hlines(0.0, -0.5, max(n_points - 0.5, 0.5), colors="gray", linewidths=0.8, alpha=0.35, zorder=0)
+        self.ring_ax.hlines(0.0, 0.0, float(total_boundary_length), colors="gray", linewidths=0.8, alpha=0.35, zorder=0)
 
     def update_drone(self, drone):
         """

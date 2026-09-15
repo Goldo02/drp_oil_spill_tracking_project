@@ -152,7 +152,7 @@ def run_simulation(
 
     initial_radius = spill.radius
     engine.initialize_world_boundary()
-    engine.spawn_drones_on_boundary(num_drones)
+    engine.spawn_drones_on_boundary(num_drones, rng=np.random.default_rng(seed))
 
     # ==================================================================
     # VISUALIZATION
