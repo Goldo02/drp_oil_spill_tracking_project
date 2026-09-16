@@ -1,15 +1,14 @@
 import numpy as np
 
 
-class Controller:
+class DroneController:
     """
-    Distributed controller for multi-drone exploration and oil-spill
-    boundary tracking.
+    Local onboard controller for one drone.
 
     Responsibilities:
-        - determine communication neighbours;
-        - perform distributed consensus;
-        - compute motion actions for each drone.
+        - read this drone's local consensus grid;
+        - choose exploration or boundary tracking;
+        - compute this drone's motion command.
     """
 
     def __init__(
@@ -46,91 +45,6 @@ class Controller:
         self.k_n = 1.5
 
         self.boundary_lock_gain = 3.0
-
-    # ==================================================================
-    # COMMUNICATION
-    # ==================================================================
-
-    def get_neighbors(self, drone, drones):
-        """Return drones that can communicate with `drone`."""
-
-        if self.fully_connected:
-            return [
-                other
-                for other in drones
-                if other is not drone
-            ]
-
-        neighbours = []
-
-        for other in drones:
-
-            if other is drone:
-                continue
-
-            distance = float(
-                np.hypot(
-                    drone.x - other.x,
-                    drone.y - other.y,
-                )
-            )
-
-            if distance <= self.communication_radius:
-                neighbours.append(other)
-
-        return neighbours
-
-    # ==================================================================
-    # CONSENSUS
-    # ==================================================================
-
-    def consensus_step(self, drones):
-        """
-        Perform one synchronous consensus iteration.
-
-        Each drone replaces its grid with the average of its own grid
-        and the grids of its current communication neighbours.
-        """
-
-        snapshot = {
-            drone.drone_id: np.asarray(
-                drone.grid,
-                dtype=float,
-            ).copy()
-            for drone in drones
-        }
-
-        updated = {}
-
-        for drone in drones:
-
-            neighbours = self.get_neighbors(
-                drone,
-                drones,
-            )
-
-            grids = [
-                snapshot[drone.drone_id]
-            ]
-
-            grids.extend(
-                snapshot[
-                    neighbour.drone_id
-                ]
-                for neighbour in neighbours
-            )
-
-            updated[
-                drone.drone_id
-            ] = np.mean(
-                grids,
-                axis=0,
-            )
-
-        for drone in drones:
-            drone.grid = updated[
-                drone.drone_id
-            ]
 
     # ==================================================================
     # VECTOR UTILITIES
@@ -558,15 +472,15 @@ class Controller:
 
         return occupied_points[best_idx]
 
-    def compute_actions(
+    def compute_action(
         self,
-        drones,
+        drone,
         world_field,
         x_coords,
         y_coords,
     ):
         """
-        Compute one action for every drone.
+        Compute this drone's local action.
 
         The decision is driven by the local consensus occupancy grid: if the
         consensus map contains occupied boundary cells, the drone stays in
@@ -576,41 +490,36 @@ class Controller:
 
         Returns
         -------
-        dict
-            {drone_id: np.ndarray([vx, vy])}
+        np.ndarray
+            [vx, vy] command.
         """
 
-        actions = {}
+        target = self._grid_target(drone)
+        should_track_boundary = target is not None
 
-        for drone in drones:
-            target = self._grid_target(drone)
-            should_track_boundary = target is not None
+        if should_track_boundary:
+            drone.last_control_mode = "boundary_tracking"
 
-            if should_track_boundary:
-                drone.last_control_mode = "boundary_tracking"
+            action = self._boundary_tracking_action(
+                drone,
+                world_field,
+                x_coords,
+                y_coords,
+            )
 
-                action = self._boundary_tracking_action(
-                    drone,
-                    world_field,
-                    x_coords,
-                    y_coords,
+            if action is None:
+                direction = self._normalize(
+                    np.asarray(target, dtype=float)
+                    - np.array([drone.x, drone.y], dtype=float)
                 )
+                if direction is not None:
+                    action = direction * self.exploration_speed
+                else:
+                    action = self._exploration_action(drone)
+                    drone.last_control_mode = "explore"
 
-                if action is None:
-                    direction = self._normalize(
-                        np.asarray(target, dtype=float)
-                        - np.array([drone.x, drone.y], dtype=float)
-                    )
-                    if direction is not None:
-                        action = direction * self.exploration_speed
-                    else:
-                        action = self._exploration_action(drone)
-                        drone.last_control_mode = "explore"
+        else:
+            action = self._exploration_action(drone)
+            drone.last_control_mode = "explore"
 
-            else:
-                action = self._exploration_action(drone)
-                drone.last_control_mode = "explore"
-
-            actions[drone.drone_id] = self._clip_action(action)
-
-        return actions
+        return self._clip_action(action)

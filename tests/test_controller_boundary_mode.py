@@ -1,6 +1,6 @@
 import numpy as np
 
-from controller import Controller
+from controller import DroneController
 
 
 class DummyMap:
@@ -27,7 +27,7 @@ class DummyDrone:
 
 
 def test_compute_actions_uses_local_grid_not_edge_flag():
-    controller = Controller(
+    controller = DroneController(
         sim_map=DummyMap(),
         communication_radius=1.0,
         occupancy_threshold=0.5,
@@ -39,19 +39,19 @@ def test_compute_actions_uses_local_grid_not_edge_flag():
     x_coords = np.linspace(-2.0, 2.0, 41)
     y_coords = np.linspace(-2.0, 2.0, 41)
 
-    controller.compute_actions(
-        [drone],
+    controller.compute_action(
+        drone,
         world_field,
         x_coords,
         y_coords,
     )
 
     assert drone.last_control_mode == "boundary_tracking"
-    assert np.linalg.norm(controller.compute_actions([drone], world_field, x_coords, y_coords)[drone.drone_id]) > 0.0
+    assert np.linalg.norm(controller.compute_action(drone, world_field, x_coords, y_coords)) > 0.0
 
 
 def test_compute_actions_tracks_occupied_target_in_consensus_grid():
-    controller = Controller(
+    controller = DroneController(
         sim_map=DummyMap(),
         communication_radius=1.0,
         occupancy_threshold=0.5,
@@ -63,7 +63,7 @@ def test_compute_actions_tracks_occupied_target_in_consensus_grid():
     x_coords = np.linspace(-2.0, 2.0, 41)
     y_coords = np.linspace(-2.0, 2.0, 41)
 
-    action = controller.compute_actions([drone], world_field, x_coords, y_coords)[drone.drone_id]
+    action = controller.compute_action(drone, world_field, x_coords, y_coords)
 
     assert drone.last_control_mode == "boundary_tracking"
     assert np.linalg.norm(action) > 0.0

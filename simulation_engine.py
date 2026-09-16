@@ -1,7 +1,7 @@
 import numpy as np
 
 from drone import Drone
-from controller import Controller
+from controller import DroneController
 
 
 class SimulationEngine:
@@ -23,7 +23,6 @@ class SimulationEngine:
         self,
         sim_map,
         oil_spill,
-        controller=None,
         x_min=-10.0,
         x_max=10.0,
         y_min=-10.0,
@@ -68,6 +67,7 @@ class SimulationEngine:
         )
 
         self.verbose = bool(verbose)
+        self.fully_connected = bool(fully_connected)
 
         # --------------------------------------------------------------
         # Occupancy grid
@@ -132,21 +132,6 @@ class SimulationEngine:
         )
 
         # --------------------------------------------------------------
-        # Controller
-        # --------------------------------------------------------------
-
-        if controller is None:
-            self.controller = Controller(
-                sim_map=self.sim_map,
-                communication_radius=self.communication_radius,
-                fully_connected=fully_connected,
-                occupancy_threshold=self.occupancy_threshold,
-                resolution=self.resolution,
-            )
-        else:
-            self.controller = controller
-
-        # --------------------------------------------------------------
         # Simulation state
         # --------------------------------------------------------------
 
@@ -208,6 +193,13 @@ class SimulationEngine:
             sensor_size=self.sensor_size,
             gps_noise=gps_noise,
             camera_noise=camera_noise,
+            controller=DroneController(
+                sim_map=self.sim_map,
+                communication_radius=self.communication_radius,
+                fully_connected=self.fully_connected,
+                occupancy_threshold=self.occupancy_threshold,
+                resolution=self.resolution,
+            ),
         )
 
         self.drones.append(drone)
@@ -241,13 +233,45 @@ class SimulationEngine:
     # CONSENSUS
     # ==================================================================
 
+    def _get_neighbors(self, drone):
+        if self.fully_connected:
+            return [
+                other
+                for other in self.drones
+                if other is not drone
+            ]
+
+        return [
+            other
+            for other in self.drones
+            if other is not drone
+            and float(np.linalg.norm(drone.position - other.position)) <= self.communication_radius
+        ]
+
+    def _exchange_consensus_messages(self):
+        """Deliver one synchronous round of local map messages."""
+        messages = {
+            drone.drone_id: drone.create_consensus_message()
+            for drone in self.drones
+        }
+
+        delivered = {}
+        for drone in self.drones:
+            delivered[drone.drone_id] = [
+                messages[neighbor.drone_id]
+                for neighbor in self._get_neighbors(drone)
+            ]
+
+        for drone in self.drones:
+            drone.consensus_step(
+                delivered[drone.drone_id],
+                own_grid=messages[drone.drone_id]["grid"],
+            )
+
     def _perform_consensus(self):
         """Run the configured number of consensus iterations."""
-
         for _ in range(self.consensus_rounds):
-            self.controller.consensus_step(
-                self.drones
-            )
+            self._exchange_consensus_messages()
 
     # ==================================================================
     # DIAGNOSTICS
@@ -394,20 +418,14 @@ class SimulationEngine:
     # ==================================================================
 
     def _apply_actions(self):
-        """Compute distributed actions and apply them to drones."""
-
-        actions = self.controller.compute_actions(
-            self.drones,
-            world_field=self.world_field,
-            x_coords=self.sim_map.x_coords,
-            y_coords=self.sim_map.y_coords,
-        )
+        """Compute per-drone local actions and apply them."""
 
         for drone in self.drones:
 
-            action = actions.get(
-                drone.drone_id,
-                np.zeros(2, dtype=float),
+            action = drone.compute_action(
+                self.world_field,
+                self.sim_map.x_coords,
+                self.sim_map.y_coords,
             )
 
             drone.action(
@@ -537,9 +555,7 @@ class SimulationEngine:
             self.consensus_rounds
         ):
 
-            self.controller.consensus_step(
-                self.drones
-            )
+            self._exchange_consensus_messages()
 
             self._record_measurement_trace()
 

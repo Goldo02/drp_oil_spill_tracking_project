@@ -16,7 +16,6 @@ from environment import (
     SmoothedPolygonOilSpill,
 )
 
-from controller import Controller
 from simulation_engine import SimulationEngine
 from visualization import Visualizer
 
@@ -91,10 +90,6 @@ def run_simulation(
             continuous=polygon_continuous,
         )
 
-    # ==================================================================
-    # CONTROLLER
-    # ==================================================================
-
     dx = sim_map.dx
     dy = sim_map.dy
 
@@ -104,14 +99,6 @@ def run_simulation(
         * (abs(dx) + abs(dy))
     )
 
-    controller = Controller(
-        sim_map=sim_map,
-        communication_radius=communication_radius,
-        fully_connected=fully_connected,
-        occupancy_threshold=0.5,
-        resolution=0.1,
-    )
-
     # ==================================================================
     # SIMULATION ENGINE
     # ==================================================================
@@ -119,7 +106,6 @@ def run_simulation(
     engine = SimulationEngine(
         sim_map=sim_map,
         oil_spill=spill,
-        controller=controller,
 
         x_min=-10.0,
         x_max=10.0,
@@ -436,7 +422,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--communication-radius-cells",
         type=int,
-        default=205,
+        default=250,
     )
 
     parser.add_argument(
