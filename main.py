@@ -9,7 +9,6 @@ if not os.environ.get("MPLCONFIGDIR"):
 import matplotlib
 
 from environment import CircleOilSpill, SimulationMap, SmoothedPolygonOilSpill
-from controller import Controller
 from simulation_engine import SimulationEngine
 from visualization import Visualizer
 
@@ -52,16 +51,9 @@ def run_simulation(
     dx, dy = sim_map.dx, sim_map.dy
     communication_radius = communication_radius_cells * 0.5 * (abs(dx) + abs(dy))
 
-    controller = Controller(
-        sim_map=sim_map,
-        communication_radius=communication_radius,
-        occupancy_threshold=0.5,
-    )
-
     engine = SimulationEngine(
         sim_map=sim_map,
         oil_spill=spill,
-        controller=controller,
         x_min=-10.0, x_max=10.0,
         y_min=-10.0, y_max=10.0,
         resolution=0.1,

@@ -1,6 +1,7 @@
 import numpy as np
 
-from controller import Controller
+from controller import Controller, DroneController
+from simulation_engine import SimulationEngine
 
 
 class StaticDrone:
@@ -57,11 +58,11 @@ def test_mssp_assigns_closed_boundary_across_wraparound_edge():
 
 
 def test_compute_actions_updates_voronoi_and_moves_toward_lloyd_target():
-    controller = Controller(
+    support = Controller(
         sim_map=None,
-        communication_radius=100.0,
+        communication_radius=0.0,
     )
-    controller.initialize_known_boundary(
+    boundary = support.initialize_known_boundary(
         np.array([[float(i), 0.0] for i in range(5)], dtype=float),
         force_closed=False,
     )
@@ -71,7 +72,17 @@ def test_compute_actions_updates_voronoi_and_moves_toward_lloyd_target():
         StaticDrone("B", 3.0, 0.0),
     ]
 
-    actions = controller.compute_actions(drones)
+    actions = {}
+    for drone in drones:
+        controller = DroneController(
+            known_boundary_points=boundary,
+            known_boundary_closed=False,
+        )
+        drone.known_positions = {
+            other.drone_id: np.array([other.x, other.y], dtype=float)
+            for other in drones
+        }
+        actions[drone.drone_id] = controller.compute_action(drone)
 
     assert set(actions) == {"A", "B"}
     for drone in drones:
@@ -217,29 +228,27 @@ def test_equidistant_action_uses_current_seed_arc_from_ring_info():
 
 
 def test_multihop_does_not_overwrite_a_drone_own_current_position():
-    controller = Controller(
-        sim_map=None,
-        communication_radius=100.0,
-    )
     drone_a = StaticDrone("A", 1.0, 0.0)
     drone_b = StaticDrone("B", 2.0, 0.0)
     drone_b.known_positions["A"] = np.array([-9.0, 0.0], dtype=float)
 
-    controller._update_multihop_positions([drone_a, drone_b])
+    engine = object.__new__(SimulationEngine)
+    engine.drones = [drone_a, drone_b]
+    engine.communication_radius = 100.0
+    engine._exchange_positions_multihop()
 
     np.testing.assert_allclose(drone_a.known_positions["A"], [1.0, 0.0])
 
 
 def test_multihop_refreshes_stale_neighbor_positions_with_current_values():
-    controller = Controller(
-        sim_map=None,
-        communication_radius=100.0,
-    )
     drone_a = StaticDrone("A", 1.0, 0.0)
     drone_b = StaticDrone("B", 2.0, 0.0)
     drone_c = StaticDrone("C", 3.0, 0.0)
     drone_a.known_positions["C"] = np.array([-9.0, 0.0], dtype=float)
 
-    controller._update_multihop_positions([drone_a, drone_b, drone_c])
+    engine = object.__new__(SimulationEngine)
+    engine.drones = [drone_a, drone_b, drone_c]
+    engine.communication_radius = 100.0
+    engine._exchange_positions_multihop()
 
     np.testing.assert_allclose(drone_a.known_positions["C"], [3.0, 0.0])

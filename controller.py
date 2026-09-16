@@ -506,72 +506,6 @@ class Controller:
             self.known_boundary_closed = False
         self.known_boundary_ordered = True
 
-    # ------------------------------------------------------------------
-    # PUBLIC INTERFACE
-    # ------------------------------------------------------------------
-
-    def _update_multihop_positions(self, drones):
-        """
-        Private helper to simulate multi-hop communication between drones.
-        
-        It checks the physical Euclidean distance between drones against `communication_radius`.
-        If two drones are within range, they share and merge their `known_positions` 
-        dictionaries using their GPS-sensed positions.
-        """
-        # 1. Start each communication cycle using GPS positions instead of real ones.
-        current_gps_positions = {
-            getattr(drone, 'drone_id', 0): self._drone_sensed_position(drone)
-            for drone in drones
-        }
-        for drone in drones:
-            drone_id = getattr(drone, 'drone_id', 0)
-            drone.known_positions = {
-                drone_id: current_gps_positions[drone_id].copy(),
-            }
-
-        # 2. Multi-hop propagation loop
-        for _ in range(5):
-            pending_updates = [{} for _ in drones]
-
-            for i, drone_i in enumerate(drones):
-                for j, drone_j in enumerate(drones):
-                    if i == j:
-                        continue
-                    
-                    # Nota: La portata radio dipende dalla distanza REALE tra i corpi fisici
-                    dist = np.linalg.norm(drone_i.position - drone_j.position)
-                    
-                    if dist <= self.communication_radius:
-                        # Se sono vicini nella realtà, si scambiano ciò che sanno (incluso il GPS)
-                        pending_updates[i].update(drone_j.known_positions)
-
-            # Apply the accumulated knowledge updates to each drone
-            for i, drone in enumerate(drones):
-                if pending_updates[i]:
-                    drone_id = getattr(drone, 'drone_id', 0)
-                    for known_id, position in pending_updates[i].items():
-                        if known_id == drone_id:
-                            continue
-                        drone.known_positions[known_id] = np.asarray(
-                            position,
-                            dtype=float,
-                        )
-                    # Mantieni aggiornata la propria posizione percepita via GPS
-                    drone.known_positions[drone_id] = current_gps_positions[drone_id].copy()
-
-    @staticmethod
-    def _drone_sensed_position(drone):
-        if hasattr(drone, "get_gps_pos"):
-            return np.asarray(drone.get_gps_pos(), dtype=float)
-        return np.asarray(drone.position, dtype=float)
-
-    def _compute_voronoi_target(self, drones):
-        """
-        Compute MSSP 1D Voronoi target centroids for all drones.
-        """
-        for drone in drones:
-            self.compute_ring_ordering(drone, drones)
-
     def project_drone_to_boundary(self, drone):
         """Snap a drone state to the nearest point of the known boundary."""
         if (
@@ -764,37 +698,6 @@ class Controller:
         return res
 
 
-    def compute_actions(self, drones, world_field=None, x_coords=None, y_coords=None):
-        """Run one distributed Lloyd iteration on the 1D boundary."""
-        # 1. Update communication network and propagate positions via multi-hop
-        self._update_multihop_positions(drones)
-
-        # 2. Compute the 1D Voronoi target centroid for each drone
-        self._compute_voronoi_target(drones)
-
-        return self._compute_lloyd_actions(drones, world_field, x_coords, y_coords)
-
-    def _compute_lloyd_actions(self, drones, world_field=None, x_coords=None, y_coords=None):
-        """Move each robot toward its current Lloyd target."""
-        actions = {}
-        for drone in drones:
-            drone_id = getattr(drone, 'drone_id', None)
-
-            drone.last_control_mode = 'lloyd'
-            action = self._equidistant_action(
-                drone,
-                getattr(drone, 'last_ring_info', None),
-                world_field,
-                x_coords,
-                y_coords,
-            )
-            actions[drone_id] = self._clip_action(
-                action,
-                max_speed=getattr(drone, 'max_speed', 0.12),
-            )
-
-        return actions
-
     def _clip_action(self, action, max_speed=0.12):
         action = np.asarray(action, dtype=float)
         if action.shape != (2,) or not np.all(np.isfinite(action)):
@@ -880,3 +783,55 @@ class Controller:
 
         action = float(self.k_t) * (np.asarray(target, dtype=float) - current_pos)
         return self._clip_action(action, max_speed=max_speed)
+
+
+class DroneController(Controller):
+    """Local onboard controller owned by a single drone."""
+
+    def __init__(
+        self,
+        known_boundary_points=None,
+        known_boundary_closed=True,
+        k_t=1.0,
+        constrain_to_boundary=True,
+    ):
+        super().__init__(
+            sim_map=None,
+            communication_radius=0.0,
+            k_t=k_t,
+            constrain_to_boundary=constrain_to_boundary,
+        )
+        if known_boundary_points is not None:
+            self.set_known_boundary(
+                known_boundary_points,
+                known_boundary_closed=known_boundary_closed,
+                already_ordered=True,
+            )
+
+    def set_known_boundary(
+        self,
+        boundary_points,
+        known_boundary_closed=True,
+        already_ordered=True,
+    ):
+        self.known_boundary_points = np.asarray(boundary_points, dtype=float).copy()
+        self.known_boundary_closed = bool(known_boundary_closed)
+        self.known_boundary_ordered = bool(already_ordered)
+
+    def compute_action(self, drone):
+        ring_info = self.compute_ring_ordering(drone, None)
+        drone.last_control_mode = "lloyd"
+        action = self._equidistant_action(
+            drone,
+            ring_info,
+            world_field=None,
+            x_coords=None,
+            y_coords=None,
+        )
+        return self._clip_action(
+            action,
+            max_speed=getattr(drone, "max_speed", 0.12),
+        )
+
+    def project_to_boundary(self, drone):
+        self.project_drone_to_boundary(drone)

@@ -1,4 +1,5 @@
 import numpy as np
+from controller import Controller
 from drone import Drone
 
 
@@ -9,7 +10,6 @@ class SimulationEngine:
         self,
         sim_map,
         oil_spill,
-        controller=None,
         x_min=-10.0,
         x_max=10.0,
         y_min=-10.0,
@@ -46,7 +46,11 @@ class SimulationEngine:
         self.communication_radius_cells = int(communication_radius_cells)
         self.communication_radius = self.communication_radius_cells * 0.5 * (abs(dx) + abs(dy))
 
-        self.controller = controller
+        self.controller = Controller(
+            sim_map=self.sim_map,
+            communication_radius=self.communication_radius,
+            occupancy_threshold=0.5,
+        )
         self.drones = []
         self.frame = 0
 
@@ -122,7 +126,11 @@ class SimulationEngine:
             drone.last_control_mode = "equi_distant"
 
         for drone in self.drones:
-            drone.known_boundary_points = self.controller.known_boundary_points.copy()
+            drone.set_known_boundary(
+                self.controller.known_boundary_points,
+                known_boundary_closed=self.controller.known_boundary_closed,
+                already_ordered=self.controller.known_boundary_ordered,
+            )
             drone.known_positions = {
                 other.drone_id: np.array([other.x, other.y], dtype=float)
                 for other in self.drones
@@ -158,21 +166,52 @@ class SimulationEngine:
             mode = getattr(drone, "last_control_mode", "unknown")
             print(f"    {drone.drone_id}: pos=({pos[0]:.3f}, {pos[1]:.3f}), mode={mode}, {target_str}, {ring_str}, action=({action[0]:.3f}, {action[1]:.3f}), speed={speed:.3f}")
 
-    def _apply_actions(self):
-        # Il controller calcola già autonomamente multi-hop e target di Voronoi
-        actions = self.controller.compute_actions(
-            self.drones,
-            world_field=self.world_field,
-            x_coords=self.sim_map.x_coords,
-            y_coords=self.sim_map.y_coords,
-        )
+    def _exchange_positions_multihop(self):
+        sensed_positions = {
+            drone.drone_id: self._sensed_position(drone)
+            for drone in self.drones
+        }
 
-        # Muove i droni e li corregge sul bordo
+        for drone in self.drones:
+            drone.known_positions = {
+                drone.drone_id: sensed_positions[drone.drone_id].copy(),
+            }
+
+        for _ in range(5):
+            pending_updates = [{} for _ in self.drones]
+
+            for i, drone_i in enumerate(self.drones):
+                for j, drone_j in enumerate(self.drones):
+                    if i == j:
+                        continue
+                    if np.linalg.norm(drone_i.position - drone_j.position) <= self.communication_radius:
+                        pending_updates[i].update(drone_j.known_positions)
+
+            for i, drone in enumerate(self.drones):
+                drone_id = drone.drone_id
+                for known_id, position in pending_updates[i].items():
+                    if known_id != drone_id:
+                        drone.known_positions[known_id] = np.asarray(position, dtype=float)
+                drone.known_positions[drone_id] = sensed_positions[drone_id].copy()
+
+    @staticmethod
+    def _sensed_position(drone):
+        if hasattr(drone, "get_gps_pos"):
+            return np.asarray(drone.get_gps_pos(), dtype=float)
+        return np.asarray(drone.position, dtype=float)
+
+    def _apply_actions(self):
+        self._exchange_positions_multihop()
+
+        actions = {
+            drone.drone_id: drone.compute_action()
+            for drone in self.drones
+        }
+
         for drone in self.drones:
             action = actions.get(drone.drone_id, np.zeros(2, dtype=float))
             drone.action(action, bounds=(self.sim_map.xlim, self.sim_map.ylim))
-            if hasattr(self.controller, "project_drone_to_boundary"):
-                self.controller.project_drone_to_boundary(drone)
+            drone.project_to_boundary()
 
     def get_visualization_data(self):
         return {

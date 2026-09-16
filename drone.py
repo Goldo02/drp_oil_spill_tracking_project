@@ -1,5 +1,6 @@
 import numpy as np
 
+from controller import DroneController
 from sensors import GPSSensor
 
 
@@ -35,6 +36,7 @@ class Drone:
         }
         self.target_centroid = None
         self.last_ring_info = None
+        self.controller = DroneController()
 
     @property
     def position(self):
@@ -42,6 +44,20 @@ class Drone:
 
     def get_gps_pos(self):
         return self.gps.sense(self.position)
+
+    def set_known_boundary(self, boundary_points, known_boundary_closed=True, already_ordered=True):
+        self.known_boundary_points = np.asarray(boundary_points, dtype=float).copy()
+        self.controller.set_known_boundary(
+            self.known_boundary_points,
+            known_boundary_closed=known_boundary_closed,
+            already_ordered=already_ordered,
+        )
+
+    def compute_action(self):
+        return self.controller.compute_action(self)
+
+    def project_to_boundary(self):
+        self.controller.project_to_boundary(self)
 
     def action(self, command, dt=1.0, bounds=None):
         command = self._clip_command(command, self.max_speed)
