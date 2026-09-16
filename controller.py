@@ -16,38 +16,19 @@ class Controller:
         self,
         sim_map,
         communication_radius,
-        fully_connected=False,
         occupancy_threshold=0.5,
-        resolution=0.1,
         k_t=1.0,
-        k_spacing=1.0,
-        settling_steps=0,
-        d_safe=0.5,
-        repulsion_gain=0.0,
         **kwargs,
     ):
-        # Basic environment/configuration state (kept for compatibility)
         self.sim_map = sim_map
         self.communication_radius = float(communication_radius)
-        self.fully_connected = bool(fully_connected)
         self.occupancy_threshold = float(occupancy_threshold)
-        self.resolution = float(resolution)
 
-        # Known boundary representation: ordered list of (x,y) points.
-        # The user requested that each drone "already knows" the shape; this
-        # controller will keep a shared canonical copy and helpers to assign it.
         self.known_boundary_points = np.empty((0, 2), dtype=float)
-        self.known_boundary_initialized = False
-        # whether the known boundary is closed (found as a loop)
         self.known_boundary_closed = False
+        self.known_boundary_ordered = False
 
-        # Equidistant controller parameters
         self.k_t = float(k_t)
-        self.k_spacing = float(k_spacing)
-        self.settling_steps = int(settling_steps)
-        # collision avoidance params
-        self.d_safe = float(d_safe)
-        self.repulsion_gain = float(repulsion_gain)
         self.constrain_to_boundary = bool(kwargs.get("constrain_to_boundary", True))
 
     # ------------------------------------------------------------------
@@ -305,90 +286,6 @@ class Controller:
             }
         return targets
 
-    @staticmethod
-    def _cell_target_index(boundary_points, indices, seed_index, is_closed):
-        """Return a boundary index near the 1D arc midpoint of a Voronoi cell."""
-        indices = np.asarray(indices, dtype=int)
-        if indices.size == 0:
-            return int(seed_index)
-
-        boundary = np.asarray(boundary_points, dtype=float)
-        if indices.size == 1:
-            return int(indices[0])
-
-        if is_closed:
-            n_points = int(boundary.shape[0])
-            offsets = (
-                (indices - int(seed_index) + n_points / 2.0)
-                % n_points
-                - n_points / 2.0
-            )
-            ordered = indices[np.argsort(offsets)]
-        else:
-            ordered = np.sort(indices)
-
-        cumulative = np.zeros(ordered.size, dtype=float)
-        for idx in range(1, ordered.size):
-            previous_idx = int(ordered[idx - 1])
-            current_idx = int(ordered[idx])
-            cumulative[idx] = cumulative[idx - 1] + float(
-                np.linalg.norm(boundary[current_idx] - boundary[previous_idx])
-            )
-
-        midpoint = 0.5 * cumulative[-1]
-        target_pos = int(np.searchsorted(cumulative, midpoint, side="left"))
-        return int(ordered[min(target_pos, ordered.size - 1)])
-
-    @staticmethod
-    def _arc_indices_between(start_index, target_index, n_points, is_closed):
-        """Return boundary indices from start to target along the shortest arc."""
-        start_index = int(start_index)
-        target_index = int(target_index)
-        if start_index == target_index:
-            return np.array([start_index], dtype=int)
-
-        if not is_closed:
-            step = 1 if target_index > start_index else -1
-            return np.arange(start_index, target_index + step, step, dtype=int)
-
-        forward_steps = (target_index - start_index) % n_points
-        backward_steps = (start_index - target_index) % n_points
-        if forward_steps <= backward_steps:
-            return np.array(
-                [(start_index + offset) % n_points for offset in range(forward_steps + 1)],
-                dtype=int,
-            )
-        return np.array(
-            [(start_index - offset) % n_points for offset in range(backward_steps + 1)],
-            dtype=int,
-        )
-
-    @classmethod
-    def _next_boundary_index_toward(cls, boundary_points, start_index, target_index, is_closed, max_step):
-        """Choose the farthest boundary index reachable within one control step."""
-        boundary = np.asarray(boundary_points, dtype=float)
-        path = cls._arc_indices_between(
-            start_index,
-            target_index,
-            int(boundary.shape[0]),
-            is_closed,
-        )
-        if path.size <= 1:
-            return int(path[0])
-
-        traveled = 0.0
-        chosen = int(path[1])
-        for idx in range(1, path.size):
-            previous_idx = int(path[idx - 1])
-            current_idx = int(path[idx])
-            edge_length = float(np.linalg.norm(boundary[current_idx] - boundary[previous_idx]))
-            if traveled + edge_length > max_step:
-                break
-            traveled += edge_length
-            chosen = current_idx
-
-        return int(chosen)
-
     # ------------------------------------------------------------------
     # BOUNDARY / INITIALIZATION HELPERS
     # ------------------------------------------------------------------
@@ -408,10 +305,10 @@ class Controller:
         if arr.ndim == 2 and arr.shape[1] == 2:
             pts = arr.copy()
             self.known_boundary_points = pts
-            self.known_boundary_initialized = True
             self.known_boundary_closed = bool(force_closed) or (
                 pts.shape[0] > 1 and np.linalg.norm(pts[0] - pts[-1]) < 1e-6
             )
+            self.known_boundary_ordered = False
             return self.known_boundary_points.copy()
 
         # Case B: given an occupancy grid -> extract contour points
@@ -432,7 +329,7 @@ class Controller:
         occupied = field >= self.occupancy_threshold
         if not np.any(occupied):
             self.known_boundary_points = np.empty((0, 2), dtype=float)
-            self.known_boundary_initialized = False
+            self.known_boundary_ordered = False
             return self.known_boundary_points.copy()
 
         nx, ny = field.shape
@@ -466,20 +363,8 @@ class Controller:
 
         pts = np.asarray(pts, dtype=float)
         self.known_boundary_points = pts
-        self.known_boundary_initialized = pts.size > 0
-        # If initialization came from an occupancy grid, attempt to mark closedness
-        try:
-            # If user passed a 2D grid, we estimated pts from it above; set closed flag
-            if hasattr(world_field_or_points, 'ndim') and getattr(world_field_or_points, 'ndim', 1) == 2:
-                self.known_boundary_closed = self.is_polygon_closed(np.asarray(world_field_or_points, dtype=float))
-            else:
-                # if points are provided explicitly, consider closed if first and last are near
-                if pts.size and np.linalg.norm(pts[0] - pts[-1]) < 1e-6:
-                    self.known_boundary_closed = True
-                else:
-                    self.known_boundary_closed = False
-        except Exception:
-            self.known_boundary_closed = False
+        self.known_boundary_closed = bool(force_closed)
+        self.known_boundary_ordered = False
         return self.known_boundary_points.copy()
 
     def build_boundary_grid(self, world_field, x_coords=None, y_coords=None):
@@ -493,13 +378,8 @@ class Controller:
         if field.size == 0:
             return np.zeros_like(field, dtype=float)
 
-        # Ensure we have boundary points available for mapping.
         if self.known_boundary_points is None or self.known_boundary_points.size == 0:
-            # try to initialize from the provided field
-            try:
-                self.initialize_known_boundary(field, x_coords=x_coords, y_coords=y_coords)
-            except Exception:
-                return np.zeros_like(field, dtype=float)
+            self.initialize_known_boundary(field, x_coords=x_coords, y_coords=y_coords)
 
         contour_grid = np.zeros_like(field, dtype=float)
         points = np.asarray(self.known_boundary_points, dtype=float)
@@ -525,93 +405,6 @@ class Controller:
         return contour_grid
 
     # ------------------------------------------------------------------
-    # EXTRA PUBLIC HELPERS / CONSENSUS
-    # ------------------------------------------------------------------
-
-    def consensus_step(self, drones):
-        """Optional consensus step. Default baseline: do not merge occupancy grids.
-
-        For compatibility with tests, this method intentionally does not
-        combine per-robot occupancy grids when `fully_connected` is False.
-        It will ensure each drone has a `known_positions` mapping.
-        """
-        for drone in drones:
-            if not hasattr(drone, 'known_positions') or drone.known_positions is None:
-                drone.known_positions = {getattr(drone, 'drone_id', 0): np.array([drone.x, drone.y], dtype=float)}
-        # no grid merging in this baseline
-        return
-
-    def is_polygon_closed(self, grid):
-        """Return True if the binary `grid` contains a closed contour enclosing area.
-
-        Approach: treat occupied cells as walls, flood-fill from the grid border
-        over free cells; if any free cell is not reachable from the border then
-        the wall encloses an interior -> closed polygon.
-        """
-        grid = np.asarray(grid, dtype=float)
-        if grid.size == 0:
-            return False
-
-        occupied = grid >= self.occupancy_threshold
-        if not np.any(occupied):
-            return False
-
-        nx, ny = occupied.shape
-        visited = np.zeros_like(occupied, dtype=bool)
-
-        from collections import deque
-
-        q = deque()
-        # enqueue all boundary free cells
-        for ix in range(nx):
-            for iy in (0, ny - 1):
-                if not occupied[ix, iy] and not visited[ix, iy]:
-                    visited[ix, iy] = True
-                    q.append((ix, iy))
-        for iy in range(ny):
-            for ix in (0, nx - 1):
-                if not occupied[ix, iy] and not visited[ix, iy]:
-                    visited[ix, iy] = True
-                    q.append((ix, iy))
-
-        while q:
-            x, y = q.popleft()
-            for dx, dy in ((1,0),(-1,0),(0,1),(0,-1)):
-                nx2 = x + dx
-                ny2 = y + dy
-                if 0 <= nx2 < nx and 0 <= ny2 < ny:
-                    if not occupied[nx2, ny2] and not visited[nx2, ny2]:
-                        visited[nx2, ny2] = True
-                        q.append((nx2, ny2))
-
-        # If there exists any free cell not visited, it's an interior -> closed
-        interior_exists = np.any(~visited & ~occupied)
-        return bool(interior_exists)
-
-    def place_drones_on_boundary_random(self, drones, rng=None):
-        """Place provided drone objects randomly along the known boundary.
-
-        This routine mutates each drone by setting `x`, `y`, and a copy of the
-        known boundary under `known_boundary_points` and a simple `known_positions` map.
-        """
-        if rng is None:
-            rng = np.random.default_rng()
-
-        if self.known_boundary_points.size == 0:
-            raise RuntimeError("known_boundary_points must be initialized first")
-
-        n = self.known_boundary_points.shape[0]
-        for i, drone in enumerate(drones):
-            idx = int(rng.integers(0, n))
-            x, y = self.known_boundary_points[idx]
-            drone.x = float(x)
-            drone.y = float(y)
-            # Each drone receives the shared copy of the boundary (per user request)
-            drone.known_boundary_points = self.known_boundary_points.copy()
-            # Known positions map: each drone only knows itself by default.
-            drone.known_positions = {getattr(drone, 'drone_id', i): np.array([drone.x, drone.y], dtype=float)}
-
-    # ------------------------------------------------------------------
     # BOUNDARY ORDERING / CIRCULAR HELPERS
     # ------------------------------------------------------------------
 
@@ -623,9 +416,13 @@ class Controller:
         the last point is adjacent to the first. If ordering cannot be
         improved (e.g. few points), the array is left as-is.
         """
+        if self.known_boundary_ordered:
+            return
+
         pts = np.asarray(self.known_boundary_points, dtype=float)
         n = pts.shape[0]
         if n <= 2:
+            self.known_boundary_ordered = True
             return
 
         # Compute nearest-neighbour distances to estimate typical spacing
@@ -639,6 +436,7 @@ class Controller:
 
         median_nn = float(np.median(dists)) if np.isfinite(dists).all() else 0.0
         if median_nn <= 0:
+            self.known_boundary_ordered = True
             return
 
         # Greedy nearest-neighbour ordering
@@ -666,43 +464,7 @@ class Controller:
             # if not closed, keep original but mark closedness conservatively
             self.known_boundary_points = pts.copy()
             self.known_boundary_closed = False
-
-    def _mod_index(self, idx, n):
-        return int(idx % n)
-
-    def _circular_signed_distance(self, a, b, n):
-        """Return signed shortest distance from a to b on a circular index set of length n.
-
-        Value in range (-n/2, n/2].
-        """
-        diff = (b - a) % n
-        if diff > n / 2.0:
-            diff -= n
-        return diff
-
-    def _circular_midpoint(self, a, b, n):
-        """Return the midpoint index (float) between indices a and b along the shortest arc."""
-        sd = self._circular_signed_distance(a, b, n)
-        return (a + sd / 2.0) % n
-
-    def _indices_in_arc(self, start, end, n):
-        """Return integer indices j in 0..n-1 that lie in the closed arc [start, end]
-
-        Arc is taken in the positive modular direction from `start` to `end`.
-        Both `start` and `end` may be floats; inclusion is decided by modular
-        arithmetic comparing (j - start) % n to arc_length=(end - start) % n.
-        """
-        arc_len = (end - start) % n
-        if arc_len == 0:
-            # full circle -> all indices
-            return np.arange(n, dtype=int)
-
-        indices = []
-        for j in range(n):
-            rel = (j - start) % n
-            if rel <= arc_len + 1e-9:
-                indices.append(j)
-        return np.array(indices, dtype=int)
+        self.known_boundary_ordered = True
 
     # ------------------------------------------------------------------
     # PUBLIC INTERFACE
@@ -819,9 +581,7 @@ class Controller:
         if n_pts == 0:
             return None
 
-        known = getattr(current_drone, 'known_positions', None)
-        if known is None or len(known) == 0:
-            known = {getattr(d, 'drone_id', 0): np.array([d.x, d.y], dtype=float) for d in drones}
+        known = current_drone.known_positions
 
         is_closed = bool(self.known_boundary_closed)
         arc_lengths, total_boundary_length = self._boundary_arc_lengths(
@@ -995,18 +755,6 @@ class Controller:
 
         return actions
 
-    # ------------------------------------------------------------------
-    # Small utility helpers kept for compatibility
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _normalize(v):
-        v = np.asarray(v, dtype=float)
-        n = float(np.linalg.norm(v))
-        if n <= 1e-12:
-            return None
-        return v / n
-
     def _clip_action(self, action, max_speed=0.12):
         action = np.asarray(action, dtype=float)
         if action.shape != (2,) or not np.all(np.isfinite(action)):
@@ -1017,10 +765,6 @@ class Controller:
         if s > max_speed:
             return action * (max_speed / s)
         return action
-
-    def _boundary_tracking_action(self, *args, **kwargs):
-        """Boundary tracking is not used while testing 1D Lloyd coverage."""
-        return np.zeros(2, dtype=float)
 
     def _equidistant_action(self, drone, ring_info, world_field, x_coords, y_coords):
         """Move the drone toward the current Lloyd target along the boundary arc."""
@@ -1096,36 +840,3 @@ class Controller:
 
         action = float(self.k_t) * (np.asarray(target, dtype=float) - current_pos)
         return self._clip_action(action, max_speed=max_speed)
-
-    def _compute_repulsion(self, drone):
-        """Compute simple inter-drone repulsion based on `d_safe` and `repulsion_gain`.
-
-        Returns a 2D vector (possibly zero) pointing away from neighbors that are
-        closer than `d_safe`.
-        """
-        kp = float(self.repulsion_gain)
-        d_safe = float(getattr(self, 'd_safe', 0.5))
-        if kp == 0.0:
-            return np.zeros(2, dtype=float)
-
-        known = getattr(drone, 'known_positions', None)
-        if known is None:
-            return np.zeros(2, dtype=float)
-
-        mypos = np.array([drone.x, drone.y], dtype=float)
-        total = np.zeros(2, dtype=float)
-        for other_id, pos in known.items():
-            if other_id == getattr(drone, 'drone_id', None):
-                continue
-            pos = np.asarray(pos, dtype=float)
-            diff = mypos - pos
-            dist = float(np.linalg.norm(diff))
-            if dist <= 1e-12:
-                # if overlapping, push in arbitrary direction
-                total += kp * np.array([1.0, 0.0])
-            elif dist < d_safe:
-                # linear repulsion magnitude
-                mag = kp * (d_safe - dist)
-                total += (diff / dist) * mag
-
-        return total

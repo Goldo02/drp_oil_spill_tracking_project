@@ -55,9 +55,7 @@ def run_simulation(
     controller = Controller(
         sim_map=sim_map,
         communication_radius=communication_radius,
-        fully_connected=fully_connected,
         occupancy_threshold=0.5,
-        resolution=0.1,
     )
 
     engine = SimulationEngine(
