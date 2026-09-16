@@ -2,6 +2,11 @@ import heapq
 
 import numpy as np
 
+try:
+    import contourpy
+except ImportError:  # pragma: no cover
+    contourpy = None
+
 
 class Controller:
     """
@@ -332,13 +337,50 @@ class Controller:
             self.known_boundary_ordered = False
             return self.known_boundary_points.copy()
 
-        nx, ny = field.shape
+        pts = self._extract_ordered_contour(field, x_coords, y_coords)
+        is_ordered_contour = pts.size > 0
+        if pts.size == 0:
+            pts = self._extract_boundary_mask_points(occupied, x_coords, y_coords)
+
+        self.known_boundary_points = pts
+        self.known_boundary_closed = bool(force_closed)
+        self.known_boundary_ordered = is_ordered_contour
+        return self.known_boundary_points.copy()
+
+    def _extract_ordered_contour(self, field, x_coords, y_coords):
+        if contourpy is None:
+            return np.empty((0, 2), dtype=float)
+
+        generator = contourpy.contour_generator(
+            x=np.asarray(x_coords, dtype=float),
+            y=np.asarray(y_coords, dtype=float),
+            z=np.asarray(field, dtype=float).T,
+            name="serial",
+        )
+        lines = generator.lines(float(self.occupancy_threshold))
+        if not lines:
+            return np.empty((0, 2), dtype=float)
+
+        def path_length(line):
+            if len(line) < 2:
+                return 0.0
+            return float(np.sum(np.linalg.norm(np.diff(line, axis=0), axis=1)))
+
+        contour = np.asarray(max(lines, key=path_length), dtype=float)
+        if contour.ndim != 2 or contour.shape[1] != 2:
+            return np.empty((0, 2), dtype=float)
+        if len(contour) > 1 and np.linalg.norm(contour[0] - contour[-1]) < 1e-9:
+            contour = contour[:-1]
+        return contour
+
+    @staticmethod
+    def _extract_boundary_mask_points(occupied, x_coords, y_coords):
+        nx, ny = occupied.shape
         boundary_mask = np.zeros_like(occupied, dtype=bool)
         for ix in range(nx):
             for iy in range(ny):
                 if not occupied[ix, iy]:
                     continue
-                # check 8-neighbors for a free pixel
                 has_free = False
                 for dx in (-1, 0, 1):
                     for dy in (-1, 0, 1):
@@ -346,26 +388,24 @@ class Controller:
                             continue
                         x2 = ix + dx
                         y2 = iy + dy
-                        if 0 <= x2 < nx and 0 <= y2 < ny:
-                            if not occupied[x2, y2]:
-                                has_free = True
-                                break
+                        if 0 <= x2 < nx and 0 <= y2 < ny and not occupied[x2, y2]:
+                            has_free = True
+                            break
                     if has_free:
                         break
                 if has_free:
                     boundary_mask[ix, iy] = True
 
-        pts = []
-        for ix, iy in np.argwhere(boundary_mask):
-            x = float(x_coords[ix]) if len(x_coords) > ix else float(ix)
-            y = float(y_coords[iy]) if len(y_coords) > iy else float(iy)
-            pts.append((x, y))
-
-        pts = np.asarray(pts, dtype=float)
-        self.known_boundary_points = pts
-        self.known_boundary_closed = bool(force_closed)
-        self.known_boundary_ordered = False
-        return self.known_boundary_points.copy()
+        return np.asarray(
+            [
+                (
+                    float(x_coords[ix]) if len(x_coords) > ix else float(ix),
+                    float(y_coords[iy]) if len(y_coords) > iy else float(iy),
+                )
+                for ix, iy in np.argwhere(boundary_mask)
+            ],
+            dtype=float,
+        )
 
     def build_boundary_grid(self, world_field, x_coords=None, y_coords=None):
         """Create a binary grid with contour pixels marked as 1.0.
