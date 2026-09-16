@@ -1,7 +1,6 @@
 import argparse
 import os
 import random
-
 import numpy as np
 
 if not os.environ.get("MPLCONFIGDIR"):
@@ -9,19 +8,13 @@ if not os.environ.get("MPLCONFIGDIR"):
 
 import matplotlib
 
-
-from environment import (
-    CircleOilSpill,
-    SimulationMap,
-    SmoothedPolygonOilSpill,
-)
-
+from environment import CircleOilSpill, SimulationMap, SmoothedPolygonOilSpill
 from controller import Controller
 from simulation_engine import SimulationEngine
 from visualization import Visualizer
 
 
-def run_simulation( 
+def run_simulation(
     visualize=False,
     max_frames=500,
     seed=42,
@@ -29,80 +22,35 @@ def run_simulation(
     oil_shape="smoothed_polygon",
     fully_connected=False,
     communication_radius_cells=205,
-    measure_every=3,
-    show_nls_points=False,
     polygon_vertices=36,
     polygon_r0=2.5,
     polygon_smoothness=0.2,
     polygon_x0=None,
     polygon_y0=None,
     polygon_continuous=False,
-    dt=1.0,
 ):
-    # ==================================================================
-    # RANDOM SEED
-    # ==================================================================
-
+    # Random seed & environment setup
     np.random.seed(seed)
     random.seed(seed)
-
     print(f"Random seed: {seed}")
 
-    # ==================================================================
-    # MATPLOTLIB
-    # ==================================================================
-
-    if visualize:
-        matplotlib.use("TkAgg")
-    else:
-        matplotlib.use("Agg")
-
+    matplotlib.use("TkAgg" if visualize else "Agg")
     import matplotlib.pyplot as plt
 
-    # ==================================================================
-    # ENVIRONMENT
-    # ==================================================================
-
-    sim_map = SimulationMap(
-        xlim=(-5.0, 5.0),
-        ylim=(-5.0, 5.0),
-        grid_size=500,
-    )
+    sim_map = SimulationMap(xlim=(-5.0, 5.0), ylim=(-5.0, 5.0), grid_size=500)
 
     if oil_shape == "circle":
-
-        spill = CircleOilSpill(
-            x0=0.0,
-            y0=0.0,
-            radius=2.0,
-        )
-
+        spill = CircleOilSpill(x0=0.0, y0=0.0, radius=2.0)
     else:
-
         spill = SmoothedPolygonOilSpill(
-            sim_map.X,
-            sim_map.Y,
-            n_vertices=polygon_vertices,
-            r0=polygon_r0,
-            smoothness=polygon_smoothness,
-            x0=polygon_x0,
-            y0=polygon_y0,
-            seed=seed,
-            continuous=polygon_continuous,
+            sim_map.X, sim_map.Y,
+            n_vertices=polygon_vertices, r0=polygon_r0,
+            smoothness=polygon_smoothness, x0=polygon_x0,
+            y0=polygon_y0, seed=seed, continuous=polygon_continuous,
         )
 
-    # ==================================================================
-    # CONTROLLER
-    # ==================================================================
-
-    dx = sim_map.dx
-    dy = sim_map.dy
-
-    communication_radius = (
-        communication_radius_cells
-        * 0.5
-        * (abs(dx) + abs(dy))
-    )
+    dx, dy = sim_map.dx, sim_map.dy
+    communication_radius = communication_radius_cells * 0.5 * (abs(dx) + abs(dy))
 
     controller = Controller(
         sim_map=sim_map,
@@ -112,323 +60,83 @@ def run_simulation(
         resolution=0.1,
     )
 
-    # ==================================================================
-    # SIMULATION ENGINE
-    # ==================================================================
-
     engine = SimulationEngine(
         sim_map=sim_map,
         oil_spill=spill,
         controller=controller,
-
-        x_min=-10.0,
-        x_max=10.0,
-        y_min=-10.0,
-        y_max=10.0,
-
+        x_min=-10.0, x_max=10.0,
+        y_min=-10.0, y_max=10.0,
         resolution=0.1,
-
-        sensor_size=120,
-        measure_every=measure_every,
-
-        communication_radius_cells=(
-            communication_radius_cells
-        ),
-
-        fully_connected=fully_connected,
-
-        occupancy_threshold=0.5,
-        temporal_alpha=0.05,
-        consensus_rounds=0,
-
-        dt=dt,
-
+        communication_radius_cells=communication_radius_cells,
         verbose=True,
     )
 
-    # ==================================================================
-    # DRONE INITIALIZATION
-    # ==================================================================
-
-    initial_radius = spill.radius
     engine.initialize_world_boundary()
     engine.spawn_drones_on_boundary(num_drones, rng=np.random.default_rng(seed))
-
-    # ==================================================================
-    # VISUALIZATION
-    # ==================================================================
 
     visualizer = Visualizer(
         sim_map=sim_map,
         oil_spill=spill,
-        communication_radius=(
-            None
-            if fully_connected
-            else communication_radius
-        ),
-        show_communication_radius=(
-            not fully_connected
-        ),
-        show_nls_points=show_nls_points,
+        communication_radius=None if fully_connected else communication_radius,
+        show_communication_radius=not fully_connected,
     )
 
     if visualize:
         plt.show(block=False)
     else:
-        print(
-            "Visualization disabled. "
-            "Headless mode (Agg backend)."
-        )
+        print("Visualization disabled. Headless mode (Agg backend).")
 
-    # ==================================================================
-    # SIMULATION
-    # ==================================================================
-
-    print(
-        f"Starting distributed occupancy "
-        f"grid simulation "
-        f"({max_frames} frames)..."
-    )
-
-    print(
-        f"Oil shape: {oil_shape}"
-    )
-
+    # Simulation Info & Log
+    print(f"Starting distributed occupancy grid simulation ({max_frames} frames)...")
+    print(f"Oil shape: {oil_shape}")
     if oil_shape != "circle":
+        print(f"Polygon parameters: vertices={polygon_vertices}, r0={polygon_r0}, smoothness={polygon_smoothness}, center=({spill.x0:.2f}, {spill.y0:.2f}), continuous={polygon_continuous}")
+    print(f"Mode: static boundary control (Rc={communication_radius:.2f})")
 
-        print(
-            "Polygon parameters: "
-            f"vertices={polygon_vertices}, "
-            f"r0={polygon_r0}, "
-            f"smoothness={polygon_smoothness}, "
-            f"center=({spill.x0:.2f}, "
-            f"{spill.y0:.2f}), "
-            f"continuous={polygon_continuous}"
-        )
-
-    print(
-        f"Measurement interval: "
-        f"every {measure_every} frames"
-    )
-
-    print(
-        "Consensus: disabled"
-    )
-
-    print(
-        "Mode: local-only control "
-        f"(Rc={communication_radius:.2f})"
-    )
-
-    # ==================================================================
-    # RUN
-    # ==================================================================
-
+    # Main Simulation Loop
     try:
-
         for frame in range(max_frames):
-
-            error = engine.step()
-
+            engine.step()
             if visualize:
-
-                visualizer.render(
-                    engine.get_visualization_data()
-                )
-
+                visualizer.render(engine.get_visualization_data())
             if frame % 50 == 0:
-
-                print(
-                    f"Frame {frame}/"
-                    f"{max_frames} | "
-                    f"disagreement error="
-                    f"{error:.6f}"
-                )
-
+                print(f"Frame {frame}/{max_frames}")
     except KeyboardInterrupt:
+        print("Simulation interrupted by user.")
 
-        print(
-            "Simulation interrupted by user."
-        )
+    print("Simulation finished.")
 
-    engine.finalize_histories()
-
-    print(
-        "Simulation finished."
-    )
-
-    # ==================================================================
-    # FINALIZATION & SAVING (Delegato al Visualizer)
-    # ==================================================================
-
-    # 1. Render e salvataggio dello stato finale dello scenario
-    final_data = engine.get_visualization_data()
-    visualizer.render(final_data, pause=False)
+    # Finalization & Saving
     output_dir = "./tmp_output"
+    visualizer.render(engine.get_visualization_data(), pause=False)
     visualizer.save_final_state("final_simulation_state.png", directory=output_dir)
 
-    # 2. Generazione e salvataggio della griglia di occupazione finale
     final_grid = engine.compute_mean_grid()
-    visualizer.plot_final_occupancy_grid(
-        final_grid,
-        "final_occupancy_grid.png",
-        directory=output_dir,
-        alpha=1.0,
-    )
-    visualizer.save_final_occupancy_grid_per_robot(
-        engine.drones,
-        directory=output_dir,
-        alpha=1.0,
-    )
-
-    # ==================================================================
-    # FINAL DIAGNOSTICS
-    # ==================================================================
-
-    error_history = np.asarray(
-        engine.error_history,
-        dtype=float,
-    )
-
-    if error_history.size:
-
-        print(
-            "\n=== FINAL RESULTS ==="
-        )
-
-        print(
-            f"Initial error: "
-            f"{error_history[0]:.6f}"
-        )
-
-        print(
-            f"Final error: "
-            f"{error_history[-1]:.6f}"
-        )
-
-        print(
-            f"Minimum error: "
-            f"{float(np.min(error_history)):.6f}"
-        )
+    visualizer.plot_final_occupancy_grid(final_grid, "final_occupancy_grid.png", directory=output_dir, alpha=1.0)
+    visualizer.save_final_occupancy_grid_per_robot(engine.drones, directory=output_dir, alpha=1.0)
 
     if visualize:
-
-        print(
-            "Closing the window to exit."
-        )
-
+        print("Closing the window to exit.")
         plt.show()
 
 
 if __name__ == "__main__":
-
-    parser = argparse.ArgumentParser(
-        description=(
-            "Distributed oil spill "
-            "occupancy grid mapping simulation"
-        )
-    )
-
-    parser.add_argument(
-        "--visualize",
-        action="store_true",
-    )
-
-    parser.add_argument(
-        "--frames",
-        type=int,
-        default=500,
-    )
-
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-    )
-
-    parser.add_argument(
-        "--num-drones",
-        type=int,
-        default=5,
-    )
-
-    parser.add_argument(
-        "--oil-shape",
-        choices=(
-            "circle",
-            "smoothed_polygon",
-        ),
-        default="smoothed_polygon",
-    )
-
-    parser.add_argument(
-        "--polygon-vertices",
-        type=int,
-        default=36,
-    )
-
-    parser.add_argument(
-        "--polygon-r0",
-        type=float,
-        default=2.5,
-    )
-
-    parser.add_argument(
-        "--polygon-smoothness",
-        type=float,
-        default=0.2,
-    )
-
-    parser.add_argument(
-        "--polygon-x0",
-        type=float,
-        default=None,
-    )
-
-    parser.add_argument(
-        "--polygon-y0",
-        type=float,
-        default=None,
-    )
-
-    parser.add_argument(
-        "--polygon-continuous",
-        action="store_true",
-    )
-
-    parser.add_argument(
-        "--fully-connected",
-        action="store_true",
-    )
-
-    parser.add_argument(
-        "--range-based",
-        action="store_true",
-    )
-
-    parser.add_argument(
-        "--communication-radius-cells",
-        type=int,
-        default=250,
-    )
-
-    parser.add_argument(
-        "--measure-every",
-        type=int,
-        default=3,
-    )
-
-    parser.add_argument(
-        "--show-nls-points",
-        action="store_true",
-    )
-
-    parser.add_argument(
-        "--dt",
-        type=float,
-        default=1.0,
-        help="Simulation timestep.",
-    )
+    parser = argparse.ArgumentParser(description="Distributed oil spill occupancy grid mapping simulation")
+    
+    parser.add_argument("--visualize", action="store_true")
+    parser.add_argument("--frames", type=int, default=500)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num-drones", type=int, default=5)
+    parser.add_argument("--oil-shape", choices=("circle", "smoothed_polygon"), default="smoothed_polygon")
+    parser.add_argument("--polygon-vertices", type=int, default=36)
+    parser.add_argument("--polygon-r0", type=float, default=2.5)
+    parser.add_argument("--polygon-smoothness", type=float, default=0.2)
+    parser.add_argument("--polygon-x0", type=float, default=None)
+    parser.add_argument("--polygon-y0", type=float, default=None)
+    parser.add_argument("--polygon-continuous", action="store_true")
+    parser.add_argument("--fully-connected", action="store_true")
+    parser.add_argument("--range-based", action="store_true")
+    parser.add_argument("--communication-radius-cells", type=int, default=250)
 
     args = parser.parse_args()
 
@@ -438,38 +146,12 @@ if __name__ == "__main__":
         seed=args.seed,
         num_drones=args.num_drones,
         oil_shape=args.oil_shape,
-
-        fully_connected=(
-            args.fully_connected
-            and not args.range_based
-        ),
-
-        communication_radius_cells=(
-            args.communication_radius_cells
-        ),
-
-        measure_every=args.measure_every,
-
-        show_nls_points=(
-            args.show_nls_points
-        ),
-
-        polygon_vertices=(
-            args.polygon_vertices
-        ),
-
+        fully_connected=(args.fully_connected and not args.range_based),
+        communication_radius_cells=args.communication_radius_cells,
+        polygon_vertices=args.polygon_vertices,
         polygon_r0=args.polygon_r0,
-
-        polygon_smoothness=(
-            args.polygon_smoothness
-        ),
-
+        polygon_smoothness=args.polygon_smoothness,
         polygon_x0=args.polygon_x0,
         polygon_y0=args.polygon_y0,
-
-        polygon_continuous=(
-            args.polygon_continuous
-        ),
-
-        dt=args.dt,
+        polygon_continuous=args.polygon_continuous,
     )

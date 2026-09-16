@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from controller import Controller
-from matplotlib.patches import Circle, RegularPolygon, Rectangle
+from matplotlib.patches import Circle, RegularPolygon
 
 
 class Visualizer:
@@ -21,7 +21,6 @@ class Visualizer:
         oil_spill=None,
         communication_radius=None,
         show_communication_radius=False,
-        show_nls_points=False,
     ):
         plt.ion()
 
@@ -33,8 +32,6 @@ class Visualizer:
             show_communication_radius
             and communication_radius is not None
         )
-
-        self.show_nls_points = show_nls_points
 
         # ------------------------------------------------------------------
         # Figure
@@ -82,8 +79,6 @@ class Visualizer:
 
         self.drone_patches = {}
         self.texts = {}
-        self.edge_markers = {}
-        self.nls_markers = {}
         self.control_arrows = {}
         self.centroid_markers = {}
         self.voronoi_ring_artists = []
@@ -183,19 +178,6 @@ class Visualizer:
                 self.texts[drone_id].remove()
 
             del self.texts[drone_id]
-
-        if drone_id in self.edge_markers:
-            for artist in self.edge_markers[drone_id]:
-                if artist is not None:
-                    artist.remove()
-
-            del self.edge_markers[drone_id]
-
-        if drone_id in self.nls_markers:
-            if self.nls_markers[drone_id] is not None:
-                self.nls_markers[drone_id].remove()
-
-            del self.nls_markers[drone_id]
 
         if drone_id in self.control_arrows:
             if self.control_arrows[drone_id] is not None:
@@ -653,39 +635,6 @@ class Visualizer:
         patches.append(body)
 
         # ------------------------------------------------------------------
-        # Camera footprint
-        # ------------------------------------------------------------------
-
-        dx = self.sim_map.dx
-        dy = self.sim_map.dy
-
-        sensor_size = getattr(
-            drone.camera,
-            "size",
-            1,
-        )
-
-        sensor_width = sensor_size * dx
-        sensor_height = sensor_size * dy
-
-        sensor_box = Rectangle(
-            (
-                drone.x - sensor_width / 2.0,
-                drone.y - sensor_height / 2.0,
-            ),
-            sensor_width,
-            sensor_height,
-            edgecolor="blue",
-            facecolor="none",
-            alpha=0.3,
-            linestyle="--",
-            zorder=3,
-        )
-
-        self.ax.add_patch(sensor_box)
-        patches.append(sensor_box)
-
-        # ------------------------------------------------------------------
         # Label
         # ------------------------------------------------------------------
 
@@ -699,98 +648,6 @@ class Visualizer:
 
         self.drone_patches[drone_id] = patches
         self.texts[drone_id] = label
-
-        # ------------------------------------------------------------------
-        # Edge detection
-        # ------------------------------------------------------------------
-
-        edge_marker = None
-        edge_label = None
-
-        if (
-            getattr(drone, "edge_detected", False)
-            and getattr(drone, "last_edge_point", None) is not None
-        ):
-            edge_point = np.asarray(
-                drone.last_edge_point,
-                dtype=float,
-            )
-
-            edge_marker = self.ax.scatter(
-                [edge_point[0]],
-                [edge_point[1]],
-                s=70,
-                c="limegreen",
-                marker="X",
-                edgecolors="black",
-                linewidths=0.8,
-                zorder=6,
-            )
-
-            oil_fraction = getattr(
-                drone,
-                "last_oil_fraction",
-                None,
-            )
-
-            edge_count = getattr(
-                drone,
-                "last_edge_count",
-                0,
-            )
-
-            if oil_fraction is None:
-                annotation = f"n={edge_count}"
-            else:
-                annotation = (
-                    f"n={edge_count}\n"
-                    f"{100.0 * oil_fraction:.1f}% oil"
-                )
-
-            edge_label = self.ax.text(
-                edge_point[0] + 0.12,
-                edge_point[1] + 0.12,
-                annotation,
-                fontsize=7,
-                color="limegreen",
-                zorder=7,
-            )
-
-        self.edge_markers[drone_id] = [
-            edge_marker,
-            edge_label,
-        ]
-
-        # ------------------------------------------------------------------
-        # NLS points
-        # ------------------------------------------------------------------
-
-        nls_marker = None
-
-        if self.show_nls_points:
-            points = getattr(
-                drone,
-                "last_nls_points",
-                None,
-            )
-
-            if points is not None:
-                points = np.asarray(
-                    points,
-                    dtype=float,
-                )
-
-                if points.ndim == 2 and points.shape[0] > 0:
-                    nls_marker = self.ax.scatter(
-                        points[:, 0],
-                        points[:, 1],
-                        s=2,
-                        c="red",
-                        alpha=0.4,
-                        zorder=4,
-                    )
-
-        self.nls_markers[drone_id] = nls_marker
 
         # ------------------------------------------------------------------
         # Control vector

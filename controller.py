@@ -712,26 +712,23 @@ class Controller:
         """
         Private helper to simulate multi-hop communication between drones.
         
-        It checks the Euclidean distance between drones against `communication_radius`.
+        It checks the physical Euclidean distance between drones against `communication_radius`.
         If two drones are within range, they share and merge their `known_positions` 
-        dictionaries, propagating information across the network (multi-hop).
+        dictionaries using their GPS-sensed positions.
         """
-        # 1. Start each communication cycle from current measurements only.
-        # Without timestamps, keeping old dictionaries can reintroduce stale
-        # positions through neighbors and corrupt the 1D geodesic partition.
-        current_positions = {
-            getattr(drone, 'drone_id', 0): np.array([drone.x, drone.y], dtype=float)
+        # 1. Start each communication cycle using GPS positions instead of real ones.
+        current_gps_positions = {
+            getattr(drone, 'drone_id', 0): self._drone_sensed_position(drone)
             for drone in drones
         }
         for drone in drones:
             drone_id = getattr(drone, 'drone_id', 0)
             drone.known_positions = {
-                drone_id: current_positions[drone_id].copy(),
+                drone_id: current_gps_positions[drone_id].copy(),
             }
 
-        # 2. Multi-hop propagation loop (e.g., 2 iterations to let information travel across neighbors)
+        # 2. Multi-hop propagation loop
         for _ in range(5):
-            # Create a list of dictionaries to accumulate updates for each drone in this round
             pending_updates = [{} for _ in drones]
 
             for i, drone_i in enumerate(drones):
@@ -739,11 +736,11 @@ class Controller:
                     if i == j:
                         continue
                     
-                    # Compute distance between drone i and drone j
+                    # Nota: La portata radio dipende dalla distanza REALE tra i corpi fisici
                     dist = np.linalg.norm(drone_i.position - drone_j.position)
                     
                     if dist <= self.communication_radius:
-                        # If within communication range, drone_i learns what drone_j knows
+                        # Se sono vicini nella realtà, si scambiano ciò che sanno (incluso il GPS)
                         pending_updates[i].update(drone_j.known_positions)
 
             # Apply the accumulated knowledge updates to each drone
@@ -757,10 +754,14 @@ class Controller:
                             position,
                             dtype=float,
                         )
-                    drone.known_positions[drone_id] = np.array(
-                        [drone.x, drone.y],
-                        dtype=float,
-                    )
+                    # Mantieni aggiornata la propria posizione percepita via GPS
+                    drone.known_positions[drone_id] = current_gps_positions[drone_id].copy()
+
+    @staticmethod
+    def _drone_sensed_position(drone):
+        if hasattr(drone, "get_gps_pos"):
+            return np.asarray(drone.get_gps_pos(), dtype=float)
+        return np.asarray(drone.position, dtype=float)
 
     def _compute_voronoi_target(self, drones):
         """
@@ -807,17 +808,6 @@ class Controller:
 
         Returns a dict compatible with tests: keys `N`, `current`, `succ`, `pred`, `center_of_mass`, `occupied_points`, `assigned_drone_indices`, `ring`.
         """
-        if self.known_boundary_points is None or len(self.known_boundary_points) == 0:
-            grid = getattr(current_drone, 'grid', None)
-            if grid is not None and np.asarray(grid).size > 0:
-                try:
-                    x_min, x_max, y_min, y_max = current_drone.grid_bounds
-                    Nx, Ny = current_drone.grid_shape
-                    x_coords = np.linspace(x_min, x_max, Nx)
-                    y_coords = np.linspace(y_min, y_max, Ny)
-                    self.initialize_known_boundary(grid, x_coords=x_coords, y_coords=y_coords)
-                except Exception:
-                    pass
 
         if self.known_boundary_points is None or len(self.known_boundary_points) == 0:
             return None
@@ -976,28 +966,19 @@ class Controller:
 
     def compute_actions(self, drones, world_field=None, x_coords=None, y_coords=None):
         """Run one distributed Lloyd iteration on the 1D boundary."""
-        actions = {}
-        
-        # Ensure initial attributes exist on all drones
-        for drone in drones:
-            drone.known_boundary_points = self.known_boundary_points.copy()
-            if not hasattr(drone, 'known_positions'):
-                drone.known_positions = {getattr(drone, 'drone_id', 0): np.array([drone.x, drone.y], dtype=float)}
-
         # 1. Update communication network and propagate positions via multi-hop
         self._update_multihop_positions(drones)
 
         # 2. Compute the 1D Voronoi target centroid for each drone
         self._compute_voronoi_target(drones)
-        for drone in drones:
-            drone.known_boundary_points = self.known_boundary_points.copy()
 
-        # 3. Move each robot toward its current Lloyd target.
+        return self._compute_lloyd_actions(drones, world_field, x_coords, y_coords)
+
+    def _compute_lloyd_actions(self, drones, world_field=None, x_coords=None, y_coords=None):
+        """Move each robot toward its current Lloyd target."""
+        actions = {}
         for drone in drones:
             drone_id = getattr(drone, 'drone_id', None)
-
-            if not hasattr(drone, 'known_positions') or drone.known_positions is None:
-                drone.known_positions = {drone_id: np.array([drone.x, drone.y], dtype=float)}
 
             drone.last_control_mode = 'lloyd'
             action = self._equidistant_action(
