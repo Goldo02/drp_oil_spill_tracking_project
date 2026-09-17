@@ -1,6 +1,8 @@
 import argparse
+import json
 import os
 import random
+from pathlib import Path
 
 import numpy as np
 
@@ -15,6 +17,8 @@ from visualization import Visualizer
 
 
 OUTPUT_DIR = "./tmp_output"
+OIL_MAPPING_DATA_PATH = os.path.join(OUTPUT_DIR, "oil_mapping_data.npy")
+OIL_MAPPING_METADATA_FILENAME = "oil_mapping_metadata.json"
 
 
 def _set_random_seed(seed):
@@ -24,7 +28,13 @@ def _set_random_seed(seed):
 
 
 def _configure_matplotlib(visualize):
-    matplotlib.use("TkAgg" if visualize else "Agg")
+    try:
+        matplotlib.use("TkAgg" if visualize else "Agg")
+    except ImportError as exc:
+        if not visualize:
+            raise
+        print(f"Interactive visualization unavailable ({exc}); using Agg backend.")
+        matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     return plt
@@ -183,6 +193,98 @@ def _save_outputs(engine, visualizer):
     )
 
 
+def _ordered_points_by_angle(points):
+    points = np.asarray(points, dtype=float).reshape(-1, 2)
+    if len(points) <= 2:
+        return points.copy()
+
+    centroid = np.mean(points, axis=0)
+    angles = np.arctan2(points[:, 1] - centroid[1], points[:, 0] - centroid[0])
+    return points[np.argsort(angles)].copy()
+
+
+def _mapped_boundary_points_from_consensus(engine):
+    mean_grid = np.asarray(engine.compute_mean_grid(), dtype=float)
+    occupied = np.argwhere(mean_grid > float(engine.occupancy_threshold))
+    if occupied.size == 0:
+        return np.empty((0, 2), dtype=float)
+
+    points = np.column_stack(
+        (
+            engine.x_min + (occupied[:, 0] + 0.5) * engine.resolution,
+            engine.y_min + (occupied[:, 1] + 0.5) * engine.resolution,
+        )
+    )
+    return _ordered_points_by_angle(points)
+
+
+def _model_boundary_points(spill):
+    if hasattr(spill, "boundary"):
+        points = np.asarray(spill.boundary, dtype=float)
+        if points.ndim == 2 and points.shape[1] == 2:
+            return points.copy()
+
+    if all(hasattr(spill, attr) for attr in ("x0", "y0", "radius")):
+        theta = np.linspace(0.0, 2.0 * np.pi, 720, endpoint=False)
+        return np.column_stack(
+            (
+                float(spill.x0) + float(spill.radius) * np.cos(theta),
+                float(spill.y0) + float(spill.radius) * np.sin(theta),
+            )
+        )
+
+    return np.empty((0, 2), dtype=float)
+
+
+def _save_oil_mapping(engine, sim_map, spill, output_path):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    points = _mapped_boundary_points_from_consensus(engine)
+    source = "consensus_mean_grid"
+
+    if points.shape[0] < 3:
+        points = _model_boundary_points(spill)
+        source = "oil_spill_model_boundary"
+
+    points = np.asarray(points, dtype=float).reshape(-1, 2)
+    if points.shape[0] < 3:
+        raise RuntimeError("Unable to export oil mapping: fewer than 3 boundary points.")
+
+    np.save(output_path, points)
+
+    metadata = {
+        "data_file": output_path.name,
+        "source": source,
+        "coordinate_frame": "world",
+        "units": "simulation_world_units",
+        "shape": list(points.shape),
+        "dtype": str(points.dtype),
+        "closed_boundary": True,
+        "ordered_boundary": True,
+        "occupancy_threshold": float(engine.occupancy_threshold),
+        "sim_map": {
+            "xlim": list(map(float, sim_map.xlim)),
+            "ylim": list(map(float, sim_map.ylim)),
+            "grid_size": int(sim_map.grid_size),
+            "dx": float(sim_map.dx),
+            "dy": float(sim_map.dy),
+        },
+        "mapping_grid": {
+            "bounds": list(map(float, engine.grid_bounds)),
+            "resolution": float(engine.resolution),
+            "shape": list(map(int, engine.grid_shape)),
+        },
+    }
+
+    metadata_path = output_path.with_name(OIL_MAPPING_METADATA_FILENAME)
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    print(
+        "Saved oil mapping: "
+        f"{output_path} ({points.shape[0]} world-coordinate boundary points, "
+        f"source={source})"
+    )
+
+
 def _print_final_diagnostics(engine):
     error_history = np.asarray(engine.error_history, dtype=float)
     if not error_history.size:
@@ -211,6 +313,7 @@ def run_simulation(
     polygon_y0=None,
     polygon_continuous=False,
     dt=1.0,
+    oil_mapping_output=OIL_MAPPING_DATA_PATH,
 ):
     _set_random_seed(seed)
     plt = _configure_matplotlib(visualize)
@@ -268,6 +371,7 @@ def run_simulation(
     print("Simulation finished.")
 
     _save_outputs(engine, visualizer)
+    _save_oil_mapping(engine, sim_map, spill, oil_mapping_output)
     _print_final_diagnostics(engine)
 
     if visualize:
@@ -300,6 +404,11 @@ def _build_parser():
     parser.add_argument("--measure-every", type=int, default=3)
     parser.add_argument("--show-nls-points", action="store_true")
     parser.add_argument("--dt", type=float, default=1.0, help="Simulation timestep.")
+    parser.add_argument(
+        "--oil-mapping-output",
+        default=OIL_MAPPING_DATA_PATH,
+        help="Path for exported (N, 2) oil boundary points.",
+    )
     return parser
 
 
@@ -322,6 +431,7 @@ def main():
         polygon_y0=args.polygon_y0,
         polygon_continuous=args.polygon_continuous,
         dt=args.dt,
+        oil_mapping_output=args.oil_mapping_output,
     )
 
 
