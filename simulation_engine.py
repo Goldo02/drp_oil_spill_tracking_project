@@ -1,236 +1,767 @@
 import numpy as np
+
 from drone import Drone
-from edge_detection import identify_centroid, check_geometric_lock
+from controller import Controller, DroneController
+
 
 class SimulationEngine:
-    """Orchestrates the simulation loop for multiple drones."""
-    def __init__(self, sim_map, oil_spill, dt=0.1, sigma_gps=0.1, sigma_cam=0.1):
+    """
+    Main coordinator of the multi-drone simulation.
+
+    Responsibilities:
+        - update the environment;
+        - trigger drone sensing;
+        - update local occupancy grids;
+        - execute distributed consensus;
+        - compute diagnostics;
+        - request actions from the controller;
+        - apply actions to drones;
+        - expose state to the visualizer.
+    """
+
+    def __init__(
+        self,
+        sim_map,
+        oil_spill,
+        x_min=-10.0,
+        x_max=10.0,
+        y_min=-10.0,
+        y_max=10.0,
+        resolution=0.1,
+        sensor_size=100,
+        measure_every=3,
+        communication_radius_cells=205,
+        fully_connected=False,
+        occupancy_threshold=0.5,
+        temporal_alpha=0.05,
+        consensus_rounds=10,
+        dt=1.0,
+        verbose=True,
+        closure_min_enclosed_false_cells=250,
+    ):
         self.sim_map = sim_map
         self.oil_spill = oil_spill
-        self.dt = dt
-        self.sigma_gps = sigma_gps
-        self.sigma_cam = sigma_cam
+
+        self.x_min = float(x_min)
+        self.x_max = float(x_max)
+        self.y_min = float(y_min)
+        self.y_max = float(y_max)
+
+        self.resolution = float(resolution)
+        self.dt = float(dt)
+
+        self.sensor_size = int(sensor_size)
+        self.measure_every = max(1, int(measure_every))
+        self.occupancy_threshold = float(occupancy_threshold)
+        self.temporal_alpha = None
+        self.consensus_rounds = max(1, int(consensus_rounds))
+        self.verbose = bool(verbose)
+        self.fully_connected = bool(fully_connected)
+
+        self.Nx = int(round((self.x_max - self.x_min) / self.resolution))
+        self.Ny = int(round((self.y_max - self.y_min) / self.resolution))
+        self.grid_shape = (self.Nx, self.Ny)
+        self.grid_bounds = (self.x_min, self.x_max, self.y_min, self.y_max)
+
+        self.world_field = self._get_world_field()
+
+        dx = self.sim_map.dx if self.sim_map.dx > 0 else self.resolution
+        dy = self.sim_map.dy if self.sim_map.dy > 0 else self.resolution
+        self.communication_radius_cells = int(communication_radius_cells)
+        self.communication_radius = (
+            self.communication_radius_cells * 0.5 * (abs(dx) + abs(dy))
+        )
+
         self.drones = []
         self.frame = 0
-        
-        # True circle parameters (unknown to drones)
-        self.true_x0 = oil_spill.x0
-        self.true_y0 = oil_spill.y0
-        self.true_r0 = oil_spill.r0
-        
-        # Pre-calculated field
-        self.world_field = oil_spill.field(sim_map.X, sim_map.Y)
-        
-        # Matveev & Consensus Control Parameters
-        self.c_star = 0.5 
-        self.u_bar = 3.0       # Radial correction gain
-        self.v_base = 0.3      # Constant orbit speed
-        self.k_consensus = 0.2 # Consensus gain for distributed averaging
-        self.num_consensus_steps = 10  # Number of consensus iterations per frame
+        self.error_history = []
+        self.mean_grid_history = []
+        self.latest_mean_grid = np.zeros(self.grid_shape, dtype=float)
+        self.measurement_consensus_history = []
+        self._current_measurement_trace = None
+        self.control_state = "mapping"
+        self.transition_frame = None
+        self.closed_boundary_points = np.empty((0, 2), dtype=float)
+        self.boundary_controller = Controller(
+            sim_map=self.sim_map,
+            communication_radius=self.communication_radius,
+            occupancy_threshold=self.occupancy_threshold,
+        )
+        self.closure_min_boundary_cells = 24
+        self.closure_min_enclosed_false_cells = int(closure_min_enclosed_false_cells)
+        self.last_closure_enclosed_false_cells = 0
 
-        # History for plotting consensus convergence
-        self.estimates_history = {}
+    def _get_world_field(self):
+        """Return the current environment field."""
+        return np.asarray(self.oil_spill.get_field(self.sim_map.X, self.sim_map.Y), dtype=float)
 
-    def add_drone(self, drone_id, x, y):
-        drone = Drone(drone_id, x, y, map_bounds=(*self.sim_map.xlim, *self.sim_map.ylim),
-                      gps_noise=self.sigma_gps, camera_noise=self.sigma_cam,
-                      true_x0=self.true_x0, true_y0=self.true_y0, true_r0=self.true_r0)
-        # Initial random velocity and heading for SEARCH
-        angle = np.random.uniform(0, 2 * np.pi)
-        vx, vy = np.cos(angle) * 0.5, np.sin(angle) * 0.5
-        drone.set_velocity(vx, vy)
-        drone.theta = angle
-        drone.speed = self.v_base
-        drone.on_edge = False  # track APPROACH state entry
+    def _update_environment(self):
+        """Advance the environment by one simulation timestep."""
+        self.oil_spill.update(self.dt)
+        self.world_field = self._get_world_field()
+
+    def add_drone(
+        self,
+        drone_id,
+        x,
+        y,
+        gps_noise=0.1,
+        camera_noise=0.1,
+    ):
+        """Create and register a drone."""
+
+        drone = Drone(
+            drone_id=drone_id,
+            x=x,
+            y=y,
+            grid_shape=self.grid_shape,
+            grid_bounds=self.grid_bounds,
+            sensor_size=self.sensor_size,
+            gps_noise=gps_noise,
+            camera_noise=camera_noise,
+            controller=DroneController(
+                sim_map=self.sim_map,
+                communication_radius=self.communication_radius,
+                fully_connected=self.fully_connected,
+                occupancy_threshold=self.occupancy_threshold,
+                resolution=self.resolution,
+            ),
+        )
+
         self.drones.append(drone)
-        # Initialize history
-        self.estimates_history[drone_id] = {
-            'x0': [], 'y0': [], 'r0_pre': [], 'r0_post': [], 'r0_consensus': []
+
+        return drone
+
+    def _perform_measurement(self):
+        """Perform sensing and local grid updates."""
+
+        for drone in self.drones:
+
+            edge_points = drone.sense(
+                self.world_field,
+                self.sim_map.x_coords,
+                self.sim_map.y_coords,
+            )
+
+            drone.update_grid(
+                edge_points=edge_points,
+                x_min=self.x_min,
+                y_min=self.y_min,
+                resolution=self.resolution,
+                alpha=None,
+            )
+
+    def _get_neighbors(self, drone):
+        if self.fully_connected:
+            return [other for other in self.drones if other is not drone]
+
+        return [
+            other
+            for other in self.drones
+            if other is not drone
+            and float(np.linalg.norm(drone.position - other.position))
+            <= self.communication_radius
+        ]
+
+    def _exchange_consensus_messages(self):
+        """Deliver one synchronous round of local map messages."""
+        messages = {drone.drone_id: drone.create_consensus_message() for drone in self.drones}
+        delivered = {
+            drone.drone_id: [
+                messages[neighbor.drone_id] for neighbor in self._get_neighbors(drone)
+            ]
+            for drone in self.drones
         }
 
-    def step(self):
-        """Update physics and logic for all drones."""
-        self.frame += 1
-
-        # 0. Local measurements and updates for drones detecting edge
         for drone in self.drones:
-            # Robust perception
-            camera_view = drone.get_camera_view(self.world_field, self.sim_map.x_coords, self.sim_map.y_coords)
-            h, w = camera_view.shape
-            win = 2
-            center_val = np.mean(camera_view[h//2-win : h//2+win+1, w//2-win : w//2+win+1])
+            drone.consensus_step(
+                delivered[drone.drone_id],
+                own_grid=messages[drone.drone_id]["grid"],
+            )
 
-            gps_x, gps_y = drone.get_gps_pos()
+    def _perform_consensus(self):
+        """Run the configured number of consensus iterations."""
+        for _ in range(self.consensus_rounds):
+            self._exchange_consensus_messages()
 
-            # If detecting edge, compute local radius estimate
-            if center_val > self.c_star:
-                # Distance to center
-                dist_to_center = np.sqrt((gps_x - self.true_x0)**2 + (gps_y - self.true_y0)**2)
-                # True distance to boundary
-                if dist_to_center <= self.true_r0:
-                    d_i = self.true_r0 - dist_to_center
-                else:
-                    d_i = dist_to_center - self.true_r0
-                # Noisy distance to boundary
-                d_i_noisy = d_i + np.random.normal(0, self.sigma_cam)
-                # Local radius estimate
-                r_i = dist_to_center - d_i_noisy
-                drone.estimate_r0 = r_i
-                # Center is known
-                drone.estimate_x0 = self.true_x0
-                drone.estimate_y0 = self.true_y0
+    def compute_mean_grid(self):
+        """Return the mean occupancy grid."""
 
-        # Print initial measurements (post-measurement and pre-consensus)
-        print(f"Frame {self.frame} - INITIAL MEASUREMENTS:")
-        for d in self.drones:
-            print(f"D{d.drone_id}: {d.estimate_r0:.6f}")
+        if not self.drones:
+            return np.zeros(self.grid_shape, dtype=float)
 
-        # Record history BEFORE consensus so we can visualize individual estimate paths
-        for d in self.drones:
-            self.estimates_history[d.drone_id]['x0'].append(d.estimate_x0)
-            self.estimates_history[d.drone_id]['y0'].append(d.estimate_y0)
-            self.estimates_history[d.drone_id]['r0_pre'].append(d.estimate_r0)
-            # Record initial consensus state point (pre-iteration)
-            self.estimates_history[d.drone_id]['r0_consensus'].append(d.estimate_r0)
+        return np.mean(
+            [np.asarray(drone.grid, dtype=float) for drone in self.drones],
+            axis=0,
+        )
 
-        # Distributed consensus: iterate until convergence (all-to-all topology)
-        max_iters = 100
-        tol = 1e-6
-        actual_iters = 0
+    def compute_disagreement_error(self):
+        """Return mean L2 disagreement from the global mean."""
 
-        for it in range(1, max_iters + 1):
-            new_r0 = {}
-            for drone in self.drones:
-                neighbors = [d for d in self.drones if d != drone]
-                if neighbors:
-                    mean_neighbors = np.mean([d.estimate_r0 for d in neighbors])
-                    new_r0[drone] = drone.estimate_r0 + self.k_consensus * (mean_neighbors - drone.estimate_r0)
-                else:
-                    new_r0[drone] = drone.estimate_r0
+        if not self.drones:
+            return 0.0, np.zeros(self.grid_shape, dtype=float)
 
-            max_diff = 0.0
-            for drone in self.drones:
-                diff = abs(new_r0[drone] - drone.estimate_r0)
-                max_diff = max(max_diff, diff)
-                drone.estimate_r0 = new_r0[drone]
+        mean_grid = self.compute_mean_grid()
+        errors = [
+            np.linalg.norm(np.asarray(drone.grid, dtype=float) - mean_grid)
+            for drone in self.drones
+        ]
+        return float(np.mean(errors)), mean_grid
 
-            # store intra-consensus state for visualization
-            for d in self.drones:
-                self.estimates_history[d.drone_id]['r0_consensus'].append(d.estimate_r0)
+    def _drone_error_snapshot(self):
+        mean_grid = self.compute_mean_grid()
 
-            actual_iters = it
-            if max_diff < tol:
+        return {
+            drone.drone_id: float(np.linalg.norm(np.asarray(drone.grid, dtype=float) - mean_grid))
+            for drone in self.drones
+        }
+
+    def _print_error_snapshot(self, header):
+        if not self.verbose:
+            return
+
+        snapshot = self._drone_error_snapshot()
+
+        values = list(snapshot.values())
+        mean_error = float(np.mean(values)) if values else 0.0
+        max_error = float(np.max(values)) if values else 0.0
+
+        ordered = ", ".join(
+            f"{drone_id}={value:.6f}" for drone_id, value in snapshot.items()
+        )
+
+        print(f"{header} | mean_error={mean_error:.6f} | max_error={max_error:.6f}")
+        print(f"    per-drone: {ordered}")
+
+    def _start_new_measurement_trace(self):
+
+        if self._current_measurement_trace is not None:
+
+            self.measurement_consensus_history.append(
+                {
+                    drone_id: list(values)
+                    for drone_id, values in self._current_measurement_trace.items()
+                }
+            )
+
+        self._current_measurement_trace = {drone.drone_id: [] for drone in self.drones}
+
+    def _record_measurement_trace(self):
+
+        if self._current_measurement_trace is None:
+            self._current_measurement_trace = {
+                drone.drone_id: [] for drone in self.drones
+            }
+
+        snapshot = self._drone_error_snapshot()
+
+        for drone_id, value in snapshot.items():
+            self._current_measurement_trace[drone_id].append(value)
+
+    def _apply_mapping_actions(self):
+        """Compute mapping/orbiting actions and apply them."""
+
+        for drone in self.drones:
+
+            action = drone.compute_action(
+                self.world_field,
+                self.sim_map.x_coords,
+                self.sim_map.y_coords,
+            )
+
+            drone.action(
+                action,
+                bounds=(
+                    self.sim_map.xlim,
+                    self.sim_map.ylim,
+                ),
+            )
+
+    @staticmethod
+    def _sensed_position(drone):
+        if hasattr(drone, "get_gps_pos"):
+            return np.asarray(drone.get_gps_pos(), dtype=float)
+        return np.asarray(drone.position, dtype=float)
+
+    def _exchange_positions_multihop(self):
+        sensed_positions = {
+            drone.drone_id: self._sensed_position(drone)
+            for drone in self.drones
+        }
+        sensed_arcs = {
+            drone.drone_id: getattr(drone, "boundary_s", None)
+            for drone in self.drones
+        }
+
+        for drone in self.drones:
+            drone.known_positions = {
+                drone.drone_id: sensed_positions[drone.drone_id].copy(),
+            }
+            drone.known_boundary_arcs = {}
+            if sensed_arcs[drone.drone_id] is not None:
+                drone.known_boundary_arcs[drone.drone_id] = float(
+                    sensed_arcs[drone.drone_id]
+                )
+
+        hop_count = max(1, len(self.drones))
+        for _ in range(hop_count):
+            pending_updates = [{} for _ in self.drones]
+            pending_arc_updates = [{} for _ in self.drones]
+
+            for i, drone_i in enumerate(self.drones):
+                for j, drone_j in enumerate(self.drones):
+                    if i == j:
+                        continue
+                    in_range = getattr(self, "fully_connected", False) or (
+                        float(np.linalg.norm(drone_i.position - drone_j.position))
+                        <= self.communication_radius
+                    )
+                    if in_range:
+                        pending_updates[i].update(drone_j.known_positions)
+                        pending_arc_updates[i].update(
+                            getattr(drone_j, "known_boundary_arcs", {})
+                        )
+
+            for i, drone in enumerate(self.drones):
+                drone_id = drone.drone_id
+                for known_id, position in pending_updates[i].items():
+                    if known_id != drone_id:
+                        drone.known_positions[known_id] = np.asarray(position, dtype=float)
+                for known_id, boundary_s in pending_arc_updates[i].items():
+                    if boundary_s is not None:
+                        drone.known_boundary_arcs[known_id] = float(boundary_s)
+                drone.known_positions[drone_id] = sensed_positions[drone_id].copy()
+                if sensed_arcs[drone_id] is not None:
+                    drone.known_boundary_arcs[drone_id] = float(sensed_arcs[drone_id])
+
+    def _apply_lloyd_actions(self):
+        """Compute decentralized 1D Voronoi/Lloyd actions and apply them."""
+        self._exchange_positions_multihop()
+
+        actions = {
+            drone.drone_id: drone.compute_action()
+            for drone in self.drones
+        }
+
+        for drone in self.drones:
+            action = actions.get(drone.drone_id, np.zeros(2, dtype=float))
+            drone.action(
+                action,
+                bounds=(
+                    self.sim_map.xlim,
+                    self.sim_map.ylim,
+                ),
+            )
+            drone.project_to_boundary()
+
+    def _apply_actions(self):
+        if self.control_state == "lloyd":
+            self._apply_lloyd_actions()
+        else:
+            self._apply_mapping_actions()
+
+    def _occupied_boundary_cells(self, grid):
+        occupied = np.asarray(grid, dtype=float) > self.occupancy_threshold
+        cells = [tuple(cell) for cell in np.argwhere(occupied)]
+        return set(cells)
+
+    @staticmethod
+    def _cell_neighbors(cell):
+        ix, iy = cell
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                yield ix + dx, iy + dy
+
+    def _dfs_polygon_closure_check(self, grid):
+        """Use DFS over occupied boundary cells to detect one closed loop."""
+        cells = self._occupied_boundary_cells(grid)
+        if len(cells) < self.closure_min_boundary_cells:
+            self.last_closure_enclosed_false_cells = 0
+            return False, np.empty((0, 2), dtype=float)
+
+        adjacency = {
+            cell: [neighbor for neighbor in self._cell_neighbors(cell) if neighbor in cells]
+            for cell in cells
+        }
+        usable = {cell for cell, neighbors in adjacency.items() if len(neighbors) >= 2}
+        if len(usable) < self.closure_min_boundary_cells:
+            self.last_closure_enclosed_false_cells = 0
+            return False, np.empty((0, 2), dtype=float)
+
+        start = next(iter(usable))
+        stack = [start]
+        visited = set()
+        while stack:
+            cell = stack.pop()
+            if cell in visited or cell not in usable:
+                continue
+            visited.add(cell)
+            stack.extend(neighbor for neighbor in adjacency[cell] if neighbor in usable)
+
+        if len(visited) != len(usable):
+            self.last_closure_enclosed_false_cells = 0
+            return False, np.empty((0, 2), dtype=float)
+
+        has_open_endpoint = any(
+            sum(1 for neighbor in adjacency[cell] if neighbor in usable) < 2
+            for cell in usable
+        )
+        if has_open_endpoint:
+            self.last_closure_enclosed_false_cells = 0
+            return False, np.empty((0, 2), dtype=float)
+
+        enclosed_false_cells = self._count_enclosed_false_cells(grid)
+        self.last_closure_enclosed_false_cells = enclosed_false_cells
+        if enclosed_false_cells < getattr(self, "closure_min_enclosed_false_cells", 0):
+            return False, np.empty((0, 2), dtype=float)
+
+        contour_points = self._ordered_contour_points_from_grid(grid)
+        if contour_points.shape[0] >= self.closure_min_boundary_cells:
+            return True, contour_points
+
+        ordered_cells = self._order_loop_cells(visited, adjacency)
+        return True, self._cells_to_world_points(ordered_cells)
+
+    def _count_enclosed_false_cells(self, grid):
+        occupied = np.asarray(grid, dtype=float) > self.occupancy_threshold
+        free = ~occupied
+        if free.size == 0:
+            return 0
+
+        nx, ny = free.shape
+        visited = np.zeros_like(free, dtype=bool)
+        stack = []
+
+        for ix in range(nx):
+            for iy in (0, ny - 1):
+                if free[ix, iy] and not visited[ix, iy]:
+                    visited[ix, iy] = True
+                    stack.append((ix, iy))
+
+        for iy in range(ny):
+            for ix in (0, nx - 1):
+                if free[ix, iy] and not visited[ix, iy]:
+                    visited[ix, iy] = True
+                    stack.append((ix, iy))
+
+        while stack:
+            ix, iy = stack.pop()
+            for x2, y2 in (
+                (ix - 1, iy),
+                (ix + 1, iy),
+                (ix, iy - 1),
+                (ix, iy + 1),
+            ):
+                if (
+                    0 <= x2 < nx
+                    and 0 <= y2 < ny
+                    and free[x2, y2]
+                    and not visited[x2, y2]
+                ):
+                    visited[x2, y2] = True
+                    stack.append((x2, y2))
+
+        enclosed = free & ~visited
+        return int(np.count_nonzero(enclosed))
+
+    def _ordered_contour_points_from_grid(self, grid):
+        x_coords = self.x_min + (np.arange(self.grid_shape[0]) + 0.5) * self.resolution
+        y_coords = self.y_min + (np.arange(self.grid_shape[1]) + 0.5) * self.resolution
+
+        try:
+            points = self.boundary_controller.initialize_known_boundary(
+                np.asarray(grid, dtype=float),
+                x_coords=x_coords,
+                y_coords=y_coords,
+                force_closed=True,
+            )
+        except Exception:
+            return np.empty((0, 2), dtype=float)
+
+        points = np.asarray(points, dtype=float)
+        if points.ndim != 2 or points.shape[1] != 2:
+            return np.empty((0, 2), dtype=float)
+        return points.copy()
+
+    def _order_loop_cells(self, cells, adjacency):
+        cells = set(cells)
+        if len(cells) <= 2:
+            return list(cells)
+
+        start = min(cells)
+        order = [start]
+        visited = {start}
+        previous = None
+        current = start
+
+        while len(visited) < len(cells):
+            candidates = [
+                neighbor
+                for neighbor in adjacency.get(current, [])
+                if neighbor in cells and neighbor != previous
+            ]
+            unvisited = [neighbor for neighbor in candidates if neighbor not in visited]
+
+            if not unvisited:
                 break
 
-        # Optionally enforce exact consensus average at the end of the loop
-        # (ensures all r0 values are effectively identical when plotting)
-        consensus_avg = np.mean([d.estimate_r0 for d in self.drones])
-        for d in self.drones:
-            d.estimate_r0 = consensus_avg
+            next_cell = self._choose_next_loop_cell(previous, current, unvisited)
+            previous, current = current, next_cell
+            order.append(current)
+            visited.add(current)
 
-        print(f"AFTER CONSENSUS (converged in {actual_iters} iter(s), max_diff={max_diff:.2e}):")
-        for d in self.drones:
-            print(f"D{d.drone_id}: {d.estimate_r0:.6f}")
+        while len(visited) < len(cells):
+            current_arr = np.asarray(current, dtype=float)
+            remaining = [cell for cell in cells if cell not in visited]
+            next_cell = min(
+                remaining,
+                key=lambda cell: float(np.linalg.norm(np.asarray(cell, dtype=float) - current_arr)),
+            )
+            previous, current = current, next_cell
+            order.append(current)
+            visited.add(current)
 
-        # Record history AFTER consensus for comparison
-        for d in self.drones:
-            self.estimates_history[d.drone_id]['r0_post'].append(d.estimate_r0)
+        return order
 
-        # 1. Compute angular positions and consensus gaps for APPROACH drones
-        drones_on_edge = [d for d in self.drones if d.mode == "APPROACH"]
-        
-        # Reset gap attributes
-        for d in self.drones:
-            d.u_consensus = 0.0
+    @staticmethod
+    def _choose_next_loop_cell(previous, current, candidates):
+        if previous is None or len(candidates) == 1:
+            return min(candidates)
 
-        if len(drones_on_edge) > 1:
-            # Compute each drone's angle relative to its estimated spill center
-            for d in drones_on_edge:
-                d.phi = np.arctan2(d.y - d.estimate_y0, d.x - d.estimate_x0)
+        incoming = np.asarray(current, dtype=float) - np.asarray(previous, dtype=float)
+        incoming_norm = float(np.linalg.norm(incoming))
+        if incoming_norm <= 1e-12:
+            return min(candidates)
+        incoming = incoming / incoming_norm
 
-            # Sort drones by phi (ascending) — defines CCW circular order
-            drones_on_edge.sort(key=lambda d: d.phi)
-            N = len(drones_on_edge)
-            # Ideal equal-spacing gap
-            ideal_gap = 2 * np.pi / N
+        def turn_cost(candidate):
+            outgoing = np.asarray(candidate, dtype=float) - np.asarray(current, dtype=float)
+            outgoing_norm = float(np.linalg.norm(outgoing))
+            if outgoing_norm <= 1e-12:
+                return 2.0
+            outgoing = outgoing / outgoing_norm
+            return 1.0 - float(np.dot(incoming, outgoing))
 
-            for i in range(N):
-                d = drones_on_edge[i]
-                # Neighbors in sorted CCW order (circular)
-                d_prev = drones_on_edge[(i - 1) % N]
-                d_next = drones_on_edge[(i + 1) % N]
+        return min(candidates, key=turn_cost)
 
-                # Gap to next drone (CCW ahead) and from previous (CCW behind)
-                gap_to_next   = (d_next.phi - d.phi)   % (2 * np.pi)
-                gap_from_prev = (d.phi      - d_prev.phi) % (2 * np.pi)
+    def _cells_to_world_points(self, cells):
+        points = np.asarray(
+            [
+                (
+                    self.x_min + (ix + 0.5) * self.resolution,
+                    self.y_min + (iy + 0.5) * self.resolution,
+                )
+                for ix, iy in cells
+            ],
+            dtype=float,
+        )
+        return points.copy()
 
-                # Error terms: positive means "drone should move CCW to close gap"
-                #   e_next  > 0  → gap ahead is too big  → speed up (move CCW)
-                #   e_prev  > 0  → gap behind is too big → slow down (move CW)
-                e_next = gap_to_next  - ideal_gap   # positive → move CCW
-                e_prev = gap_from_prev - ideal_gap  # positive → move CW
+    def is_mapped_polygon_closed(self, mean_grid=None):
+        if mean_grid is None:
+            mean_grid = self.compute_mean_grid()
+        return self._dfs_polygon_closure_check(mean_grid)
 
-                # Net: move CCW when ahead gap is large, move CW when behind gap is large
-                delta_gap = e_next - e_prev  # same as gap_to_next - gap_from_prev
-                # Compute a proportional correction (rad/s) for the angular velocity
-                u_phi = self.k_consensus * delta_gap
-                max_u_phi = 0.8
-                u_phi = np.clip(u_phi, -max_u_phi, max_u_phi)
-                # Store as angular-speed correction (to be applied to tangential speed)
-                d.u_consensus_phi = u_phi
+    def _transition_to_lloyd_state(self, boundary_points):
+        boundary_points = np.asarray(boundary_points, dtype=float).reshape(-1, 2)
+        if self.control_state == "lloyd" or boundary_points.shape[0] < 3:
+            return
+
+        self.closed_boundary_points = boundary_points.copy()
+        self.boundary_controller.known_boundary_points = boundary_points.copy()
+        self.boundary_controller.known_boundary_closed = True
+        self.boundary_controller.known_boundary_ordered = True
+        self.control_state = "lloyd"
+        self.transition_frame = self.frame
+
+        known_boundary_arcs = {}
+        for drone in self.drones:
+            drone.control_state = "lloyd"
+            drone.set_known_boundary(
+                boundary_points,
+                known_boundary_closed=True,
+                already_ordered=True,
+            )
+            drone.pending_boundary_s = None
+            drone.pending_boundary_point = None
+            drone.project_to_boundary()
+            known_boundary_arcs[drone.drone_id] = float(drone.boundary_s)
+
+        known_positions = {
+            drone.drone_id: np.array([drone.x, drone.y], dtype=float)
+            for drone in self.drones
+        }
 
         for drone in self.drones:
-            # 2. Robust perception (mean of 5x5 center window)
-            camera_view = drone.get_camera_view(self.world_field, self.sim_map.x_coords, self.sim_map.y_coords)
-            h, w = camera_view.shape
-            win = 2
-            center_val = np.mean(camera_view[h//2-win : h//2+win+1, w//2-win : w//2+win+1])
+            drone.known_positions = {
+                drone_id: position.copy()
+                for drone_id, position in known_positions.items()
+            }
+            drone.known_boundary_arcs = dict(known_boundary_arcs)
 
-            # 3. Mode transition logic
-            if drone.mode == "SEARCH":
-                if center_val > self.c_star:
-                    drone.mode = "APPROACH"
-                    drone.on_edge = True
-                    # --- KEY FIX: Initialize theta to the CCW tangent direction ---
-                    # The tangent to the circle at drone's position is perpendicular
-                    # to the radial vector (pointing CCW).
-                    radial_angle = np.arctan2(drone.y - drone.estimate_y0, drone.x - drone.estimate_x0)
-                    drone.theta = radial_angle + np.pi / 2  # 90° CCW = tangent direction
-                    print(f"Frame {self.frame}: Drone {drone.drone_id} -> APPROACH (theta_init={np.degrees(drone.theta):.1f}°).")
+        if self.verbose:
+            print(
+                "  State transition: mapping -> lloyd "
+                f"(DFS closed loop with {boundary_points.shape[0]} boundary cells)"
+            )
 
-            if drone.mode == "APPROACH":
-                # Continuous radial control (proportional to radial error)
-                desired_r = drone.estimate_r0
-                dx = drone.x - drone.estimate_x0
-                dy = drone.y - drone.estimate_y0
-                dist = np.sqrt(dx*dx + dy*dy)
-                radial_error = dist - desired_r
-                k_radial = 1.5
-                v_radial = -k_radial * radial_error
+    def get_visualization_data(self):
+        """Return state required by the visualizer."""
 
-                # Tangential speed: base plus consensus correction on angular rate
-                u_phi = getattr(drone, 'u_consensus_phi', 0.0)
-                v_tangential = self.v_base + (u_phi * max(dist, 1e-3))
-                v_tangential = np.clip(v_tangential, 0.05, 1.5)
+        error, mean_grid = self.compute_disagreement_error()
 
-                # Tangential unit vector (CCW): (-sin(phi), cos(phi))
-                phi_now = np.arctan2(dy, dx)
-                t_x, t_y = -np.sin(phi_now), np.cos(phi_now)
-                r_x, r_y = np.cos(phi_now), np.sin(phi_now)
+        return {
+            "frame": self.frame,
+            "world_field": self.world_field.copy(),
+            "mean_grid": mean_grid.copy(),
+            "disagreement_error": error,
+            "drones": self.drones,
+            "communication_radius": self.communication_radius,
+            "control_state": self.control_state,
+            "transition_frame": self.transition_frame,
+            "closed_boundary_points": self.closed_boundary_points.copy(),
+            "error_history": list(self.error_history),
+            "closure_enclosed_false_cells": self.last_closure_enclosed_false_cells,
+            "closure_min_enclosed_false_cells": self.closure_min_enclosed_false_cells,
+        }
 
-                vx = v_tangential * t_x + v_radial * r_x
-                vy = v_tangential * t_y + v_radial * r_y
+    def _print_sensor_status(self):
 
-                drone.set_velocity(vx, vy)
-                drone.theta = np.arctan2(vy, vx)
+        for drone in self.drones:
 
-                # Lost track: return to SEARCH only if no oil is visible at all
-                if np.max(camera_view) < 0.15:
-                    drone.mode = "SEARCH"
-                    drone.on_edge = False
-                    angle = np.random.uniform(0, 2 * np.pi)
-                    drone.set_velocity(np.cos(angle) * 0.5, np.sin(angle) * 0.5)
-                    drone.theta = angle
+            if drone.edge_detected and drone.last_edge_point is not None:
 
-            # 4. Physics integration (commented out to keep drones static)
-            # drone.update_position(self.dt)
+                print(
+                    f"    {drone.drone_id}: "
+                    f"edge_points={drone.last_edge_count}, "
+                    f"nearest_edge=("
+                    f"{drone.last_edge_point[0]:.4f}, "
+                    f"{drone.last_edge_point[1]:.4f})"
+                )
+
+            else:
+
+                print(f"    {drone.drone_id}: " f"no edge detected")
+
+    def step(self):
+        """
+        Execute one complete simulation timestep.
+
+        Order:
+            1. update environment;
+            2. sensing;
+            3. consensus;
+            4. diagnostics;
+            5. distributed control;
+            6. drone motion.
+        """
+
+        self.frame += 1
+
+        measurement_frame = (
+            self.control_state == "mapping"
+            and (self.frame - 1) % self.measure_every == 0
+        )
+
+        if self.verbose:
+
+            if self.control_state == "lloyd":
+                frame_type = "lloyd"
+            else:
+                frame_type = "measurement" if measurement_frame else "consensus"
+
+            print(f"\nFrame {self.frame} " f"[{frame_type}]")
+        # Environment
+
+        self._update_environment()
+        # Measurement
+
+        if measurement_frame:
+
+            self._start_new_measurement_trace()
+
+            self._perform_measurement()
+
+            self._record_measurement_trace()
+
+            self._print_error_snapshot("  After sensing")
+
+            if self.verbose:
+                self._print_sensor_status()
+        # Consensus
+
+        if self.control_state == "mapping":
+            for round_idx in range(self.consensus_rounds):
+
+                self._exchange_consensus_messages()
+
+                self._record_measurement_trace()
+
+                self._print_error_snapshot(
+                    f"  Consensus iteration " f"{round_idx + 1}/" f"{self.consensus_rounds}"
+                )
+        # Diagnostics
+
+        error, mean_grid = self.compute_disagreement_error()
+
+        self.error_history.append(error)
+
+        self.mean_grid_history.append(mean_grid.copy())
+
+        self.latest_mean_grid = mean_grid
+        if self.control_state == "mapping":
+            closed, boundary_points = self.is_mapped_polygon_closed(mean_grid)
+            if closed:
+                self._transition_to_lloyd_state(boundary_points)
+        # Control
+
+        self._apply_actions()
+
+        if self.verbose:
+
+            mode_summary = ", ".join(
+                f"{drone.drone_id}:" f"{getattr(drone, 'last_control_mode', 'unknown')}"
+                for drone in self.drones
+            )
+
+            print(
+                f"  Frame summary: "
+                f"global_disagreement="
+                f"{error:.6f} | "
+                f"modes: {mode_summary}"
+            )
+
+        return error
+
+    def run(
+        self,
+        iterations,
+        render_callback=None,
+    ):
+        """Run the simulation."""
+
+        for _ in range(int(iterations)):
+
+            self.step()
+
+            if render_callback is not None:
+                render_callback(self.get_visualization_data())
+
+        self.finalize_histories()
+
+    def finalize_histories(self):
+
+        if self._current_measurement_trace is not None and any(
+            len(values) > 0 for values in self._current_measurement_trace.values()
+        ):
+
+            self.measurement_consensus_history.append(
+                {
+                    drone_id: list(values)
+                    for drone_id, values in self._current_measurement_trace.items()
+                }
+            )
+
+        self._current_measurement_trace = None
