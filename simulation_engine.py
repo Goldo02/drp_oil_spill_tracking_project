@@ -53,6 +53,7 @@ class SimulationEngine:
         )
         self.drones = []
         self.frame = 0
+        self.boundary_source = None
 
     def _get_world_field(self):
         field = self.oil_spill.get_field(self.sim_map.X, self.sim_map.Y)
@@ -70,6 +71,12 @@ class SimulationEngine:
         return drone
 
     def initialize_world_boundary(self):
+        if self.boundary_source == "loaded_oil_mapping":
+            raise RuntimeError(
+                "Refusing to recompute the static oil boundary after loading "
+                "oil mapping data."
+            )
+
         x_coords = getattr(self.sim_map, "x_coords", None)
         y_coords = getattr(self.sim_map, "y_coords", None)
         if x_coords is None:
@@ -83,6 +90,28 @@ class SimulationEngine:
             y_coords=y_coords,
             force_closed=True,
         )
+        self.boundary_source = "static_world_field"
+        return self.world_boundary_points.copy()
+
+    def initialize_loaded_boundary(
+        self,
+        boundary_points,
+        known_boundary_closed=True,
+        already_ordered=True,
+    ):
+        points = np.asarray(boundary_points, dtype=float)
+        if points.ndim != 2 or points.shape[1] != 2:
+            raise ValueError("Loaded oil mapping must be a 2D array with shape (N, 2)")
+        if points.shape[0] < 3:
+            raise ValueError("Loaded oil mapping must contain at least 3 boundary points")
+        if not np.all(np.isfinite(points)):
+            raise ValueError("Loaded oil mapping contains non-finite coordinates")
+
+        self.world_boundary_points = points.copy()
+        self.controller.known_boundary_points = points.copy()
+        self.controller.known_boundary_closed = bool(known_boundary_closed)
+        self.controller.known_boundary_ordered = bool(already_ordered)
+        self.boundary_source = "loaded_oil_mapping"
         return self.world_boundary_points.copy()
 
     def spawn_drones_on_boundary(self, num_drones, rng=None):
@@ -91,6 +120,8 @@ class SimulationEngine:
 
         boundary_points = np.asarray(self.world_boundary_points, dtype=float)
         if boundary_points.size == 0:
+            if self.boundary_source == "loaded_oil_mapping":
+                raise RuntimeError("Loaded oil mapping boundary is empty.")
             boundary_points = self.initialize_world_boundary()
         if boundary_points.size == 0:
             return []
