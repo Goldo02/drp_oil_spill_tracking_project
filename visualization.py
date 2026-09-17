@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from controller import Controller
+from matplotlib.collections import LineCollection
 from matplotlib.patches import Circle, RegularPolygon
 
 
@@ -82,6 +83,7 @@ class Visualizer:
         self.control_arrows = {}
         self.centroid_markers = {}
         self.voronoi_ring_artists = []
+        self.voronoi_map_artists = []
         self.ring_color_map = {}
 
         self.fig.canvas.draw()
@@ -200,6 +202,125 @@ class Visualizer:
             idx = len(ids) % 10
             self.ring_color_map[drone_id] = palette(idx)
         return self.ring_color_map[drone_id]
+
+    def _clear_voronoi_map_artists(self):
+        """Remove the colored 2D boundary Voronoi overlay."""
+        for artist in self.voronoi_map_artists:
+            if artist is not None:
+                try:
+                    artist.remove()
+                except Exception:
+                    pass
+        self.voronoi_map_artists = []
+
+    def _canonical_voronoi_boundary_data(self, drones):
+        """Return one valid 2D boundary Voronoi assignment from drone metadata."""
+        if drones is None:
+            return None
+
+        for drone in drones:
+            ring_data = getattr(drone, "last_ring_info", None)
+            if not isinstance(ring_data, dict):
+                continue
+
+            points = np.asarray(ring_data.get("occupied_points", []), dtype=float)
+            if points.ndim != 2 or points.shape[1] != 2 or points.size == 0:
+                continue
+
+            assignment = np.asarray(
+                ring_data.get(
+                    "assigned_drone_indices",
+                    np.empty(points.shape[0], dtype=object),
+                ),
+                dtype=object,
+            )
+            if assignment.shape[0] != points.shape[0] or assignment.size == 0:
+                continue
+
+            return {
+                "points": points,
+                "assignment": assignment,
+                "is_closed": bool(ring_data.get("is_closed", True)),
+            }
+
+        return None
+
+    def update_voronoi_map_overlay(self, drones):
+        """Color the 2D oil boundary according to the Voronoi owner robot."""
+        self._clear_voronoi_map_artists()
+
+        data = self._canonical_voronoi_boundary_data(drones)
+        if data is None:
+            return
+
+        points = data["points"]
+        assignment = data["assignment"]
+        is_closed = bool(data["is_closed"])
+        n_points = int(points.shape[0])
+        if n_points < 2:
+            return
+
+        segments_by_owner = {}
+        segment_count = n_points if is_closed else n_points - 1
+
+        for idx in range(segment_count):
+            next_idx = (idx + 1) % n_points
+            owner_left = assignment[idx]
+            owner_right = assignment[next_idx]
+            p_left = points[idx]
+            p_right = points[next_idx]
+
+            if owner_left is None and owner_right is None:
+                continue
+
+            if owner_left == owner_right:
+                if owner_left is not None:
+                    segments_by_owner.setdefault(owner_left, []).append(
+                        np.vstack((p_left, p_right))
+                    )
+                continue
+
+            midpoint = 0.5 * (p_left + p_right)
+            if owner_left is not None:
+                segments_by_owner.setdefault(owner_left, []).append(
+                    np.vstack((p_left, midpoint))
+                )
+            if owner_right is not None:
+                segments_by_owner.setdefault(owner_right, []).append(
+                    np.vstack((midpoint, p_right))
+                )
+
+        for owner, segments in segments_by_owner.items():
+            if not segments:
+                continue
+            collection = LineCollection(
+                segments,
+                colors=[self._drone_color(owner)],
+                linewidths=4.0,
+                alpha=0.95,
+                zorder=4,
+                capstyle="round",
+                joinstyle="round",
+            )
+            self.ax.add_collection(collection)
+            self.voronoi_map_artists.append(collection)
+
+        assigned_mask = np.array([owner is not None for owner in assignment], dtype=bool)
+        if np.any(assigned_mask):
+            point_colors = [
+                self._drone_color(owner)
+                for owner in assignment[assigned_mask]
+            ]
+            scatter = self.ax.scatter(
+                points[assigned_mask, 0],
+                points[assigned_mask, 1],
+                s=9,
+                c=point_colors,
+                edgecolors="none",
+                alpha=0.9,
+                zorder=4.2,
+            )
+            self.voronoi_map_artists.append(scatter)
 
     def update_ring_partition(self, drones):
         """Draw the 1D Voronoi partition as a line with one colored cell per drone."""
@@ -996,6 +1117,8 @@ class Visualizer:
             self.update_environment(
                 world_field
             )
+
+        self.update_voronoi_map_overlay(drones)
 
         # Update drones.
         for drone in drones:
