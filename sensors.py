@@ -16,12 +16,7 @@ class Sensor:
         if self.noise_std <= 0.0:
             return value
 
-        noise = np.random.normal(
-            loc=0.0,
-            scale=self.noise_std,
-            size=value.shape,
-        )
-
+        noise = np.random.normal(loc=0.0, scale=self.noise_std, size=value.shape)
         return value + noise
 
 
@@ -37,9 +32,7 @@ class GPSSensor(Sensor):
         position = np.asarray(real_position, dtype=float)
 
         if position.shape != (2,):
-            raise ValueError(
-                "GPS position must have shape (2,)"
-            )
+            raise ValueError("GPS position must have shape (2,)")
 
         return self.add_noise(position)
 
@@ -66,19 +59,9 @@ class CameraMeasurement:
         edge_points,
         oil_fraction,
     ):
-        self.image = np.asarray(
-            image,
-            dtype=float,
-        )
-
-        self.edge_points = np.asarray(
-            edge_points,
-            dtype=float,
-        )
-
-        self.oil_fraction = float(
-            oil_fraction
-        )
+        self.image = np.asarray(image, dtype=float)
+        self.edge_points = np.asarray(edge_points, dtype=float)
+        self.oil_fraction = float(oil_fraction)
 
 
 class CameraSensor(Sensor):
@@ -109,35 +92,14 @@ class CameraSensor(Sensor):
         super().__init__(noise_std)
 
         self.size = int(size)
-
         if self.size <= 0:
-            raise ValueError(
-                "Camera size must be positive"
-            )
+            raise ValueError("Camera size must be positive")
 
-        self.apply_blur = bool(
-            apply_blur
-        )
-
-        self.blur_sigma = float(
-            blur_sigma
-        )
-
-        self.edge_threshold1 = float(
-            edge_threshold1
-        )
-
-        self.edge_threshold2 = float(
-            edge_threshold2
-        )
-
-        self.occupancy_threshold = float(
-            occupancy_threshold
-        )
-
-    # ======================================================================
-    # PUBLIC API
-    # ======================================================================
+        self.apply_blur = bool(apply_blur)
+        self.blur_sigma = float(blur_sigma)
+        self.edge_threshold1 = float(edge_threshold1)
+        self.edge_threshold2 = float(edge_threshold2)
+        self.occupancy_threshold = float(occupancy_threshold)
 
     def sense(
         self,
@@ -171,37 +133,16 @@ class CameraSensor(Sensor):
             Processed camera measurement.
         """
 
-        field = np.asarray(
-            world_field,
-            dtype=float,
-        )
-
-        x_coords = np.asarray(
-            x_coords,
-            dtype=float,
-        )
-
-        y_coords = np.asarray(
-            y_coords,
-            dtype=float,
-        )
-
-        self._validate_inputs(
-            field,
-            x_coords,
-            y_coords,
-        )
+        field = np.asarray(world_field, dtype=float)
+        x_coords = np.asarray(x_coords, dtype=float)
+        y_coords = np.asarray(y_coords, dtype=float)
+        self._validate_inputs(field, x_coords, y_coords)
 
         threshold = (
             self.occupancy_threshold
             if occupancy_threshold is None
             else float(occupancy_threshold)
         )
-
-        # --------------------------------------------------------------
-        # 1. Local field of view
-        # --------------------------------------------------------------
-
         local_matrix = self._extract_local_window(
             world_field=field,
             x=x,
@@ -210,72 +151,24 @@ class CameraSensor(Sensor):
             y_coords=y_coords,
         )
 
-        # --------------------------------------------------------------
-        # 2. Measurement noise
-        # --------------------------------------------------------------
-
-        noisy_matrix = self.add_noise(
-            local_matrix
-        )
-
-        # Camera measurements should remain within the physical
-        # field range.
-        noisy_matrix = np.clip(
-            noisy_matrix,
-            0.0,
-            1.0,
-        )
-
-        # --------------------------------------------------------------
-        # 3. Optional smoothing
-        # --------------------------------------------------------------
+        noisy_matrix = self.add_noise(local_matrix)
+        noisy_matrix = np.clip(noisy_matrix, 0.0, 1.0)
 
         if self.apply_blur:
-            noisy_matrix = self._gaussian_blur(
-                noisy_matrix,
-                self.blur_sigma,
-            )
+            noisy_matrix = self._gaussian_blur(noisy_matrix, self.blur_sigma)
 
-        # --------------------------------------------------------------
-        # 4. Oil occupancy
-        # --------------------------------------------------------------
+        binary_window = noisy_matrix >= threshold
+        oil_fraction = float(np.mean(binary_window)) if binary_window.size else 0.0
 
-        binary_window = (
-            noisy_matrix >= threshold
-        )
-
-        if binary_window.size > 0:
-            oil_fraction = float(
-                np.mean(binary_window)
-            )
-        else:
-            oil_fraction = 0.0
-
-        # --------------------------------------------------------------
-        # 5. Edge detection
-        # --------------------------------------------------------------
-
-        edges = self._detect_edges(
-            noisy_matrix
-        )
-
-        edge_points = extract_edge_points(
-            edges
-        )
-
-        # --------------------------------------------------------------
-        # 6. Local -> world coordinates
-        # --------------------------------------------------------------
-
-        edge_points = (
-            self._local_to_world_coordinates(
-                edge_points=edge_points,
-                x=x,
-                y=y,
-                x_coords=x_coords,
-                y_coords=y_coords,
-                image_shape=noisy_matrix.shape,
-            )
+        edges = self._detect_edges(noisy_matrix)
+        edge_points = extract_edge_points(edges)
+        edge_points = self._local_to_world_coordinates(
+            edge_points=edge_points,
+            x=x,
+            y=y,
+            x_coords=x_coords,
+            y_coords=y_coords,
+            image_shape=noisy_matrix.shape,
         )
 
         return CameraMeasurement(
@@ -283,10 +176,6 @@ class CameraSensor(Sensor):
             edge_points=edge_points,
             oil_fraction=oil_fraction,
         )
-
-    # ======================================================================
-    # VALIDATION
-    # ======================================================================
 
     @staticmethod
     def _validate_inputs(
@@ -297,32 +186,16 @@ class CameraSensor(Sensor):
         """Validate environment data supplied to the camera."""
 
         if field.ndim != 2:
-            raise ValueError(
-                "world_field must be a 2D array"
-            )
+            raise ValueError("world_field must be a 2D array")
 
-        if field.shape != (
-            len(x_coords),
-            len(y_coords),
-        ):
-            raise ValueError(
-                "world_field shape must match "
-                "x_coords and y_coords"
-            )
+        if field.shape != (len(x_coords), len(y_coords)):
+            raise ValueError("world_field shape must match " "x_coords and y_coords")
 
         if len(x_coords) < 2:
-            raise ValueError(
-                "At least two x coordinates are required"
-            )
+            raise ValueError("At least two x coordinates are required")
 
         if len(y_coords) < 2:
-            raise ValueError(
-                "At least two y coordinates are required"
-            )
-
-    # ======================================================================
-    # LOCAL FIELD OF VIEW
-    # ======================================================================
+            raise ValueError("At least two y coordinates are required")
 
     def _extract_local_window(
         self,
@@ -338,90 +211,32 @@ class CameraSensor(Sensor):
         The output always has shape `(size, size)`.
         """
 
-        dx = float(
-            x_coords[1] - x_coords[0]
-        )
+        dx = float(x_coords[1] - x_coords[0])
 
-        dy = float(
-            y_coords[1] - y_coords[0]
-        )
+        dy = float(y_coords[1] - y_coords[0])
 
         if abs(dx) <= 1e-12:
-            raise ValueError(
-                "x coordinate spacing must be non-zero"
-            )
+            raise ValueError("x coordinate spacing must be non-zero")
 
         if abs(dy) <= 1e-12:
-            raise ValueError(
-                "y coordinate spacing must be non-zero"
-            )
+            raise ValueError("y coordinate spacing must be non-zero")
 
-        i_center = int(
-            round(
-                (float(x) - x_coords[0])
-                / dx
-            )
-        )
+        i_center = int(round((float(x) - x_coords[0]) / dx))
 
-        j_center = int(
-            round(
-                (float(y) - y_coords[0])
-                / dy
-            )
-        )
+        j_center = int(round((float(y) - y_coords[0]) / dy))
 
         half = self.size // 2
 
-        i_min = max(
-            0,
-            i_center - half,
-        )
+        i_min = max(0, i_center - half)
+        i_max = min(world_field.shape[0], i_center + half + 1)
+        j_min = max(0, j_center - half)
+        j_max = min(world_field.shape[1], j_center + half + 1)
 
-        i_max = min(
-            world_field.shape[0],
-            i_center + half + 1,
-        )
-
-        j_min = max(
-            0,
-            j_center - half,
-        )
-
-        j_max = min(
-            world_field.shape[1],
-            j_center + half + 1,
-        )
-
-        local_matrix = world_field[
-            i_min:i_max,
-            j_min:j_max,
-        ].astype(float)
-
-        # --------------------------------------------------------------
-        # Padding outside simulation domain
-        # --------------------------------------------------------------
-
-        pad_before_i = max(
-            0,
-            half - i_center,
-        )
-
-        pad_after_i = max(
-            0,
-            (i_center + half + 1)
-            - world_field.shape[0],
-        )
-
-        pad_before_j = max(
-            0,
-            half - j_center,
-        )
-
-        pad_after_j = max(
-            0,
-            (j_center + half + 1)
-            - world_field.shape[1],
-        )
+        local_matrix = world_field[i_min:i_max, j_min:j_max].astype(float)
+        pad_before_i = max(0, half - i_center)
+        pad_after_i = max(0, (i_center + half + 1) - world_field.shape[0])
+        pad_before_j = max(0, half - j_center)
+        pad_after_j = max(0, (j_center + half + 1) - world_field.shape[1])
 
         local_matrix = np.pad(
             local_matrix,
@@ -438,52 +253,19 @@ class CameraSensor(Sensor):
             mode="constant",
             constant_values=0.0,
         )
-
-        # --------------------------------------------------------------
         # Enforce exact output size
-        # --------------------------------------------------------------
 
-        target_shape = (
-            self.size,
-            self.size,
-        )
-
-        local_matrix = local_matrix[
-            : self.size,
-            : self.size,
-        ]
+        target_shape = (self.size, self.size)
+        local_matrix = local_matrix[: self.size, : self.size]
 
         if local_matrix.shape != target_shape:
-            padded = np.zeros(
-                target_shape,
-                dtype=float,
-            )
-
-            rows = min(
-                local_matrix.shape[0],
-                self.size,
-            )
-
-            cols = min(
-                local_matrix.shape[1],
-                self.size,
-            )
-
-            padded[
-                :rows,
-                :cols,
-            ] = local_matrix[
-                :rows,
-                :cols,
-            ]
-
+            padded = np.zeros(target_shape, dtype=float)
+            rows = min(local_matrix.shape[0], self.size)
+            cols = min(local_matrix.shape[1], self.size)
+            padded[:rows, :cols] = local_matrix[:rows, :cols]
             local_matrix = padded
 
         return local_matrix
-
-    # ======================================================================
-    # EDGE DETECTION
-    # ======================================================================
 
     def _detect_edges(self, image):
         """
@@ -499,10 +281,6 @@ class CameraSensor(Sensor):
             sigma=self.blur_sigma if self.apply_blur else 1.0,
         )
 
-    # ======================================================================
-    # IMAGE PROCESSING
-    # ======================================================================
-
     @staticmethod
     def _gaussian_blur(
         image,
@@ -511,29 +289,14 @@ class CameraSensor(Sensor):
         """Apply Gaussian smoothing using scipy."""
 
         if sigma <= 0.0:
-            return np.asarray(
-                image,
-                dtype=float,
-            )
+            return np.asarray(image, dtype=float)
 
         try:
             from scipy.ndimage import gaussian_filter
         except ImportError as exc:
-            raise ImportError(
-                "Gaussian blur requires scipy"
-            ) from exc
+            raise ImportError("Gaussian blur requires scipy") from exc
 
-        return gaussian_filter(
-            np.asarray(
-                image,
-                dtype=float,
-            ),
-            sigma=float(sigma),
-        )
-
-    # ======================================================================
-    # COORDINATE TRANSFORMATION
-    # ======================================================================
+        return gaussian_filter(np.asarray(image, dtype=float), sigma=float(sigma))
 
     @staticmethod
     def _local_to_world_coordinates(
@@ -550,56 +313,22 @@ class CameraSensor(Sensor):
         Input edge points are expected in `(row, column)` format.
         """
 
-        points = np.asarray(
-            edge_points,
-            dtype=float,
-        )
+        points = np.asarray(edge_points, dtype=float)
 
         if points.size == 0:
-            return np.empty(
-                (0, 2),
-                dtype=float,
-            )
+            return np.empty((0, 2), dtype=float)
 
-        points = points.reshape(
-            -1,
-            2,
-        )
+        points = points.reshape(-1, 2)
 
-        dx = (
-            float(
-                x_coords[1] - x_coords[0]
-            )
-            if len(x_coords) > 1
-            else 1.0
-        )
+        dx = float(x_coords[1] - x_coords[0]) if len(x_coords) > 1 else 1.0
 
-        dy = (
-            float(
-                y_coords[1] - y_coords[0]
-            )
-            if len(y_coords) > 1
-            else 1.0
-        )
+        dy = float(y_coords[1] - y_coords[0]) if len(y_coords) > 1 else 1.0
 
         height, width = image_shape
 
-        # Determine the exact grid cell that was used to extract the
-        # local window. The extractor rounds the drone position to the
-        # nearest grid index; using the grid coordinate here ensures the
-        # forward and inverse mappings are consistent and avoids a
-        # constant translation when the drone is not exactly on a grid
-        # node.
-        i_center = int(
-            round((float(x) - x_coords[0]) / dx)
-        )
+        i_center = int(round((float(x) - x_coords[0]) / dx))
+        j_center = int(round((float(y) - y_coords[0]) / dy))
 
-        j_center = int(
-            round((float(y) - y_coords[0]) / dy)
-        )
-
-        # Clip to valid indices in case the center was near the domain
-        # boundary and the extractor padded the window.
         i_center = int(np.clip(i_center, 0, len(x_coords) - 1))
         j_center = int(np.clip(j_center, 0, len(y_coords) - 1))
 
@@ -612,9 +341,4 @@ class CameraSensor(Sensor):
         world_x = center_world_x + (points[:, 0] - center_row) * dx
         world_y = center_world_y + (points[:, 1] - center_col) * dy
 
-        return np.column_stack(
-            (
-                world_x,
-                world_y,
-            )
-        ).astype(float)
+        return np.column_stack((world_x, world_y)).astype(float)

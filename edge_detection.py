@@ -41,30 +41,23 @@ def detect_edges(
     if image.ndim != 2 or image.size == 0:
         return np.zeros_like(image, dtype=bool)
 
-    # Return empty if the window has no significant variation (e.g. all empty water or all solid oil)
     val_min = float(np.min(image))
     val_max = float(np.max(image))
     if val_max - val_min < 0.15:
         return np.zeros_like(image, dtype=bool)
 
-    # Handle legacy threshold arguments if provided
     if "threshold1" in kwargs:
         t1 = kwargs["threshold1"]
         if 0.0 < float(t1) < 1.0:
             threshold = float(t1)
 
     threshold = float(threshold)
-
-    # 1. Smooth the measurement to eliminate high-frequency sensor noise
     if gaussian_filter is not None and sigma > 0.0:
         smoothed = gaussian_filter(image, sigma=float(sigma))
     else:
         smoothed = image
 
-    # 2. Binary mask of the detected spill region
     mask = smoothed >= threshold
-
-    # 3. Extract the single-pixel boundary contour
     if binary_erosion is not None:
         eroded = binary_erosion(mask, border_value=True)
         edges = mask ^ eroded
@@ -102,8 +95,8 @@ def extract_edge_points(edges):
         return np.empty((0, 2), dtype=float)
 
     rows, cols = np.nonzero(edges)
-
-    if len(rows) == 0:
-        return np.empty((0, 2), dtype=float)
-
-    return np.column_stack((rows, cols)).astype(float)
+    return (
+        np.empty((0, 2), dtype=float)
+        if len(rows) == 0
+        else np.column_stack((rows, cols)).astype(float)
+    )

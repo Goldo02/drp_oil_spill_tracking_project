@@ -50,129 +50,43 @@ class SimulationEngine:
         self.dt = float(dt)
 
         self.sensor_size = int(sensor_size)
-        self.measure_every = max(
-            1,
-            int(measure_every),
-        )
-
-        self.occupancy_threshold = float(
-            occupancy_threshold
-        )
-
+        self.measure_every = max(1, int(measure_every))
+        self.occupancy_threshold = float(occupancy_threshold)
         self.temporal_alpha = None
-
-        self.consensus_rounds = max(
-            1,
-            int(consensus_rounds),
-        )
-
+        self.consensus_rounds = max(1, int(consensus_rounds))
         self.verbose = bool(verbose)
         self.fully_connected = bool(fully_connected)
 
-        # --------------------------------------------------------------
-        # Occupancy grid
-        # --------------------------------------------------------------
-
-        self.Nx = int(
-            round(
-                (self.x_max - self.x_min)
-                / self.resolution
-            )
-        )
-
-        self.Ny = int(
-            round(
-                (self.y_max - self.y_min)
-                / self.resolution
-            )
-        )
-
-        self.grid_shape = (
-            self.Nx,
-            self.Ny,
-        )
-
-        self.grid_bounds = (
-            self.x_min,
-            self.x_max,
-            self.y_min,
-            self.y_max,
-        )
-
-        # --------------------------------------------------------------
-        # Environment
-        # --------------------------------------------------------------
+        self.Nx = int(round((self.x_max - self.x_min) / self.resolution))
+        self.Ny = int(round((self.y_max - self.y_min) / self.resolution))
+        self.grid_shape = (self.Nx, self.Ny)
+        self.grid_bounds = (self.x_min, self.x_max, self.y_min, self.y_max)
 
         self.world_field = self._get_world_field()
 
-        # --------------------------------------------------------------
-        # Communication
-        # --------------------------------------------------------------
-
-        dx = (
-            self.sim_map.dx
-            if self.sim_map.dx > 0
-            else self.resolution
-        )
-
-        dy = (
-            self.sim_map.dy
-            if self.sim_map.dy > 0
-            else self.resolution
-        )
-
-        self.communication_radius_cells = int(
-            communication_radius_cells
-        )
-
+        dx = self.sim_map.dx if self.sim_map.dx > 0 else self.resolution
+        dy = self.sim_map.dy if self.sim_map.dy > 0 else self.resolution
+        self.communication_radius_cells = int(communication_radius_cells)
         self.communication_radius = (
-            self.communication_radius_cells
-            * 0.5
-            * (abs(dx) + abs(dy))
+            self.communication_radius_cells * 0.5 * (abs(dx) + abs(dy))
         )
-
-        # --------------------------------------------------------------
-        # Simulation state
-        # --------------------------------------------------------------
 
         self.drones = []
         self.frame = 0
-
         self.error_history = []
         self.mean_grid_history = []
-
-        self.latest_mean_grid = np.zeros(
-            self.grid_shape,
-            dtype=float,
-        )
-
+        self.latest_mean_grid = np.zeros(self.grid_shape, dtype=float)
         self.measurement_consensus_history = []
         self._current_measurement_trace = None
 
-    # ==================================================================
-    # ENVIRONMENT
-    # ==================================================================
-
     def _get_world_field(self):
         """Return the current environment field."""
-        field = self.oil_spill.get_field(
-            self.sim_map.X,
-            self.sim_map.Y,
-        )
-
-        return np.asarray(
-            field,
-            dtype=float,
-        )
+        return np.asarray(self.oil_spill.get_field(self.sim_map.X, self.sim_map.Y), dtype=float)
 
     def _update_environment(self):
         """Advance the environment by one simulation timestep."""
         self.oil_spill.update(self.dt)
         self.world_field = self._get_world_field()
-
-    # ==================================================================
-    # DRONES
-    # ==================================================================
 
     def add_drone(
         self,
@@ -206,16 +120,12 @@ class SimulationEngine:
 
         return drone
 
-    # ==================================================================
-    # SENSING
-    # ==================================================================
-
     def _perform_measurement(self):
         """Perform sensing and local grid updates."""
 
         for drone in self.drones:
 
-            edge_points = drone.sense( 
+            edge_points = drone.sense(
                 self.world_field,
                 self.sim_map.x_coords,
                 self.sim_map.y_coords,
@@ -229,38 +139,27 @@ class SimulationEngine:
                 alpha=None,
             )
 
-    # ==================================================================
-    # CONSENSUS
-    # ==================================================================
-
     def _get_neighbors(self, drone):
         if self.fully_connected:
-            return [
-                other
-                for other in self.drones
-                if other is not drone
-            ]
+            return [other for other in self.drones if other is not drone]
 
         return [
             other
             for other in self.drones
             if other is not drone
-            and float(np.linalg.norm(drone.position - other.position)) <= self.communication_radius
+            and float(np.linalg.norm(drone.position - other.position))
+            <= self.communication_radius
         ]
 
     def _exchange_consensus_messages(self):
         """Deliver one synchronous round of local map messages."""
-        messages = {
-            drone.drone_id: drone.create_consensus_message()
+        messages = {drone.drone_id: drone.create_consensus_message() for drone in self.drones}
+        delivered = {
+            drone.drone_id: [
+                messages[neighbor.drone_id] for neighbor in self._get_neighbors(drone)
+            ]
             for drone in self.drones
         }
-
-        delivered = {}
-        for drone in self.drones:
-            delivered[drone.drone_id] = [
-                messages[neighbor.drone_id]
-                for neighbor in self._get_neighbors(drone)
-            ]
 
         for drone in self.drones:
             drone.consensus_step(
@@ -273,27 +172,14 @@ class SimulationEngine:
         for _ in range(self.consensus_rounds):
             self._exchange_consensus_messages()
 
-    # ==================================================================
-    # DIAGNOSTICS
-    # ==================================================================
-
     def compute_mean_grid(self):
         """Return the mean occupancy grid."""
 
         if not self.drones:
-            return np.zeros(
-                self.grid_shape,
-                dtype=float,
-            )
+            return np.zeros(self.grid_shape, dtype=float)
 
         return np.mean(
-            [
-                np.asarray(
-                    drone.grid,
-                    dtype=float,
-                )
-                for drone in self.drones
-            ],
+            [np.asarray(drone.grid, dtype=float) for drone in self.drones],
             axis=0,
         )
 
@@ -301,42 +187,20 @@ class SimulationEngine:
         """Return mean L2 disagreement from the global mean."""
 
         if not self.drones:
-            return (
-                0.0,
-                np.zeros(
-                    self.grid_shape,
-                    dtype=float,
-                ),
-            )
+            return 0.0, np.zeros(self.grid_shape, dtype=float)
 
         mean_grid = self.compute_mean_grid()
-
         errors = [
-            np.linalg.norm(
-                np.asarray(
-                    drone.grid,
-                    dtype=float,
-                )
-                - mean_grid
-            )
+            np.linalg.norm(np.asarray(drone.grid, dtype=float) - mean_grid)
             for drone in self.drones
         ]
-
         return float(np.mean(errors)), mean_grid
 
     def _drone_error_snapshot(self):
         mean_grid = self.compute_mean_grid()
 
         return {
-            drone.drone_id: float(
-                np.linalg.norm(
-                    np.asarray(
-                        drone.grid,
-                        dtype=float,
-                    )
-                    - mean_grid
-                )
-            )
+            drone.drone_id: float(np.linalg.norm(np.asarray(drone.grid, dtype=float) - mean_grid))
             for drone in self.drones
         }
 
@@ -346,40 +210,16 @@ class SimulationEngine:
 
         snapshot = self._drone_error_snapshot()
 
-        if snapshot:
-            mean_error = float(
-                np.mean(
-                    list(snapshot.values())
-                )
-            )
-
-            max_error = float(
-                np.max(
-                    list(snapshot.values())
-                )
-            )
-        else:
-            mean_error = 0.0
-            max_error = 0.0
+        values = list(snapshot.values())
+        mean_error = float(np.mean(values)) if values else 0.0
+        max_error = float(np.max(values)) if values else 0.0
 
         ordered = ", ".join(
-            f"{drone_id}={value:.6f}"
-            for drone_id, value in snapshot.items()
+            f"{drone_id}={value:.6f}" for drone_id, value in snapshot.items()
         )
 
-        print(
-            f"{header} | "
-            f"mean_error={mean_error:.6f} | "
-            f"max_error={max_error:.6f}"
-        )
-
-        print(
-            f"    per-drone: {ordered}"
-        )
-
-    # ==================================================================
-    # MEASUREMENT HISTORY
-    # ==================================================================
+        print(f"{header} | mean_error={mean_error:.6f} | max_error={max_error:.6f}")
+        print(f"    per-drone: {ordered}")
 
     def _start_new_measurement_trace(self):
 
@@ -388,34 +228,23 @@ class SimulationEngine:
             self.measurement_consensus_history.append(
                 {
                     drone_id: list(values)
-                    for drone_id, values
-                    in self._current_measurement_trace.items()
+                    for drone_id, values in self._current_measurement_trace.items()
                 }
             )
 
-        self._current_measurement_trace = {
-            drone.drone_id: []
-            for drone in self.drones
-        }
+        self._current_measurement_trace = {drone.drone_id: [] for drone in self.drones}
 
     def _record_measurement_trace(self):
 
         if self._current_measurement_trace is None:
             self._current_measurement_trace = {
-                drone.drone_id: []
-                for drone in self.drones
+                drone.drone_id: [] for drone in self.drones
             }
 
         snapshot = self._drone_error_snapshot()
 
         for drone_id, value in snapshot.items():
-            self._current_measurement_trace[
-                drone_id
-            ].append(value)
-
-    # ==================================================================
-    # CONTROL
-    # ==================================================================
+            self._current_measurement_trace[drone_id].append(value)
 
     def _apply_actions(self):
         """Compute per-drone local actions and apply them."""
@@ -436,16 +265,10 @@ class SimulationEngine:
                 ),
             )
 
-    # ==================================================================
-    # VISUALIZATION
-    # ==================================================================
-
     def get_visualization_data(self):
         """Return state required by the visualizer."""
 
-        error, mean_grid = (
-            self.compute_disagreement_error()
-        )
+        error, mean_grid = self.compute_disagreement_error()
 
         return {
             "frame": self.frame,
@@ -456,18 +279,11 @@ class SimulationEngine:
             "communication_radius": self.communication_radius,
         }
 
-    # ==================================================================
-    # SENSOR DEBUGGING
-    # ==================================================================
-
     def _print_sensor_status(self):
 
         for drone in self.drones:
 
-            if (
-                drone.edge_detected
-                and drone.last_edge_point is not None
-            ):
+            if drone.edge_detected and drone.last_edge_point is not None:
 
                 print(
                     f"    {drone.drone_id}: "
@@ -479,14 +295,7 @@ class SimulationEngine:
 
             else:
 
-                print(
-                    f"    {drone.drone_id}: "
-                    f"no edge detected"
-                )
-
-    # ==================================================================
-    # SIMULATION STEP
-    # ==================================================================
+                print(f"    {drone.drone_id}: " f"no edge detected")
 
     def step(self):
         """
@@ -500,37 +309,20 @@ class SimulationEngine:
             5. distributed control;
             6. drone motion.
         """
-        
+
         self.frame += 1
 
-        measurement_frame = (
-            (self.frame - 1)
-            % self.measure_every
-            == 0
-        )
+        measurement_frame = (self.frame - 1) % self.measure_every == 0
 
         if self.verbose:
 
-            frame_type = (
-                "measurement"
-                if measurement_frame
-                else "consensus"
-            )
+            frame_type = "measurement" if measurement_frame else "consensus"
 
-            print(
-                f"\nFrame {self.frame} "
-                f"[{frame_type}]"
-            )
-
-        # --------------------------------------------------------------
+            print(f"\nFrame {self.frame} " f"[{frame_type}]")
         # Environment
-        # --------------------------------------------------------------
 
         self._update_environment()
-
-        # --------------------------------------------------------------
         # Measurement
-        # --------------------------------------------------------------
 
         if measurement_frame:
 
@@ -540,58 +332,38 @@ class SimulationEngine:
 
             self._record_measurement_trace()
 
-            self._print_error_snapshot(
-                "  After sensing"
-            )
+            self._print_error_snapshot("  After sensing")
 
             if self.verbose:
                 self._print_sensor_status()
-
-        # --------------------------------------------------------------
         # Consensus
-        # --------------------------------------------------------------
 
-        for round_idx in range(
-            self.consensus_rounds
-        ):
+        for round_idx in range(self.consensus_rounds):
 
             self._exchange_consensus_messages()
 
             self._record_measurement_trace()
 
             self._print_error_snapshot(
-                f"  Consensus iteration "
-                f"{round_idx + 1}/"
-                f"{self.consensus_rounds}"
+                f"  Consensus iteration " f"{round_idx + 1}/" f"{self.consensus_rounds}"
             )
-
-        # --------------------------------------------------------------
         # Diagnostics
-        # --------------------------------------------------------------
 
-        error, mean_grid = (
-            self.compute_disagreement_error()
-        )
+        error, mean_grid = self.compute_disagreement_error()
 
         self.error_history.append(error)
 
-        self.mean_grid_history.append(
-            mean_grid.copy()
-        )
+        self.mean_grid_history.append(mean_grid.copy())
 
         self.latest_mean_grid = mean_grid
-
-        # --------------------------------------------------------------
         # Control
-        # --------------------------------------------------------------
 
         self._apply_actions()
 
         if self.verbose:
 
             mode_summary = ", ".join(
-                f"{drone.drone_id}:"
-                f"{getattr(drone, 'last_control_mode', 'unknown')}"
+                f"{drone.drone_id}:" f"{getattr(drone, 'last_control_mode', 'unknown')}"
                 for drone in self.drones
             )
 
@@ -603,10 +375,6 @@ class SimulationEngine:
             )
 
         return error
-
-    # ==================================================================
-    # RUN
-    # ==================================================================
 
     def run(
         self,
@@ -620,32 +388,20 @@ class SimulationEngine:
             self.step()
 
             if render_callback is not None:
-                render_callback(
-                    self.get_visualization_data()
-                )
+                render_callback(self.get_visualization_data())
 
         self.finalize_histories()
 
-    # ==================================================================
-    # HISTORY
-    # ==================================================================
-
     def finalize_histories(self):
 
-        if (
-            self._current_measurement_trace is not None
-            and any(
-                len(values) > 0
-                for values
-                in self._current_measurement_trace.values()
-            )
+        if self._current_measurement_trace is not None and any(
+            len(values) > 0 for values in self._current_measurement_trace.values()
         ):
 
             self.measurement_consensus_history.append(
                 {
                     drone_id: list(values)
-                    for drone_id, values
-                    in self._current_measurement_trace.items()
+                    for drone_id, values in self._current_measurement_trace.items()
                 }
             )
 

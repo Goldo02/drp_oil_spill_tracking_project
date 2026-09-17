@@ -30,9 +30,6 @@ class Drone:
         max_speed=0.12,
         controller=None,
     ):
-        # ==============================================================
-        # IDENTITY AND STATE
-        # ==============================================================
 
         self.drone_id = drone_id
 
@@ -41,80 +38,28 @@ class Drone:
 
         self.max_speed = float(max_speed)
 
-        # ==============================================================
-        # GRID
-        # ==============================================================
-
         self.grid_shape = tuple(grid_shape)
         self.grid_bounds = tuple(grid_bounds)
 
-        (
-            self.x_min,
-            self.x_max,
-            self.y_min,
-            self.y_max,
-        ) = self.grid_bounds
+        self.x_min, self.x_max, self.y_min, self.y_max = self.grid_bounds
 
         self.Nx, self.Ny = self.grid_shape
 
-        # Local occupancy grid.
-        self.grid = np.zeros(
-            self.grid_shape,
-            dtype=float,
-        )
-
-        # ==============================================================
-        # SENSORS
-        # ==============================================================
-
-        self.gps = GPSSensor(
-            noise_std=gps_noise,
-        )
-
-        self.camera = CameraSensor(
-            size=sensor_size,
-            noise_std=camera_noise,
-        )
-
-        # ==============================================================
-        # SENSING STATE
-        # ==============================================================
+        self.grid = np.zeros(self.grid_shape, dtype=float)
+        self.gps = GPSSensor(noise_std=gps_noise)
+        self.camera = CameraSensor(size=sensor_size, noise_std=camera_noise)
 
         self.edge_detected = False
-
         self.last_edge_point = None
-
-        self.last_edge_points = np.empty(
-            (0, 2),
-            dtype=float,
-        )
-
-        self.last_nls_points = np.empty(
-            (0, 2),
-            dtype=float,
-        )
-
+        self.last_edge_points = np.empty((0, 2), dtype=float)
+        self.last_nls_points = np.empty((0, 2), dtype=float)
         self.last_boundary_anchor_point = None
-
         self.last_edge_count = 0
-
         self.last_oil_fraction = None
-
-        # ==============================================================
-        # CONTROL STATE
-        # ==============================================================
-
         self.last_control_mode = "idle"
+        self.last_control_vector = np.zeros(2, dtype=float)
 
-        self.last_control_vector = np.zeros(
-            2,
-            dtype=float,
-        )
-
-        # Direction used while exploring.
-        self.exploration_direction = (
-            self._random_unit_direction()
-        )
+        self.exploration_direction = self._random_unit_direction()
         self.controller = controller
         if self.controller is None:
             self.controller = DroneController(
@@ -141,39 +86,19 @@ class Drone:
         """
         return {
             "sender_id": self.drone_id,
-            "grid": np.asarray(
-                self.grid,
-                dtype=float,
-            ).copy(),
+            "grid": np.asarray(self.grid, dtype=float).copy(),
         }
-
-    # ==================================================================
-    # STATE
-    # ==================================================================
 
     @property
     def position(self):
         """Return the current drone position as [x, y]."""
-        return np.array(
-            [self.x, self.y],
-            dtype=float,
-        )
-
-    # ==================================================================
-    # GPS
-    # ==================================================================
+        return np.array([self.x, self.y], dtype=float)
 
     def get_gps_pos(self):
         """
         Return the current position measured by the GPS sensor.
         """
-        return self.gps.sense(
-            self.position
-        )
-
-    # ==================================================================
-    # SENSING
-    # ==================================================================
+        return self.gps.sense(self.position)
 
     def sense(
         self,
@@ -200,157 +125,54 @@ class Drone:
             x_coords=x_coords,
             y_coords=y_coords,
         )
-
-        # --------------------------------------------------------------
-        # Invalid / empty measurement
-        # --------------------------------------------------------------
-
         if measurement is None:
             self._clear_sensing_state()
             return self.last_edge_points
 
-        # --------------------------------------------------------------
-        # Structured measurement
-        # --------------------------------------------------------------
-
-        if hasattr(
-            measurement,
-            "edge_points",
-        ):
-            edge_points = np.asarray(
-                measurement.edge_points,
-                dtype=float,
-            )
-
-            oil_fraction = getattr(
-                measurement,
-                "oil_fraction",
-                None,
-            )
-
-        # --------------------------------------------------------------
-        # Backward compatibility with raw camera output
-        # --------------------------------------------------------------
-
+        if hasattr(measurement, "edge_points"):
+            edge_points = np.asarray(measurement.edge_points, dtype=float)
+            oil_fraction = getattr(measurement, "oil_fraction", None)
         else:
-            edge_points = np.empty(
-                (0, 2),
-                dtype=float,
-            )
-
+            edge_points = np.empty((0, 2), dtype=float)
             oil_fraction = None
-
-        # --------------------------------------------------------------
-        # No edge detected
-        # --------------------------------------------------------------
 
         if edge_points.size == 0:
             self._clear_sensing_state()
-
             self.last_oil_fraction = oil_fraction
-
             return self.last_edge_points
 
-        # --------------------------------------------------------------
-        # Store edge information
-        # --------------------------------------------------------------
-
-        edge_points = edge_points.reshape(
-            -1,
-            2,
-        )
+        edge_points = edge_points.reshape(-1, 2)
 
         self.edge_detected = True
+        self.last_edge_points = edge_points.copy()
+        self.last_nls_points = edge_points.copy()
+        self.last_edge_count = int(edge_points.shape[0])
+        self.last_oil_fraction = oil_fraction
 
-        self.last_edge_points = (
-            edge_points.copy()
-        )
-
-        self.last_nls_points = (
-            edge_points.copy()
-        )
-
-        self.last_edge_count = int(
-            edge_points.shape[0]
-        )
-
-        self.last_oil_fraction = (
-            oil_fraction
-        )
-
-        # --------------------------------------------------------------
-        # Boundary anchor
-        # --------------------------------------------------------------
-
-        current_anchor = np.mean(
-            edge_points,
-            axis=0,
-        )
+        current_anchor = np.mean(edge_points, axis=0)
 
         if self.last_boundary_anchor_point is None:
-
-            self.last_boundary_anchor_point = (
-                current_anchor
-            )
-
+            self.last_boundary_anchor_point = current_anchor
         else:
-
-            previous_anchor = np.asarray(
-                self.last_boundary_anchor_point,
-                dtype=float,
-            )
-
+            previous_anchor = np.asarray(self.last_boundary_anchor_point, dtype=float)
             self.last_boundary_anchor_point = (
-                0.8 * previous_anchor
-                + 0.2 * current_anchor
+                0.8 * previous_anchor + 0.2 * current_anchor
             )
 
-        # --------------------------------------------------------------
-        # Nearest detected edge
-        # --------------------------------------------------------------
-
-        distances = np.linalg.norm(
-            edge_points - self.position,
-            axis=1,
-        )
-
-        nearest_idx = int(
-            np.argmin(distances)
-        )
-
-        nearest_point = edge_points[
-            nearest_idx
-        ]
-
-        self.last_edge_point = (
-            float(nearest_point[0]),
-            float(nearest_point[1]),
-        )
+        distances = np.linalg.norm(edge_points - self.position, axis=1)
+        nearest_idx = int(np.argmin(distances))
+        nearest_point = edge_points[nearest_idx]
+        self.last_edge_point = (float(nearest_point[0]), float(nearest_point[1]))
 
         return self.last_edge_points
 
     def _clear_sensing_state(self):
         """Clear transient sensing information."""
-
         self.edge_detected = False
-
-        self.last_edge_points = np.empty(
-            (0, 2),
-            dtype=float,
-        )
-
-        self.last_nls_points = np.empty(
-            (0, 2),
-            dtype=float,
-        )
-
+        self.last_edge_points = np.empty((0, 2), dtype=float)
+        self.last_nls_points = np.empty((0, 2), dtype=float)
         self.last_edge_count = 0
-
         self.last_edge_point = None
-
-    # ==================================================================
-    # OCCUPANCY GRID
-    # ==================================================================
 
     def update_grid(
         self,
@@ -370,66 +192,29 @@ class Drone:
         if edge_points is None:
             return 0
 
-        points = np.asarray(
-            edge_points,
-            dtype=float,
-        )
+        points = np.asarray(edge_points, dtype=float)
 
         if points.size == 0:
             return 0
 
-        points = points.reshape(
-            -1,
-            2,
-        )
-
-        measurement_grid = np.zeros_like(
-            self.grid
-        )
-
+        points = points.reshape(-1, 2)
+        measurement_grid = np.zeros_like(self.grid)
         valid_updates = 0
 
         for x, y in points:
+            ix = int((x - x_min) / resolution)
+            iy = int((y - y_min) / resolution)
 
-            ix = int(
-                (x - x_min) / resolution
-            )
-
-            iy = int(
-                (y - y_min) / resolution
-            )
-
-            if (
-                0 <= ix < self.Nx
-                and 0 <= iy < self.Ny
-            ):
-                measurement_grid[
-                    ix,
-                    iy,
-                ] += 1.0
-
+            if 0 <= ix < self.Nx and 0 <= iy < self.Ny:
+                measurement_grid[ix, iy] += 1.0
                 valid_updates += 1
 
         if valid_updates == 0:
             return 0
 
-        # --------------------------------------------------------------
-        # Binary occupancy update: a cell becomes occupied if it has been seen
-        # at least once; no temporal fusion / alpha blending is used.
-        # --------------------------------------------------------------
-
-        self.grid = np.maximum(
-            self.grid,
-            measurement_grid,
-        )
-
-        self.grid = (self.grid > 0.0).astype(float)
+        self.grid = (np.maximum(self.grid, measurement_grid) > 0.0).astype(float)
 
         return valid_updates
-
-    # ==================================================================
-    # LOCAL CONSENSUS
-    # ==================================================================
 
     def consensus_step(
         self,
@@ -457,40 +242,24 @@ class Drone:
         if own_grid is None:
             base_grid = self.grid
         else:
-            base_grid = np.asarray(
-                own_grid,
-                dtype=float,
-            )
+            base_grid = np.asarray(own_grid, dtype=float)
 
-        grids = [
-            np.asarray(base_grid, dtype=float)
-        ]
+        grids = [np.asarray(base_grid, dtype=float)]
 
         for message in neighbor_messages:
             grid = message.get("grid")
             if grid is None:
                 continue
 
-            grids.append(
-                np.asarray(
-                    grid,
-                    dtype=float,
-                )
-            )
+            grids.append(np.asarray(grid, dtype=float))
 
         if len(grids) == 1:
             self.grid = (base_grid > 0.0).astype(float)
             return self.grid
 
-        self.grid = (
-            np.maximum.reduce(grids) > 0.0
-        ).astype(float)
+        self.grid = (np.maximum.reduce(grids) > 0.0).astype(float)
 
         return self.grid
-
-    # ==================================================================
-    # DYNAMICS
-    # ==================================================================
 
     def action(
         self,
@@ -522,113 +291,40 @@ class Drone:
             Actual clipped command applied to the drone.
         """
 
-        command = np.asarray(
-            command,
-            dtype=float,
-        )
+        command = np.asarray(command, dtype=float)
 
-        if (
-            command.shape != (2,)
-            or not np.all(
-                np.isfinite(command)
-            )
-        ):
-            command = np.zeros(
-                2,
-                dtype=float,
-            )
+        if command.shape != (2,) or not np.all(np.isfinite(command)):
+            command = np.zeros(2, dtype=float)
 
-        command = self._clip_command(
-            command,
-            self.max_speed,
-        )
+        command = self._clip_command(command, self.max_speed)
 
-        self.last_control_vector = (
-            command.copy()
-        )
-
-        # --------------------------------------------------------------
-        # Integrate motion
-        # --------------------------------------------------------------
-
-        self.x += (
-            command[0] * float(dt)
-        )
-
-        self.y += (
-            command[1] * float(dt)
-        )
-
-        # --------------------------------------------------------------
-        # Boundary handling
-        # --------------------------------------------------------------
+        self.last_control_vector = command.copy()
+        self.x += command[0] * float(dt)
+        self.y += command[1] * float(dt)
 
         if bounds is None:
-
-            x_bounds = (
-                self.x_min,
-                self.x_max,
-            )
-
-            y_bounds = (
-                self.y_min,
-                self.y_max,
-            )
-
+            x_bounds = (self.x_min, self.x_max)
+            y_bounds = (self.y_min, self.y_max)
         else:
-
             x_bounds, y_bounds = bounds
 
-        self.x = float(
-            np.clip(
-                self.x,
-                x_bounds[0],
-                x_bounds[1],
-            )
-        )
-
-        self.y = float(
-            np.clip(
-                self.y,
-                y_bounds[0],
-                y_bounds[1],
-            )
-        )
+        self.x = float(np.clip(self.x, x_bounds[0], x_bounds[1]))
+        self.y = float(np.clip(self.y, y_bounds[0], y_bounds[1]))
 
         return command
-
-    # ==================================================================
-    # CONTROL STATE
-    # ==================================================================
 
     def set_control_mode(self, mode):
         """
         Store the control mode selected by the onboard controller.
         """
-        self.last_control_mode = str(
-            mode
-        )
-
-    # ==================================================================
-    # UTILITIES
-    # ==================================================================
+        self.last_control_mode = str(mode)
 
     @staticmethod
     def _random_unit_direction():
         """Generate a random normalized 2D direction."""
 
-        angle = np.random.uniform(
-            0.0,
-            2.0 * np.pi,
-        )
-
-        return np.array(
-            [
-                np.cos(angle),
-                np.sin(angle),
-            ],
-            dtype=float,
-        )
+        angle = np.random.uniform(0.0, 2.0 * np.pi)
+        return np.array([np.cos(angle), np.sin(angle)], dtype=float)
 
     @staticmethod
     def _clip_command(
@@ -637,40 +333,17 @@ class Drone:
     ):
         """Limit the magnitude of a 2D command."""
 
-        vec = np.asarray(
-            command,
-            dtype=float,
-        )
+        vec = np.asarray(command, dtype=float)
 
-        if (
-            vec.shape != (2,)
-            or not np.all(
-                np.isfinite(vec)
-            )
-        ):
-            return np.zeros(
-                2,
-                dtype=float,
-            )
+        if vec.shape != (2,) or not np.all(np.isfinite(vec)):
+            return np.zeros(2, dtype=float)
 
-        speed = float(
-            np.linalg.norm(vec)
-        )
+        speed = float(np.linalg.norm(vec))
 
         if speed <= 1e-12:
-            return np.zeros(
-                2,
-                dtype=float,
-            )
+            return np.zeros(2, dtype=float)
 
         if speed > max_speed:
-
-            vec = (
-                vec
-                * (
-                    max_speed
-                    / speed
-                )
-            )
+            vec = vec * (max_speed / speed)
 
         return vec

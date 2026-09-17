@@ -29,20 +29,12 @@ class Visualizer:
 
         self.communication_radius = communication_radius
         self.show_communication_radius = (
-            show_communication_radius
-            and communication_radius is not None
+            show_communication_radius and communication_radius is not None
         )
 
         self.show_nls_points = show_nls_points
 
-        # ------------------------------------------------------------------
-        # Figure
-        # ------------------------------------------------------------------
-
-        self.fig, self.ax = plt.subplots(
-            figsize=(10, 8)
-        )
-
+        self.fig, self.ax = plt.subplots(figsize=(10, 8))
         self.ax.set_xlim(sim_map.xlim)
         self.ax.set_ylim(sim_map.ylim)
         self.ax.set_aspect("equal")
@@ -53,24 +45,14 @@ class Visualizer:
                 f"Communication radius Rc={communication_radius:.2f}"
             )
         else:
-            self.ax.set_title(
-                "Distributed Occupancy Grid Mapping - "
-                "Fully Connected"
-            )
-
-        # ------------------------------------------------------------------
+            self.ax.set_title("Distributed Occupancy Grid Mapping - " "Fully Connected")
         # Initial environment
-        # ------------------------------------------------------------------
 
         self.img = None
         self.contour = None
 
         if self.oil_spill is not None:
             self._draw_environment()
-
-        # ------------------------------------------------------------------
-        # Dynamic artists
-        # ------------------------------------------------------------------
 
         self.drone_patches = {}
         self.texts = {}
@@ -80,10 +62,6 @@ class Visualizer:
 
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
-
-    # ======================================================================
-    # ENVIRONMENT
-    # ======================================================================
 
     def _draw_environment(self):
         """
@@ -129,18 +107,12 @@ class Visualizer:
         if world_field is None:
             return
 
-        world_field = np.asarray(
-            world_field,
-            dtype=float,
-        )
+        world_field = np.asarray(world_field, dtype=float)
 
         if self.img is None:
             self.img = self.ax.imshow(
                 world_field.T,
-                extent=[
-                    *self.sim_map.xlim,
-                    *self.sim_map.ylim,
-                ],
+                extent=[*self.sim_map.xlim, *self.sim_map.ylim],
                 origin="lower",
                 cmap="Greys",
                 alpha=0.8,
@@ -150,10 +122,6 @@ class Visualizer:
             return
 
         self.img.set_data(world_field.T)
-
-    # ======================================================================
-    # DRONES
-    # ======================================================================
 
     def _remove_drone_artists(self, drone_id):
         """
@@ -203,10 +171,6 @@ class Visualizer:
 
         patches = []
 
-        # ------------------------------------------------------------------
-        # Communication radius
-        # ------------------------------------------------------------------
-
         if self.show_communication_radius:
             comm_circle = Circle(
                 (drone.x, drone.y),
@@ -221,11 +185,6 @@ class Visualizer:
 
             self.ax.add_patch(comm_circle)
             patches.append(comm_circle)
-
-        # ------------------------------------------------------------------
-        # Drone body
-        # ------------------------------------------------------------------
-
         body = RegularPolygon(
             (drone.x, drone.y),
             numVertices=6,
@@ -236,19 +195,10 @@ class Visualizer:
 
         self.ax.add_patch(body)
         patches.append(body)
-
-        # ------------------------------------------------------------------
-        # Camera footprint
-        # ------------------------------------------------------------------
-
         dx = self.sim_map.dx
         dy = self.sim_map.dy
 
-        sensor_size = getattr(
-            drone.camera,
-            "size",
-            1,
-        )
+        sensor_size = getattr(drone.camera, "size", 1)
 
         sensor_width = sensor_size * dx
         sensor_height = sensor_size * dy
@@ -269,11 +219,6 @@ class Visualizer:
 
         self.ax.add_patch(sensor_box)
         patches.append(sensor_box)
-
-        # ------------------------------------------------------------------
-        # Label
-        # ------------------------------------------------------------------
-
         label = self.ax.text(
             drone.x + 0.2,
             drone.y + 0.2,
@@ -285,10 +230,6 @@ class Visualizer:
         self.drone_patches[drone_id] = patches
         self.texts[drone_id] = label
 
-        # ------------------------------------------------------------------
-        # Edge detection
-        # ------------------------------------------------------------------
-
         edge_marker = None
         edge_label = None
 
@@ -296,10 +237,7 @@ class Visualizer:
             getattr(drone, "edge_detected", False)
             and getattr(drone, "last_edge_point", None) is not None
         ):
-            edge_point = np.asarray(
-                drone.last_edge_point,
-                dtype=float,
-            )
+            edge_point = np.asarray(drone.last_edge_point, dtype=float)
 
             edge_marker = self.ax.scatter(
                 [edge_point[0]],
@@ -312,25 +250,13 @@ class Visualizer:
                 zorder=6,
             )
 
-            oil_fraction = getattr(
-                drone,
-                "last_oil_fraction",
-                None,
-            )
-
-            edge_count = getattr(
-                drone,
-                "last_edge_count",
-                0,
-            )
+            oil_fraction = getattr(drone, "last_oil_fraction", None)
+            edge_count = getattr(drone, "last_edge_count", 0)
 
             if oil_fraction is None:
                 annotation = f"n={edge_count}"
             else:
-                annotation = (
-                    f"n={edge_count}\n"
-                    f"{100.0 * oil_fraction:.1f}% oil"
-                )
+                annotation = f"n={edge_count}\n{100.0 * oil_fraction:.1f}% oil"
 
             edge_label = self.ax.text(
                 edge_point[0] + 0.12,
@@ -341,29 +267,15 @@ class Visualizer:
                 zorder=7,
             )
 
-        self.edge_markers[drone_id] = [
-            edge_marker,
-            edge_label,
-        ]
-
-        # ------------------------------------------------------------------
-        # NLS points
-        # ------------------------------------------------------------------
+        self.edge_markers[drone_id] = [edge_marker, edge_label]
 
         nls_marker = None
 
         if self.show_nls_points:
-            points = getattr(
-                drone,
-                "last_nls_points",
-                None,
-            )
+            points = getattr(drone, "last_nls_points", None)
 
             if points is not None:
-                points = np.asarray(
-                    points,
-                    dtype=float,
-                )
+                points = np.asarray(points, dtype=float)
 
                 if points.ndim == 2 and points.shape[0] > 0:
                     nls_marker = self.ax.scatter(
@@ -377,10 +289,6 @@ class Visualizer:
 
         self.nls_markers[drone_id] = nls_marker
 
-        # ------------------------------------------------------------------
-        # Control vector
-        # ------------------------------------------------------------------
-
         control_vec = np.asarray(
             getattr(
                 drone,
@@ -391,14 +299,9 @@ class Visualizer:
         )
 
         if control_vec.shape != (2,):
-            control_vec = np.zeros(
-                2,
-                dtype=float,
-            )
+            control_vec = np.zeros(2, dtype=float)
 
-        control_norm = float(
-            np.linalg.norm(control_vec)
-        )
+        control_norm = float(np.linalg.norm(control_vec))
 
         control_arrow = None
 
@@ -407,9 +310,7 @@ class Visualizer:
             display_vec = control_vec.copy()
 
             if control_norm > 0.12:
-                display_vec *= (
-                    0.12 / control_norm
-                )
+                display_vec *= 0.12 / control_norm
 
             control_arrow = self.ax.quiver(
                 drone.x,
@@ -425,9 +326,7 @@ class Visualizer:
                 zorder=8,
             )
 
-        self.control_arrows[drone_id] = (
-            control_arrow
-        )
+        self.control_arrows[drone_id] = control_arrow
 
     def _ensure_output_dir(self, directory="./tmp_output"):
         """Create a target directory for PNG exports and return its absolute path."""
@@ -439,7 +338,28 @@ class Visualizer:
         """Build an output path under the requested directory."""
         return os.path.join(self._ensure_output_dir(directory), filename)
 
-    def save_final_state(self, filename="final_simulation_state.png", directory="./tmp_output"):
+    def _save_grid_plot(self, grid, title, output_path, alpha=1.0):
+        binary_grid = (np.asarray(grid, dtype=float) >= 0.5).astype(float)
+        fig, ax = plt.subplots(figsize=(8, 7))
+        im = ax.imshow(
+            binary_grid.T,
+            origin="lower",
+            cmap="Greys",
+            alpha=float(alpha),
+            vmin=0.0,
+            vmax=1.0,
+        )
+        ax.set_title(title)
+        ax.set_xlabel("Grid X")
+        ax.set_ylabel("Grid Y")
+        fig.colorbar(im, ax=ax)
+        fig.tight_layout()
+        fig.savefig(output_path, bbox_inches="tight", facecolor="white", transparent=False)
+        plt.close(fig)
+
+    def save_final_state(
+        self, filename="final_simulation_state.png", directory="./tmp_output"
+    ):
         """Salva lo stato visivo finale della simulazione."""
         output_path = self._output_path(filename, directory)
         self.fig.savefig(output_path, bbox_inches="tight")
@@ -463,38 +383,22 @@ class Visualizer:
             if grid.size == 0:
                 continue
 
-            binary_grid = (grid >= 0.5).astype(float)
-            fig, ax = plt.subplots(figsize=(8, 7))
-            im = ax.imshow(
-                binary_grid.T,
-                origin="lower",
-                cmap="Greys",
-                alpha=float(alpha),
-                vmin=0.0,
-                vmax=1.0,
-            )
-
-            ax.set_title(f"Final Occupancy Grid - Drone {drone.drone_id}")
-            ax.set_xlabel("Grid X")
-            ax.set_ylabel("Grid Y")
-            fig.colorbar(im, ax=ax)
-            fig.tight_layout()
-
             output_path = os.path.join(
                 output_dir,
                 f"{filename_prefix}_{drone.drone_id}.png",
             )
-            fig.savefig(
+            self._save_grid_plot(
+                grid,
+                f"Final Occupancy Grid - Drone {drone.drone_id}",
                 output_path,
-                bbox_inches="tight",
-                facecolor="white",
-                transparent=False,
+                alpha=alpha,
             )
-            plt.close(fig)
 
         print(f"Per-drone final occupancy grids saved to {output_dir}.")
 
-    def plot_consensus_convergence(self, engine, filename="consensus_convergence.png", directory="./tmp_output"):
+    def plot_consensus_convergence(
+        self, engine, filename="consensus_convergence.png", directory="./tmp_output"
+    ):
         """Genera e salva il grafico della convergenza del consenso."""
         error_history = np.asarray(engine.error_history, dtype=float)
         measurement_history = engine.measurement_consensus_history
@@ -502,9 +406,7 @@ class Visualizer:
         fig, ax = plt.subplots(figsize=(12, 5))
 
         if measurement_history:
-            color_cycle = plt.cm.tab10(
-                np.linspace(0, 1, max(1, len(engine.drones)))
-            )
+            color_cycle = plt.cm.tab10(np.linspace(0, 1, max(1, len(engine.drones))))
 
             for measure_idx, cycle_trace in enumerate(measurement_history, start=1):
                 cycle_length = len(next(iter(cycle_trace.values())))
@@ -558,32 +460,9 @@ class Visualizer:
         alpha=1.0,
     ):
         """Genera e salva la griglia di occupazione finale unificata."""
-        binary_grid = (np.asarray(final_grid, dtype=float) >= 0.5).astype(float)
-
-        fig, ax = plt.subplots(figsize=(8, 7))
-        im = ax.imshow(
-            binary_grid.T,
-            origin="lower",
-            cmap="Greys",
-            alpha=float(alpha),
-            vmin=0.0,
-            vmax=1.0,
-        )
-
-        ax.set_title("Final Occupancy Grid")
-        ax.set_xlabel("Grid X")
-        ax.set_ylabel("Grid Y")
-        fig.colorbar(im, ax=ax)
-
-        fig.tight_layout()
         output_path = self._output_path(filename, directory)
-        fig.savefig(output_path, bbox_inches="tight", facecolor="white", transparent=False)
-        plt.close(fig)
+        self._save_grid_plot(final_grid, "Final Occupancy Grid", output_path, alpha=alpha)
         print(f"Final occupancy grid saved to {output_path}.")
-
-    # ======================================================================
-    # RENDER
-    # ======================================================================
 
     def render(self, simulation_data, pause=None):
         """
@@ -600,29 +479,19 @@ class Visualizer:
         if simulation_data is None:
             return
 
-        world_field = simulation_data.get(
-            "world_field"
-        )
+        world_field = simulation_data.get("world_field")
 
-        drones = simulation_data.get(
-            "drones",
-            [],
-        )
+        drones = simulation_data.get("drones", [])
 
-        # Update environment first.
         if world_field is not None:
-            self.update_environment(
-                world_field
-            )
+            self.update_environment(world_field)
 
-        # Update drones.
         for drone in drones:
             self.update_drone(drone)
 
         self.fig.canvas.draw_idle()
         self.fig.canvas.flush_events()
 
-        # Se viene passato un valore numerico per la pausa, usalo, altrimenti usa il default
         pause_time = pause if isinstance(pause, (int, float)) else 0.001
         if pause is not False:
             plt.pause(pause_time)

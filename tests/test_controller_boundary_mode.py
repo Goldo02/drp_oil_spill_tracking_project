@@ -47,7 +47,12 @@ def test_compute_actions_uses_local_grid_not_edge_flag():
     )
 
     assert drone.last_control_mode == "boundary_tracking"
-    assert np.linalg.norm(controller.compute_action(drone, world_field, x_coords, y_coords)) > 0.0
+    assert (
+        np.linalg.norm(
+            controller.compute_action(drone, world_field, x_coords, y_coords)
+        )
+        > 0.0
+    )
 
 
 def test_compute_actions_tracks_occupied_target_in_consensus_grid():

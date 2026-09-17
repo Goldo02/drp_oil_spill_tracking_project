@@ -20,50 +20,23 @@ class DroneController:
         resolution=0.1,
     ):
         self.sim_map = sim_map
+        self.communication_radius = float(communication_radius)
+        self.fully_connected = bool(fully_connected)
+        self.occupancy_threshold = float(occupancy_threshold)
+        self.resolution = float(resolution)
 
-        self.communication_radius = float(
-            communication_radius
-        )
-
-        self.fully_connected = bool(
-            fully_connected
-        )
-
-        self.occupancy_threshold = float(
-            occupancy_threshold
-        )
-
-        self.resolution = float(
-            resolution
-        )
-
-        # Motion parameters.
         self.max_speed = 0.12
         self.exploration_speed = 0.08
-
         self.k_t = 1.0
         self.k_n = 1.5
-
         self.boundary_lock_gain = 3.0
-
-    # ==================================================================
-    # VECTOR UTILITIES
-    # ==================================================================
 
     @staticmethod
     def _normalize(vector):
-        vector = np.asarray(
-            vector,
-            dtype=float,
-        )
-
-        norm = float(
-            np.linalg.norm(vector)
-        )
-
+        vector = np.asarray(vector, dtype=float)
+        norm = float(np.linalg.norm(vector))
         if norm <= 1e-12:
             return None
-
         return vector / norm
 
     def _clip_action(
@@ -74,48 +47,21 @@ class DroneController:
         if max_speed is None:
             max_speed = self.max_speed
 
-        action = np.asarray(
-            action,
-            dtype=float,
-        )
-
-        speed = float(
-            np.linalg.norm(action)
-        )
+        action = np.asarray(action, dtype=float)
+        speed = float(np.linalg.norm(action))
 
         if speed <= 1e-12:
-            return np.zeros(
-                2,
-                dtype=float,
-            )
+            return np.zeros(2, dtype=float)
 
         if speed > max_speed:
-            action = (
-                action
-                * max_speed
-                / speed
-            )
+            action = action * max_speed / speed
 
         return action
 
     @staticmethod
     def _random_direction():
-        angle = np.random.uniform(
-            0.0,
-            2.0 * np.pi,
-        )
-
-        return np.array(
-            [
-                np.cos(angle),
-                np.sin(angle),
-            ],
-            dtype=float,
-        )
-
-    # ==================================================================
-    # FIELD INTERPOLATION
-    # ==================================================================
+        angle = np.random.uniform(0.0, 2.0 * np.pi)
+        return np.array([np.cos(angle), np.sin(angle)], dtype=float)
 
     def _interpolate_field(
         self,
@@ -126,94 +72,25 @@ class DroneController:
     ):
         """Bilinearly interpolate the world field."""
 
-        position = np.asarray(
-            position,
-            dtype=float,
-        )
-
-        x = float(
-            np.clip(
-                position[0],
-                x_coords[0],
-                x_coords[-1],
-            )
-        )
-
-        y = float(
-            np.clip(
-                position[1],
-                y_coords[0],
-                y_coords[-1],
-            )
-        )
-
-        i1 = int(
-            np.searchsorted(
-                x_coords,
-                x,
-                side="right",
-            )
-        )
-
-        j1 = int(
-            np.searchsorted(
-                y_coords,
-                y,
-                side="right",
-            )
-        )
-
-        i0 = max(
-            0,
-            min(
-                i1 - 1,
-                len(x_coords) - 1,
-            ),
-        )
-
-        j0 = max(
-            0,
-            min(
-                j1 - 1,
-                len(y_coords) - 1,
-            ),
-        )
-
-        i1 = max(
-            0,
-            min(
-                i1,
-                len(x_coords) - 1,
-            ),
-        )
-
-        j1 = max(
-            0,
-            min(
-                j1,
-                len(y_coords) - 1,
-            ),
-        )
+        position = np.asarray(position, dtype=float)
+        x = float(np.clip(position[0], x_coords[0], x_coords[-1]))
+        y = float(np.clip(position[1], y_coords[0], y_coords[-1]))
+        i1 = int(np.searchsorted(x_coords, x, side="right"))
+        j1 = int(np.searchsorted(y_coords, y, side="right"))
+        i0 = max(0, min(i1 - 1, len(x_coords) - 1))
+        j0 = max(0, min(j1 - 1, len(y_coords) - 1))
+        i1 = max(0, min(i1, len(x_coords) - 1))
+        j1 = max(0, min(j1, len(y_coords) - 1))
 
         if i0 == i1:
             wx = 0.0
         else:
-            wx = (
-                x - x_coords[i0]
-            ) / (
-                x_coords[i1]
-                - x_coords[i0]
-            )
+            wx = (x - x_coords[i0]) / (x_coords[i1] - x_coords[i0])
 
         if j0 == j1:
             wy = 0.0
         else:
-            wy = (
-                y - y_coords[j0]
-            ) / (
-                y_coords[j1]
-                - y_coords[j0]
-            )
+            wy = (y - y_coords[j0]) / (y_coords[j1] - y_coords[j0])
 
         q00 = world_field[i0, j0]
         q10 = world_field[i1, j0]
@@ -236,30 +113,9 @@ class DroneController:
     ):
         """Estimate the local field gradient."""
 
-        dx = max(
-            abs(
-                float(
-                    x_coords[1]
-                    - x_coords[0]
-                )
-            ),
-            self.resolution,
-        )
-
-        dy = max(
-            abs(
-                float(
-                    y_coords[1]
-                    - y_coords[0]
-                )
-            ),
-            self.resolution,
-        )
-
-        position = np.asarray(
-            position,
-            dtype=float,
-        )
+        dx = max(abs(float(x_coords[1] - x_coords[0])), self.resolution)
+        dy = max(abs(float(y_coords[1] - y_coords[0])), self.resolution)
+        position = np.asarray(position, dtype=float)
 
         x_plus = self._interpolate_field(
             world_field,
@@ -291,60 +147,32 @@ class DroneController:
 
         return np.array(
             [
-                (x_plus - x_minus)
-                / (2.0 * dx),
-
-                (y_plus - y_minus)
-                / (2.0 * dy),
+                (x_plus - x_minus) / (2.0 * dx),
+                (y_plus - y_minus) / (2.0 * dy),
             ],
             dtype=float,
         )
 
-    # ==================================================================
-    # MOTION
-    # ==================================================================
-
     def _exploration_action(self, drone):
         """Random exploration with boundary bouncing."""
 
-        direction = getattr(
-            drone,
-            "exploration_direction",
-            None,
-        )
+        direction = getattr(drone, "exploration_direction", None)
 
         if direction is None:
             direction = self._random_direction()
 
-        direction = self._normalize(
-            direction
-        )
+        direction = self._normalize(direction)
 
         if direction is None:
             direction = self._random_direction()
 
-        next_x = (
-            drone.x
-            + direction[0]
-            * self.exploration_speed
-        )
+        next_x = drone.x + direction[0] * self.exploration_speed
+        next_y = drone.y + direction[1] * self.exploration_speed
 
-        next_y = (
-            drone.y
-            + direction[1]
-            * self.exploration_speed
-        )
-
-        if (
-            next_x < self.sim_map.xlim[0]
-            or next_x > self.sim_map.xlim[1]
-        ):
+        if next_x < self.sim_map.xlim[0] or next_x > self.sim_map.xlim[1]:
             direction[0] *= -1.0
 
-        if (
-            next_y < self.sim_map.ylim[0]
-            or next_y > self.sim_map.ylim[1]
-        ):
+        if next_y < self.sim_map.ylim[0] or next_y > self.sim_map.ylim[1]:
             direction[1] *= -1.0
 
         norm_dir = self._normalize(direction)
@@ -352,10 +180,7 @@ class DroneController:
             norm_dir = self._random_direction()
         drone.exploration_direction = norm_dir
 
-        return (
-            drone.exploration_direction
-            * self.exploration_speed
-        )
+        return drone.exploration_direction * self.exploration_speed
 
     def _boundary_tracking_action(
         self,
@@ -366,10 +191,7 @@ class DroneController:
     ):
         """Follow the concentration contour locally."""
 
-        position = np.array(
-            [drone.x, drone.y],
-            dtype=float,
-        )
+        position = np.array([drone.x, drone.y], dtype=float)
 
         concentration = self._interpolate_field(
             world_field,
@@ -385,54 +207,21 @@ class DroneController:
             y_coords,
         )
 
-        normal = self._normalize(
-            gradient
-        )
+        normal = self._normalize(gradient)
 
         if normal is None:
             return None
 
-        tangent = np.array(
-            [
-                -normal[1],
-                normal[0],
-            ],
-            dtype=float,
-        )
+        tangent = np.array([-normal[1], normal[0]], dtype=float)
 
-        tangent = self._normalize(
-            tangent
-        )
+        tangent = self._normalize(tangent)
 
         if tangent is None:
             return None
 
-        error = (
-            concentration
-            - self.occupancy_threshold
-        )
-
-        error = float(
-            np.clip(
-                error,
-                -1.0,
-                1.0,
-            )
-        )
-
-        normal_gain = (
-            self.k_n * error
-            + self.boundary_lock_gain * error
-        )
-
-        action = (
-            self.k_t * tangent
-            - normal_gain * normal
-        )
-
-        return self._clip_action(
-            action
-        )
+        error = float(np.clip(concentration - self.occupancy_threshold, -1.0, 1.0))
+        normal_gain = self.k_n * error + self.boundary_lock_gain * error
+        return self._clip_action(self.k_t * tangent - normal_gain * normal)
 
     def _grid_target(self, drone):
         """Return the nearest occupied cell in the consensus grid in world coordinates."""
@@ -456,21 +245,15 @@ class DroneController:
         if x_max <= x_min or y_max <= y_min:
             return None
 
-        occupied_points = []
-        for ix, iy in occupied:
-            x = x_min + (ix + 0.5) * self.resolution
-            y = y_min + (iy + 0.5) * self.resolution
-            occupied_points.append(np.array([x, y], dtype=float))
-
-        if not occupied_points:
-            return None
-
-        occupied_points = np.asarray(occupied_points, dtype=float)
+        occupied_points = np.column_stack(
+            (
+                x_min + (occupied[:, 0] + 0.5) * self.resolution,
+                y_min + (occupied[:, 1] + 0.5) * self.resolution,
+            )
+        ).astype(float)
         deltas = occupied_points - np.asarray([drone.x, drone.y], dtype=float)
         distances = np.linalg.norm(deltas, axis=1)
-        best_idx = int(np.argmin(distances))
-
-        return occupied_points[best_idx]
+        return occupied_points[int(np.argmin(distances))]
 
     def compute_action(
         self,
@@ -495,9 +278,7 @@ class DroneController:
         """
 
         target = self._grid_target(drone)
-        should_track_boundary = target is not None
-
-        if should_track_boundary:
+        if target is not None:
             drone.last_control_mode = "boundary_tracking"
 
             action = self._boundary_tracking_action(
