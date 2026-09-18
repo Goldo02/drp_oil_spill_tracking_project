@@ -170,13 +170,16 @@ def _print_run_header(
     )
 
 
-def _run_frames(engine, visualizer, visualize, max_frames):
+def _run_frames(engine, visualizer, visualize, max_frames, record_animation=False):
     try:
         for frame in range(max_frames):
             error = engine.step()
 
-            if visualize:
-                visualizer.render(engine.get_visualization_data())
+            if visualize or record_animation:
+                visualizer.render(
+                    engine.get_visualization_data(),
+                    pause=None if visualize else False,
+                )
 
             if frame % 50 == 0:
                 print(f"Frame {frame}/{max_frames} | disagreement error={error:.6f}")
@@ -184,7 +187,13 @@ def _run_frames(engine, visualizer, visualize, max_frames):
         print("Simulation interrupted by user.")
 
 
-def _save_outputs(engine, visualizer):
+def _save_outputs(
+    engine,
+    visualizer,
+    save_gif=True,
+    gif_filename="simulation_animation.gif",
+    gif_fps=10,
+):
     visualizer.render(engine.get_visualization_data(), pause=False)
     visualizer.save_final_state("final_simulation_state.png", directory=OUTPUT_DIR)
     visualizer.plot_consensus_convergence(
@@ -198,6 +207,12 @@ def _save_outputs(engine, visualizer):
         directory=OUTPUT_DIR,
         alpha=1.0,
     )
+    if save_gif:
+        visualizer.save_animation_as_gif(
+            gif_filename,
+            directory=OUTPUT_DIR,
+            fps=gif_fps,
+        )
     visualizer.save_final_occupancy_grid_per_robot(
         engine.drones,
         directory=OUTPUT_DIR,
@@ -329,6 +344,10 @@ def run_simulation(
     oil_mapping_output=OIL_MAPPING_DATA_PATH,
     closure_min_enclosed_false_cells=250,
     mapping_point_radius_cells=1,
+    save_gif=True,
+    gif_filename="simulation_animation.gif",
+    gif_fps=10,
+    gif_frame_stride=1,
 ):
     _set_random_seed(seed)
     plt = _configure_matplotlib(visualize)
@@ -370,6 +389,9 @@ def run_simulation(
     else:
         print("Visualization disabled. Headless mode (Agg backend).")
 
+    if save_gif:
+        visualizer.start_animation_recording(frame_stride=gif_frame_stride)
+
     _print_run_header(
         max_frames,
         oil_shape,
@@ -383,12 +405,24 @@ def run_simulation(
         fully_connected,
         communication_radius,
     )
-    _run_frames(engine, visualizer, visualize, max_frames)
+    _run_frames(
+        engine,
+        visualizer,
+        visualize,
+        max_frames,
+        record_animation=save_gif,
+    )
 
     engine.finalize_histories()
     print("Simulation finished.")
 
-    _save_outputs(engine, visualizer)
+    _save_outputs(
+        engine,
+        visualizer,
+        save_gif=save_gif,
+        gif_filename=gif_filename,
+        gif_fps=gif_fps,
+    )
     _save_oil_mapping(engine, sim_map, spill, oil_mapping_output)
     _print_final_diagnostics(engine)
 
@@ -453,6 +487,33 @@ def _build_parser():
         default=OIL_MAPPING_DATA_PATH,
         help="Path for exported (N, 2) oil boundary points.",
     )
+    parser.add_argument(
+        "--no-save-gif",
+        action="store_false",
+        dest="save_gif",
+        default=True,
+        help="Disable GIF recording and export.",
+    )
+    parser.add_argument(
+        "--gif-filename",
+        default="simulation_animation.gif",
+        help="Output GIF filename under tmp_output.",
+    )
+    parser.add_argument(
+        "--gif-fps",
+        type=float,
+        default=10.0,
+        help="Playback frame rate for the saved GIF.",
+    )
+    parser.add_argument(
+        "--gif-frame-stride",
+        type=int,
+        default=1,
+        help=(
+            "Capture one GIF frame every N rendered simulation frames. "
+            "Use values >1 to reduce file size."
+        ),
+    )
     return parser
 
 
@@ -479,6 +540,10 @@ def main():
         oil_mapping_output=args.oil_mapping_output,
         closure_min_enclosed_false_cells=args.closure_min_enclosed_false_cells,
         mapping_point_radius_cells=args.mapping_point_radius_cells,
+        save_gif=args.save_gif,
+        gif_filename=args.gif_filename,
+        gif_fps=args.gif_fps,
+        gif_frame_stride=args.gif_frame_stride,
     )
 
 

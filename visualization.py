@@ -72,6 +72,10 @@ class Visualizer:
         self.centroid_markers = {}
         self.voronoi_map_artists = []
         self.ring_color_map = {}
+        self.animation_frames = []
+        self.animation_recording_enabled = False
+        self.animation_frame_stride = 1
+        self.animation_render_count = 0
 
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
@@ -650,6 +654,108 @@ class Visualizer:
         """Build an output path under the requested directory."""
         return os.path.join(self._ensure_output_dir(directory), filename)
 
+    def start_animation_recording(self, frame_stride=1):
+        """
+        Enable frame capture for a later GIF export.
+
+        Parameters
+        ----------
+        frame_stride : int, optional
+            Capture one rendered frame every ``frame_stride`` calls to
+            :meth:`render`. A value of 1 records every rendered state.
+        """
+        self.animation_frames = []
+        self.animation_recording_enabled = True
+        self.animation_frame_stride = max(1, int(frame_stride))
+        self.animation_render_count = 0
+
+    def stop_animation_recording(self):
+        """Disable frame capture without discarding already captured frames."""
+        self.animation_recording_enabled = False
+
+    def clear_animation_frames(self):
+        """Discard all frames currently buffered for GIF export."""
+        self.animation_frames = []
+        self.animation_render_count = 0
+
+    def _capture_animation_frame(self):
+        """Store the current Matplotlib canvas as an RGB frame."""
+        if not self.animation_recording_enabled:
+            return
+
+        if self.animation_render_count % self.animation_frame_stride != 0:
+            self.animation_render_count += 1
+            return
+
+        self.fig.canvas.draw()
+        rgba = np.asarray(self.fig.canvas.buffer_rgba())
+        rgb = np.asarray(rgba[:, :, :3], dtype=np.uint8).copy()
+        self.animation_frames.append(rgb)
+        self.animation_render_count += 1
+
+    def save_animation_as_gif(
+        self,
+        filename="simulation_animation.gif",
+        directory="./tmp_output",
+        fps=10,
+        loop=0,
+    ):
+        """
+        Save the rendered simulation history as a GIF.
+
+        Frames are captured from calls to :meth:`render` after
+        :meth:`start_animation_recording` has been enabled. This keeps the
+        animation identical to the normal Matplotlib visualization, including
+        the map, drones, communication radii, occupancy side panel, and Voronoi
+        overlays.
+
+        Parameters
+        ----------
+        filename : str, optional
+            GIF file name.
+        directory : str, optional
+            Output directory.
+        fps : int or float, optional
+            Playback frame rate.
+        loop : int, optional
+            GIF loop count. ``0`` means loop forever.
+
+        Returns
+        -------
+        str
+            Absolute output path of the saved GIF.
+        """
+        if not self.animation_frames:
+            raise RuntimeError(
+                "No animation frames were recorded. Call "
+                "start_animation_recording() before rendering simulation frames."
+            )
+
+        try:
+            from PIL import Image
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError(
+                "Saving GIF animations requires Pillow. Install it with "
+                "`python3 -m pip install pillow`."
+            ) from exc
+
+        output_path = self._output_path(filename, directory)
+        duration_ms = int(round(1000.0 / max(float(fps), 1e-9)))
+        images = [Image.fromarray(frame) for frame in self.animation_frames]
+        images[0].save(
+            output_path,
+            save_all=True,
+            append_images=images[1:],
+            duration=duration_ms,
+            loop=int(loop),
+            optimize=False,
+        )
+        print(
+            f"Animation GIF saved to {output_path} "
+            f"({len(images)} frames, {float(fps):.2f} fps)."
+        )
+        return output_path
+
     def _save_grid_plot(self, grid, title, output_path, alpha=1.0):
         binary_grid = (np.asarray(grid, dtype=float) >= 0.5).astype(float)
         fig, ax = plt.subplots(figsize=(8, 7))
@@ -811,6 +917,7 @@ class Visualizer:
 
         self.fig.canvas.draw_idle()
         self.fig.canvas.flush_events()
+        self._capture_animation_frame()
 
         pause_time = pause if isinstance(pause, (int, float)) else 0.001
         if pause is not False:
