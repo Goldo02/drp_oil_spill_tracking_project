@@ -115,13 +115,21 @@ def _add_drones(engine, sim_map, num_drones):
         )
 
 
-def _build_visualizer(sim_map, spill, communication_radius, fully_connected, show_nls_points):
+def _build_visualizer(
+    sim_map,
+    spill,
+    communication_radius,
+    fully_connected,
+    show_nls_points,
+    show_2d_voronoi,
+):
     return Visualizer(
         sim_map=sim_map,
         oil_spill=spill,
         communication_radius=None if fully_connected else communication_radius,
         show_communication_radius=not fully_connected,
         show_nls_points=show_nls_points,
+        show_2d_voronoi=show_2d_voronoi,
     )
 
 
@@ -308,6 +316,7 @@ def run_simulation(
     communication_radius_cells=205,
     measure_every=3,
     show_nls_points=False,
+    show_2d_voronoi=False,
     polygon_vertices=36,
     polygon_r0=2.5,
     polygon_smoothness=0.2,
@@ -349,6 +358,7 @@ def run_simulation(
         communication_radius,
         fully_connected,
         show_nls_points,
+        show_2d_voronoi,
     )
 
     if visualize:
@@ -407,6 +417,14 @@ def _build_parser():
     parser.add_argument("--communication-radius-cells", type=int, default=250)
     parser.add_argument("--measure-every", type=int, default=3)
     parser.add_argument("--show-nls-points", action="store_true")
+    parser.add_argument(
+        "--show-2d-voronoi",
+        action="store_true",
+        help=(
+            "Color each drone's assigned Voronoi boundary arc directly on the "
+            "2D map during Lloyd control."
+        ),
+    )
     parser.add_argument("--dt", type=float, default=1.0, help="Simulation timestep.")
     parser.add_argument(
         "--closure-min-enclosed-false-cells",
@@ -437,6 +455,7 @@ def main():
         communication_radius_cells=args.communication_radius_cells,
         measure_every=args.measure_every,
         show_nls_points=args.show_nls_points,
+        show_2d_voronoi=args.show_2d_voronoi,
         polygon_vertices=args.polygon_vertices,
         polygon_r0=args.polygon_r0,
         polygon_smoothness=args.polygon_smoothness,
