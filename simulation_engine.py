@@ -3,6 +3,11 @@ import numpy as np
 from drone import Drone
 from controller import Controller, DroneController
 
+try:
+    import contourpy
+except ImportError:  # pragma: no cover
+    contourpy = None
+
 
 class SimulationEngine:
     """
@@ -38,6 +43,7 @@ class SimulationEngine:
         dt=1.0,
         verbose=True,
         closure_min_enclosed_false_cells=250,
+        mapping_point_radius_cells=1,
     ):
         self.sim_map = sim_map
         self.oil_spill = oil_spill
@@ -89,6 +95,7 @@ class SimulationEngine:
         )
         self.closure_min_boundary_cells = 24
         self.closure_min_enclosed_false_cells = int(closure_min_enclosed_false_cells)
+        self.mapping_point_radius_cells = max(0, int(mapping_point_radius_cells))
         self.last_closure_enclosed_false_cells = 0
 
     def _get_world_field(self):
@@ -149,6 +156,7 @@ class SimulationEngine:
                 y_min=self.y_min,
                 resolution=self.resolution,
                 alpha=None,
+                point_radius_cells=self.mapping_point_radius_cells,
             )
 
     def _get_neighbors(self, drone):
@@ -417,18 +425,35 @@ class SimulationEngine:
         if enclosed_false_cells < getattr(self, "closure_min_enclosed_false_cells", 0):
             return False, np.empty((0, 2), dtype=float)
 
-        contour_points = self._ordered_contour_points_from_grid(grid)
-        if contour_points.shape[0] >= self.closure_min_boundary_cells:
-            return True, contour_points
+        enclosed_contour = self._ordered_enclosed_contour_points_from_grid(grid)
+        if enclosed_contour.shape[0] >= self.closure_min_boundary_cells:
+            return True, enclosed_contour
 
         ordered_cells = self._order_loop_cells(visited, adjacency)
+        neighbor_counts = np.asarray(
+            [
+                sum(1 for neighbor in adjacency[cell] if neighbor in usable)
+                for cell in usable
+            ],
+            dtype=float,
+        )
+        if neighbor_counts.size and float(np.percentile(neighbor_counts, 90.0)) <= 4.0:
+            return True, self._cells_to_world_points(ordered_cells)
+
+        centerline_points = self._ordered_centerline_points_from_grid(grid)
+        if (
+            centerline_points.shape[0] >= self.closure_min_boundary_cells
+            and self._is_boundary_trace_continuous(centerline_points)
+        ):
+            return True, centerline_points
+
         return True, self._cells_to_world_points(ordered_cells)
 
-    def _count_enclosed_false_cells(self, grid):
+    def _enclosed_free_mask(self, grid):
         occupied = np.asarray(grid, dtype=float) > self.occupancy_threshold
         free = ~occupied
         if free.size == 0:
-            return 0
+            return np.zeros_like(free, dtype=bool)
 
         nx, ny = free.shape
         visited = np.zeros_like(free, dtype=bool)
@@ -464,26 +489,106 @@ class SimulationEngine:
                     stack.append((x2, y2))
 
         enclosed = free & ~visited
+        return enclosed
+
+    def _count_enclosed_false_cells(self, grid):
+        enclosed = self._enclosed_free_mask(grid)
         return int(np.count_nonzero(enclosed))
 
-    def _ordered_contour_points_from_grid(self, grid):
-        x_coords = self.x_min + (np.arange(self.grid_shape[0]) + 0.5) * self.resolution
-        y_coords = self.y_min + (np.arange(self.grid_shape[1]) + 0.5) * self.resolution
+    def _ordered_enclosed_contour_points_from_grid(self, grid):
+        if contourpy is None:
+            return np.empty((0, 2), dtype=float)
 
-        try:
-            points = self.boundary_controller.initialize_known_boundary(
-                np.asarray(grid, dtype=float),
-                x_coords=x_coords,
-                y_coords=y_coords,
-                force_closed=True,
+        enclosed = self._enclosed_free_mask(grid)
+        if np.count_nonzero(enclosed) < 1:
+            return np.empty((0, 2), dtype=float)
+
+        x_coords = self.x_min + (np.arange(enclosed.shape[0]) + 0.5) * self.resolution
+        y_coords = self.y_min + (np.arange(enclosed.shape[1]) + 0.5) * self.resolution
+
+        generator = contourpy.contour_generator(
+            x=x_coords,
+            y=y_coords,
+            z=enclosed.astype(float).T,
+            name="serial",
+        )
+        lines = generator.lines(0.5)
+        if not lines:
+            return np.empty((0, 2), dtype=float)
+
+        def path_length(line):
+            if len(line) < 2:
+                return 0.0
+            return float(np.sum(np.linalg.norm(np.diff(line, axis=0), axis=1)))
+
+        contour = np.asarray(max(lines, key=path_length), dtype=float)
+        if contour.ndim != 2 or contour.shape[1] != 2:
+            return np.empty((0, 2), dtype=float)
+        if len(contour) > 1 and np.linalg.norm(contour[0] - contour[-1]) < 1e-9:
+            contour = contour[:-1]
+
+        if not self._is_boundary_trace_continuous(contour):
+            return np.empty((0, 2), dtype=float)
+
+        return contour.copy()
+
+    def _ordered_centerline_points_from_grid(self, grid):
+        """Return a single ordered boundary centerline from occupied map cells."""
+        occupied_cells = np.argwhere(np.asarray(grid, dtype=float) > self.occupancy_threshold)
+        if occupied_cells.shape[0] < self.closure_min_boundary_cells:
+            return np.empty((0, 2), dtype=float)
+
+        points = self._cells_to_world_points([tuple(cell) for cell in occupied_cells])
+        center = np.mean(points, axis=0)
+        deltas = points - center.reshape(1, 2)
+        radii = np.linalg.norm(deltas, axis=1)
+        valid = radii > 1e-12
+        if np.count_nonzero(valid) < self.closure_min_boundary_cells:
+            return np.empty((0, 2), dtype=float)
+
+        points = points[valid]
+        angles = np.arctan2(points[:, 1] - center[1], points[:, 0] - center[0])
+        normalized = (angles + 2.0 * np.pi) % (2.0 * np.pi)
+
+        # Several sensor hits can occupy a small radial band at the same angle.
+        # Averaging per angular bin collapses that band to one centerline sample,
+        # avoiding the inner/outer double-contour produced by contour extraction.
+        bin_count = int(
+            np.clip(
+                occupied_cells.shape[0] // 2,
+                self.closure_min_boundary_cells,
+                720,
             )
-        except Exception:
+        )
+        bin_ids = np.floor(normalized / (2.0 * np.pi) * bin_count).astype(int)
+        bin_ids = np.clip(bin_ids, 0, bin_count - 1)
+
+        centerline = []
+        centerline_angles = []
+        for bin_id in range(bin_count):
+            mask = bin_ids == bin_id
+            if not np.any(mask):
+                continue
+            centerline.append(np.mean(points[mask], axis=0))
+            centerline_angles.append(float(np.mean(normalized[mask])))
+
+        if len(centerline) < self.closure_min_boundary_cells:
             return np.empty((0, 2), dtype=float)
 
+        order = np.argsort(centerline_angles)
+        return np.asarray(centerline, dtype=float)[order].copy()
+
+    def _is_boundary_trace_continuous(self, points):
         points = np.asarray(points, dtype=float)
-        if points.ndim != 2 or points.shape[1] != 2:
-            return np.empty((0, 2), dtype=float)
-        return points.copy()
+        if points.ndim != 2 or points.shape[0] < 2:
+            return False
+
+        segment_lengths = np.linalg.norm(
+            np.roll(points, -1, axis=0) - points,
+            axis=1,
+        )
+        max_expected_step = 3.0 * float(self.resolution)
+        return bool(np.max(segment_lengths) <= max_expected_step)
 
     def _order_loop_cells(self, cells, adjacency):
         cells = set(cells)
@@ -493,35 +598,31 @@ class SimulationEngine:
         start = min(cells)
         order = [start]
         visited = {start}
-        previous = None
-        current = start
+        stack = [start]
 
-        while len(visited) < len(cells):
+        while len(visited) < len(cells) and stack:
+            current = stack[-1]
+            previous = stack[-2] if len(stack) > 1 else None
             candidates = [
                 neighbor
                 for neighbor in adjacency.get(current, [])
-                if neighbor in cells and neighbor != previous
+                if neighbor in cells and neighbor not in visited
             ]
-            unvisited = [neighbor for neighbor in candidates if neighbor not in visited]
 
-            if not unvisited:
-                break
+            if candidates:
+                next_cell = self._choose_next_loop_cell(previous, current, candidates)
+                stack.append(next_cell)
+                order.append(next_cell)
+                visited.add(next_cell)
+                continue
 
-            next_cell = self._choose_next_loop_cell(previous, current, unvisited)
-            previous, current = current, next_cell
-            order.append(current)
-            visited.add(current)
+            stack.pop()
+            if stack:
+                order.append(stack[-1])
 
-        while len(visited) < len(cells):
-            current_arr = np.asarray(current, dtype=float)
-            remaining = [cell for cell in cells if cell not in visited]
-            next_cell = min(
-                remaining,
-                key=lambda cell: float(np.linalg.norm(np.asarray(cell, dtype=float) - current_arr)),
-            )
-            previous, current = current, next_cell
-            order.append(current)
-            visited.add(current)
+        while len(stack) > 1:
+            stack.pop()
+            order.append(stack[-1])
 
         return order
 

@@ -1,5 +1,152 @@
 # Oil Spill Tracking — Drone Simulation
 
+## AGGIORNAMENTO TECNICO: CORREZIONE DEL BORDO VORONOI 2D
+
+Questa sezione documenta le modifiche apportate per risolvere il problema osservato con il comando:
+
+```bash
+python3 main.py --visualize --seed 4 --frames 300 --num-drones 5 --show-2d-voronoi
+```
+
+Il sintomo visivo era una apparente duplicazione del bordo nella vista 2D della partizione Voronoi. Dopo l'analisi di `tmp_output/final_occupancy_grid.png`, il problema non risultava originato dalla occupancy grid finale: la mappa conteneva infatti una traccia singola e coerente del bordo. La causa era a valle della mappa, nella trasformazione:
+
+```text
+occupancy grid -> boundary points ordinati -> grafo 1D -> Voronoi/Lloyd -> overlay 2D
+```
+
+In particolare, la lista ordinata dei punti salvata in `tmp_output/oil_mapping_data.npy` conteneva segmenti anomali: alcuni punti consecutivi nella lista erano distanti fino a circa `0.61 m`, mentre il passo normale della griglia di mapping era `0.1 m`. Questo indicava che l'ordinamento del bordo stava collegando punti geometricamente vicini ma non topologicamente consecutivi lungo il perimetro. Il risultato visivo era un overlay Voronoi con segmenti spurii, interpretabili come "doppio bordo".
+
+### Modifiche principali
+
+Le modifiche sono concentrate in `simulation_engine.py`, `drone.py`, `main.py` e nei test.
+
+1. **Rasterizzazione locale dei punti sensore**
+
+   In `Drone.update_grid(...)` è stato aggiunto il parametro:
+
+   ```python
+   point_radius_cells=0
+   ```
+
+   Il metodo può ora inserire ogni punto di bordo rilevato non solo nella singola cella corrispondente, ma in un piccolo footprint circolare di raggio configurabile. Questo rende la mappa locale più continua quando le misure sono sparse.
+
+   Il parametro è esposto da CLI tramite:
+
+   ```bash
+   --mapping-point-radius-cells
+   ```
+
+   Il valore di default è `1`.
+
+2. **Nuova estrazione del bordo dalla regione interna racchiusa**
+
+   La correzione più importante è in `SimulationEngine._dfs_polygon_closure_check(...)`.
+
+   Prima, dopo aver verificato la chiusura del bordo, il sistema poteva estrarre il contorno direttamente dalla linea occupata della occupancy grid. Questo è fragile: se la linea occupata diventa una piccola fascia, un algoritmo di contouring può produrre due contorni, uno interno e uno esterno.
+
+   Ora il sistema procede diversamente:
+
+   - identifica le celle libere racchiuse dal bordo occupato;
+   - costruisce una maschera della regione interna;
+   - estrae il contorno esterno di tale regione interna;
+   - usa quel contorno come bordo ordinato per il controllo Voronoi/Lloyd.
+
+   Questa logica è implementata con:
+
+   ```python
+   _enclosed_free_mask(...)
+   _ordered_enclosed_contour_points_from_grid(...)
+   ```
+
+   In questo modo il contorno usato dal controller rappresenta il perimetro della regione racchiusa, non il bordo interno/esterno della linea occupata.
+
+3. **Controllo di continuità geometrica del bordo**
+
+   È stato aggiunto:
+
+   ```python
+   _is_boundary_trace_continuous(...)
+   ```
+
+   Questo metodo verifica che i segmenti consecutivi del bordo ordinato non contengano salti eccessivi rispetto alla risoluzione della griglia. Se il contorno estratto contiene discontinuità non fisiche, viene scartato e il sistema usa un fallback più conservativo.
+
+4. **Fallback del grafo senza salti greedy**
+
+   La vecchia logica di fallback in `_order_loop_cells(...)` poteva, in caso di dead-end o biforcazioni locali, saltare al punto non visitato più vicino. Questo risolveva artificialmente la visita di tutti i punti, ma introduceva segmenti non appartenenti al perimetro reale.
+
+   Il fallback ora usa una visita con backtracking sul grafo di celle adiacenti. Quando incontra un vicolo cieco, torna indietro lungo archi già esistenti invece di creare una connessione geometrica arbitraria verso un punto non visitato. Questo garantisce che ogni passo consecutivo resti vincolato alla connettività locale della griglia.
+
+5. **Fallback centerline per bande occupate**
+
+   È stato aggiunto anche:
+
+   ```python
+   _ordered_centerline_points_from_grid(...)
+   ```
+
+   Questo metodo collassa una banda occupata spessa in una singola centerline ordinata tramite media per bin angolari. Viene usato solo come fallback e solo se supera il controllo di continuità. Serve a evitare la classica ambiguità "inner contour / outer contour" quando i punti occupati formano una fascia.
+
+### Effetto sul controllo Voronoi
+
+Il controllo Voronoi/Lloyd opera su una curva 1D ordinata. Per questo motivo la correttezza dell'ordinamento del bordo è fondamentale: anche se la occupancy grid 2D è corretta, un singolo salto nella lista dei punti può alterare:
+
+- le lunghezze d'arco cumulative;
+- la proiezione dei droni sul bordo;
+- i seed del Multi-Source Dijkstra;
+- le celle Voronoi assegnate ai droni;
+- la visualizzazione 2D dei segmenti assegnati.
+
+Dopo la modifica, sul caso ricostruito da `tmp_output/oil_mapping_data.npy`, il bordo estratto risulta continuo:
+
+```text
+closed True
+points (248, 2)
+segment max 0.10
+num > 3*median 0
+```
+
+Quindi non ci sono più segmenti anomali lunghi nella curva usata dal controller.
+
+### Test aggiunti
+
+Sono stati aggiunti test in `tests/test_state_machine_transition.py` per coprire esplicitamente i casi critici:
+
+- banda occupata spessa che deve collassare in una singola centerline;
+- contorno della regione interna senza salti lunghi;
+- fallback del grafo senza salti geometrici arbitrari.
+
+Verifica eseguita:
+
+```bash
+pytest -q
+```
+
+Risultato:
+
+```text
+19 passed
+```
+
+### Uso consigliato
+
+Per eseguire la simulazione con overlay Voronoi 2D:
+
+```bash
+python3 main.py --visualize --seed 4 --frames 300 --num-drones 5 --show-2d-voronoi
+```
+
+Per modificare l'inflazione dei punti sensore nella occupancy grid:
+
+```bash
+python3 main.py --visualize --seed 4 --frames 300 --num-drones 5 --show-2d-voronoi --mapping-point-radius-cells 2
+```
+
+Valori consigliati:
+
+- `0`: nessuna inflazione, utile per debugging della misura grezza;
+- `1`: default conservativo;
+- `2`: maggiore continuità della mappa, ma con possibile lieve deformazione del bordo.
+
 ## OVERVIEW DEL PROGETTO
 
 Questo repository implementa una simulazione di droni che tracciano il bordo di una macchia di olio (oil spill tracking). L'obiettivo è che un gruppo di droni trovi il bordo della macchia, si disponga lungo il perimetro e mantenga un'orbita stabile con una distribuzione angolare uniforme (consensus). Il codice è progettato come ambiente didattico/ricerca: semplice, modulare e leggibile, per studiare controllo radiale + consenso tangenziale su un bordo morfologicamente definito.

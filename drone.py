@@ -209,6 +209,7 @@ class Drone:
         y_min,
         resolution,
         alpha=None,
+        point_radius_cells=0,
     ):
         """
         Fuse detected edge points into the local occupancy grid as a binary map.
@@ -228,13 +229,24 @@ class Drone:
         points = points.reshape(-1, 2)
         measurement_grid = np.zeros_like(self.grid)
         valid_updates = 0
+        radius = max(0, int(round(point_radius_cells)))
+        footprint = [
+            (dx, dy)
+            for dx in range(-radius, radius + 1)
+            for dy in range(-radius, radius + 1)
+            if dx * dx + dy * dy <= radius * radius
+        ]
 
         for x, y in points:
             ix = int((x - x_min) / resolution)
             iy = int((y - y_min) / resolution)
 
             if 0 <= ix < self.Nx and 0 <= iy < self.Ny:
-                measurement_grid[ix, iy] += 1.0
+                for dx, dy in footprint:
+                    x2 = ix + dx
+                    y2 = iy + dy
+                    if 0 <= x2 < self.Nx and 0 <= y2 < self.Ny:
+                        measurement_grid[x2, y2] = 1.0
                 valid_updates += 1
 
         if valid_updates == 0:

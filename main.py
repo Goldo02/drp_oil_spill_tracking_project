@@ -82,6 +82,7 @@ def _build_engine(
     fully_connected,
     dt,
     closure_min_enclosed_false_cells,
+    mapping_point_radius_cells,
 ):
     return SimulationEngine(
         sim_map=sim_map,
@@ -101,6 +102,7 @@ def _build_engine(
         dt=dt,
         verbose=True,
         closure_min_enclosed_false_cells=closure_min_enclosed_false_cells,
+        mapping_point_radius_cells=mapping_point_radius_cells,
     )
 
 
@@ -326,6 +328,7 @@ def run_simulation(
     dt=1.0,
     oil_mapping_output=OIL_MAPPING_DATA_PATH,
     closure_min_enclosed_false_cells=250,
+    mapping_point_radius_cells=1,
 ):
     _set_random_seed(seed)
     plt = _configure_matplotlib(visualize)
@@ -349,6 +352,7 @@ def run_simulation(
         fully_connected,
         dt,
         closure_min_enclosed_false_cells,
+        mapping_point_radius_cells,
     )
     _add_drones(engine, sim_map, num_drones)
 
@@ -436,6 +440,15 @@ def _build_parser():
         ),
     )
     parser.add_argument(
+        "--mapping-point-radius-cells",
+        type=int,
+        default=1,
+        help=(
+            "Radius, in mapping-grid cells, used to rasterize each detected "
+            "sensor edge point into the local occupancy map."
+        ),
+    )
+    parser.add_argument(
         "--oil-mapping-output",
         default=OIL_MAPPING_DATA_PATH,
         help="Path for exported (N, 2) oil boundary points.",
@@ -465,6 +478,7 @@ def main():
         dt=args.dt,
         oil_mapping_output=args.oil_mapping_output,
         closure_min_enclosed_false_cells=args.closure_min_enclosed_false_cells,
+        mapping_point_radius_cells=args.mapping_point_radius_cells,
     )
 
 
