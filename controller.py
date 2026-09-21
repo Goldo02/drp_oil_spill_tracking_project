@@ -506,16 +506,10 @@ class Controller:
             self.known_boundary_closed = False
         self.known_boundary_ordered = True
 
-    def project_drone_to_boundary(self, drone):
-        """Snap a drone state to the nearest point of the known boundary."""
-        if (
-            not self.constrain_to_boundary
-            or self.known_boundary_points is None
-            or len(self.known_boundary_points) == 0
-        ):
+    def _drone_boundary_projection(self, drone, use_pending=False):
+        if self.known_boundary_points is None or len(self.known_boundary_points) == 0:
             return
 
-        boundary = np.asarray(self.known_boundary_points, dtype=float)
         self._ensure_ordered_closed_boundary()
         boundary = np.asarray(self.known_boundary_points, dtype=float)
         is_closed = bool(self.known_boundary_closed)
@@ -525,7 +519,7 @@ class Controller:
         )
         pending_s = getattr(drone, "pending_boundary_s", None)
         pending_point = getattr(drone, "pending_boundary_point", None)
-        if pending_s is not None and pending_point is not None:
+        if use_pending and pending_s is not None and pending_point is not None:
             boundary_s = float(pending_s)
             if is_closed and total_length > 1e-12:
                 boundary_s = boundary_s % float(total_length)
@@ -543,6 +537,32 @@ class Controller:
                 total_length,
                 is_closed,
             )
+
+        return float(boundary_s), np.asarray(projected, dtype=float), int(nearest_idx)
+
+    def update_boundary_projection(self, drone):
+        """Update the drone arc coordinate without changing its physical state."""
+        projection = self._drone_boundary_projection(drone, use_pending=False)
+        if projection is None:
+            return
+
+        boundary_s, _, nearest_idx = projection
+        drone.boundary_index = int(nearest_idx)
+        drone.boundary_s = float(boundary_s)
+        if not hasattr(drone, "known_boundary_arcs"):
+            drone.known_boundary_arcs = {}
+        drone.known_boundary_arcs[drone.drone_id] = float(boundary_s)
+
+    def project_drone_to_boundary(self, drone):
+        """Snap a drone state to the nearest point of the known boundary."""
+        if not self.constrain_to_boundary:
+            return
+
+        projection = self._drone_boundary_projection(drone, use_pending=True)
+        if projection is None:
+            return
+
+        boundary_s, projected, nearest_idx = projection
         drone.x = float(projected[0])
         drone.y = float(projected[1])
         drone.known_positions[drone.drone_id] = np.array(
@@ -742,21 +762,11 @@ class Controller:
         return action
 
     def _equidistant_action(self, drone, ring_info, world_field, x_coords, y_coords):
-        """Move the drone toward the current Lloyd target along the boundary arc."""
+        """Move the drone toward the current Lloyd target on the boundary."""
         target = None
-        target_arc = None
-        boundary = None
-        arc_lengths = None
-        total_length = None
-        is_closed = None
         if isinstance(ring_info, dict):
             current = ring_info.get('current', {})
             target = current.get('target_centroid')
-            target_arc = current.get('target_arc_length')
-            boundary = ring_info.get('occupied_points')
-            arc_lengths = ring_info.get('arc_lengths')
-            total_length = ring_info.get('total_boundary_length')
-            is_closed = bool(ring_info.get('is_closed', self.known_boundary_closed))
         if target is None:
             target = getattr(drone, 'target_centroid', None)
         if target is None:
@@ -764,56 +774,6 @@ class Controller:
 
         max_speed = float(getattr(drone, 'max_speed', 0.12))
         current_pos = np.array([drone.x, drone.y], dtype=float)
-
-        if (
-            target_arc is not None
-            and boundary is not None
-            and arc_lengths is not None
-            and total_length is not None
-            and float(total_length) > 1e-12
-        ):
-            boundary = np.asarray(boundary, dtype=float)
-            arc_lengths = np.asarray(arc_lengths, dtype=float)
-            current_arc = current.get('seed_arc_length')
-            if current_arc is None:
-                current_arc = getattr(drone, 'boundary_s', None)
-            if current_arc is None:
-                current_arc, _, _ = self._arc_length_at_position(
-                    boundary,
-                    arc_lengths,
-                    current_pos,
-                    float(total_length),
-                    bool(is_closed),
-                )
-
-            if bool(is_closed):
-                signed_error = (
-                    (float(target_arc) - float(current_arc) + 0.5 * float(total_length))
-                    % float(total_length)
-                    - 0.5 * float(total_length)
-                )
-            else:
-                signed_error = float(target_arc) - float(current_arc)
-
-            step = float(np.clip(
-                float(self.k_t) * signed_error,
-                -max_speed,
-                max_speed,
-            ))
-            if abs(step) <= 1e-12:
-                return np.zeros(2, dtype=float)
-
-            next_arc = float(current_arc) + step
-            next_point = self._point_at_arc_length(
-                boundary,
-                arc_lengths,
-                next_arc,
-                float(total_length),
-                bool(is_closed),
-            )
-            drone.pending_boundary_s = float(next_arc)
-            drone.pending_boundary_point = np.asarray(next_point, dtype=float).copy()
-            return self._clip_action(next_point - current_pos, max_speed=max_speed)
 
         action = float(self.k_t) * (np.asarray(target, dtype=float) - current_pos)
         return self._clip_action(action, max_speed=max_speed)
@@ -846,8 +806,14 @@ class DroneController(Controller):
 
         self.max_speed = 0.12
         self.exploration_speed = 0.08
-        self.k_n = 1.5
-        self.boundary_lock_gain = 3.0
+        self.k_n = 0.9
+        self.boundary_lock_gain = 0.8
+        self.edge_tracking_gain = 0.85
+        self.edge_tangent_neighbors = 16
+        self.mapping_tangent_smoothing = 0.75
+        self.edge_lookahead_distance = 0.45
+        self.edge_lookahead_gain = 0.30
+        self.max_edge_normal_correction = 0.07
 
         if known_boundary_points is not None:
             self.set_known_boundary(
@@ -859,6 +825,8 @@ class DroneController(Controller):
     @staticmethod
     def _normalize(vector):
         vector = np.asarray(vector, dtype=float)
+        if vector.ndim != 1 or not np.all(np.isfinite(vector)):
+            return None
         norm = float(np.linalg.norm(vector))
         if norm <= 1e-12:
             return None
@@ -868,6 +836,17 @@ class DroneController(Controller):
     def _random_direction():
         angle = np.random.uniform(0.0, 2.0 * np.pi)
         return np.array([np.cos(angle), np.sin(angle)], dtype=float)
+
+    @staticmethod
+    def _estimated_position(drone):
+        estimate = getattr(drone, "last_gps_position", None)
+        if estimate is None:
+            return np.array([drone.x, drone.y], dtype=float)
+
+        estimate = np.asarray(estimate, dtype=float)
+        if estimate.shape != (2,) or not np.all(np.isfinite(estimate)):
+            return np.array([drone.x, drone.y], dtype=float)
+        return estimate.copy()
 
     def set_known_boundary(
         self,
@@ -992,19 +971,134 @@ class DroneController(Controller):
         if direction is None:
             direction = self._random_direction()
 
-        if self.sim_map is not None:
-            next_x = drone.x + direction[0] * self.exploration_speed
-            next_y = drone.y + direction[1] * self.exploration_speed
-            if next_x < self.sim_map.xlim[0] or next_x > self.sim_map.xlim[1]:
-                direction[0] *= -1.0
-            if next_y < self.sim_map.ylim[0] or next_y > self.sim_map.ylim[1]:
-                direction[1] *= -1.0
-
         norm_dir = self._normalize(direction)
         if norm_dir is None:
             norm_dir = self._random_direction()
         drone.exploration_direction = norm_dir
         return drone.exploration_direction * self.exploration_speed
+
+    def _point_cloud_tracking_action(self, drone, points):
+        points = np.asarray(points, dtype=float)
+        if points.size == 0:
+            return None
+
+        points = points.reshape(-1, 2)
+        finite_mask = np.all(np.isfinite(points), axis=1)
+        if not np.any(finite_mask):
+            return None
+        points = points[finite_mask]
+
+        estimated_pos = self._estimated_position(drone)
+        distances = np.linalg.norm(points - estimated_pos, axis=1)
+        if distances.size == 0 or not np.all(np.isfinite(distances)):
+            return None
+
+        nearest_order = np.argsort(distances)
+        nearest_point = points[int(nearest_order[0])]
+        edge_error = nearest_point - estimated_pos
+
+        neighbor_count = min(
+            int(points.shape[0]),
+            max(2, int(self.edge_tangent_neighbors)),
+        )
+        local_points = points[nearest_order[:neighbor_count]]
+
+        tangent = None
+        if local_points.shape[0] >= 2:
+            centered = local_points - np.mean(local_points, axis=0)
+            try:
+                _, singular_values, vh = np.linalg.svd(
+                    centered,
+                    full_matrices=False,
+                )
+                if singular_values.size > 0 and singular_values[0] > 1e-9:
+                    tangent = vh[0]
+            except np.linalg.LinAlgError:
+                tangent = None
+
+        if tangent is None:
+            normal = self._normalize(estimated_pos - nearest_point)
+            if normal is not None:
+                tangent = np.array([-normal[1], normal[0]], dtype=float)
+
+        tangent = self._normalize(tangent)
+        if tangent is None:
+            return None
+
+        previous_tangent = getattr(drone, "last_mapping_tangent", None)
+        previous_tangent = self._normalize(previous_tangent) if previous_tangent is not None else None
+        if previous_tangent is not None and float(np.dot(tangent, previous_tangent)) < 0.0:
+            tangent = -tangent
+        elif previous_tangent is None:
+            reference = self._normalize(getattr(drone, "last_control_vector", None))
+            if reference is None:
+                reference = self._normalize(getattr(drone, "exploration_direction", None))
+            if reference is not None and float(np.dot(tangent, reference)) < 0.0:
+                tangent = -tangent
+
+        if previous_tangent is not None:
+            alpha = float(np.clip(self.mapping_tangent_smoothing, 0.0, 1.0))
+            smoothed = self._normalize(alpha * previous_tangent + (1.0 - alpha) * tangent)
+            if smoothed is not None:
+                tangent = smoothed
+
+        drone.last_mapping_tangent = tangent.copy()
+
+        tangential_error = float(np.dot(edge_error, tangent)) * tangent
+        normal_error = edge_error - tangential_error
+        normal_norm = float(np.linalg.norm(normal_error))
+        max_normal = float(max(0.0, self.max_edge_normal_correction))
+        if normal_norm > max_normal > 0.0:
+            normal_error = normal_error * (max_normal / normal_norm)
+
+        lookahead_error = self.edge_lookahead_distance * tangent
+        relative_points = points - nearest_point
+        forward_distance = relative_points @ tangent
+        lateral_vectors = relative_points - np.outer(forward_distance, tangent)
+        lateral_distance = np.linalg.norm(lateral_vectors, axis=1)
+        forward_mask = (
+            (forward_distance > 0.1)
+            & (forward_distance < max(0.75, 2.5 * self.edge_lookahead_distance))
+            & (lateral_distance < 0.55)
+        )
+        if np.any(forward_mask):
+            candidate_indices = np.flatnonzero(forward_mask)
+            target_idx = candidate_indices[
+                int(
+                    np.argmin(
+                        np.abs(
+                            forward_distance[candidate_indices]
+                            - self.edge_lookahead_distance
+                        )
+                    )
+                )
+            ]
+            lookahead_error = points[int(target_idx)] - estimated_pos
+
+        action = (
+            self.exploration_speed * tangent
+            + self.edge_tracking_gain * normal_error
+            + self.edge_lookahead_gain * lookahead_error
+        )
+        return self._clip_action(action, max_speed=self.max_speed)
+
+    def _edge_tracking_action(self, drone):
+        edge_points = getattr(drone, "last_edge_points", None)
+        if edge_points is None:
+            return None
+        return self._point_cloud_tracking_action(drone, edge_points)
+
+    def _has_local_edge_points(self, drone):
+        edge_points = getattr(drone, "last_edge_points", None)
+        if edge_points is None:
+            return False
+
+        edge_points = np.asarray(edge_points, dtype=float)
+        if edge_points.size == 0:
+            return False
+
+        edge_points = edge_points.reshape(-1, 2)
+        return bool(np.any(np.all(np.isfinite(edge_points), axis=1)))
 
     def _boundary_tracking_action(
         self,
@@ -1014,6 +1108,10 @@ class DroneController(Controller):
         y_coords,
     ):
         del world_field, x_coords, y_coords
+        edge_action = self._edge_tracking_action(drone)
+        if edge_action is not None:
+            return edge_action
+
         camera_estimate = self._camera_field_estimate(drone)
         if camera_estimate is None:
             return None
@@ -1034,7 +1132,7 @@ class DroneController(Controller):
             max_speed=self.max_speed,
         )
 
-    def _grid_target(self, drone):
+    def _grid_points(self, drone):
         grid = np.asarray(getattr(drone, "grid", np.zeros((1, 1), dtype=float)), dtype=float)
         if grid.size == 0:
             return None
@@ -1057,7 +1155,15 @@ class DroneController(Controller):
                 y_min + (occupied[:, 1] + 0.5) * self.resolution,
             )
         ).astype(float)
-        deltas = occupied_points - np.asarray([drone.x, drone.y], dtype=float)
+        return occupied_points
+
+    def _grid_target(self, drone):
+        occupied_points = self._grid_points(drone)
+        if occupied_points is None:
+            return None
+
+        estimated_pos = self._estimated_position(drone)
+        deltas = occupied_points - estimated_pos
         distances = np.linalg.norm(deltas, axis=1)
         return occupied_points[int(np.argmin(distances))]
 
@@ -1070,14 +1176,20 @@ class DroneController(Controller):
     ):
         target = self._grid_target(drone)
         if target is not None:
-            drone.last_control_mode = "boundary_tracking"
-            action = self._boundary_tracking_action(drone, world_field, x_coords, y_coords)
+            if self._has_local_edge_points(drone):
+                drone.last_control_mode = "boundary_tracking"
+                action = self._boundary_tracking_action(drone, world_field, x_coords, y_coords)
+            else:
+                action = None
 
             if action is None:
                 direction = self._normalize(
-                    np.asarray(target, dtype=float) - np.array([drone.x, drone.y], dtype=float)
+                    np.asarray(target, dtype=float) - self._estimated_position(drone)
                 )
                 if direction is not None:
+                    drone.exploration_direction = direction.copy()
+                    drone.last_mapping_tangent = None
+                    drone.last_control_mode = "consensus_seek"
                     action = direction * self.exploration_speed
                 else:
                     action = self._exploration_action(drone)

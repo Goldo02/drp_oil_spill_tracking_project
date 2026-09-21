@@ -46,7 +46,7 @@ def test_compute_actions_uses_local_grid_not_edge_flag():
         y_coords,
     )
 
-    assert drone.last_control_mode == "boundary_tracking"
+    assert drone.last_control_mode == "consensus_seek"
     assert (
         np.linalg.norm(
             controller.compute_action(drone, world_field, x_coords, y_coords)
@@ -70,6 +70,34 @@ def test_compute_actions_tracks_occupied_target_in_consensus_grid():
 
     action = controller.compute_action(drone, world_field, x_coords, y_coords)
 
-    assert drone.last_control_mode == "boundary_tracking"
+    assert drone.last_control_mode == "consensus_seek"
     assert np.linalg.norm(action) > 0.0
     assert action[0] > 0.0
+    assert np.allclose(
+        drone.exploration_direction,
+        action / np.linalg.norm(action),
+    )
+
+
+def test_consensus_target_redirects_previous_exploration_direction():
+    controller = DroneController(
+        sim_map=DummyMap(),
+        communication_radius=1.0,
+        occupancy_threshold=0.5,
+        resolution=0.1,
+    )
+    drone = DummyDrone(x=0.0, y=0.0, occupied_cell=(20, 35))
+    drone.exploration_direction = np.array([1.0, 0.0], dtype=float)
+
+    world_field = np.zeros((41, 41), dtype=float)
+    x_coords = np.linspace(-2.0, 2.0, 41)
+    y_coords = np.linspace(-2.0, 2.0, 41)
+
+    action = controller.compute_action(drone, world_field, x_coords, y_coords)
+
+    assert drone.last_control_mode == "consensus_seek"
+    assert action[1] > 0.0
+    assert np.allclose(
+        drone.exploration_direction,
+        action / np.linalg.norm(action),
+    )

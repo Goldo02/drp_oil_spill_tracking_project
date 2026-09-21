@@ -109,6 +109,7 @@ class CameraSensor(Sensor):
         x_coords,
         y_coords,
         occupancy_threshold=None,
+        position_estimate=None,
     ):
         """
         Acquire and process a local camera measurement.
@@ -162,10 +163,15 @@ class CameraSensor(Sensor):
 
         edges = self._detect_edges(noisy_matrix)
         edge_points = extract_edge_points(edges)
+        if position_estimate is None:
+            position_estimate = np.array([x, y], dtype=float)
+        else:
+            position_estimate = np.asarray(position_estimate, dtype=float)
+
         edge_points = self._local_to_world_coordinates(
             edge_points=edge_points,
-            x=x,
-            y=y,
+            x=position_estimate[0],
+            y=position_estimate[1],
             x_coords=x_coords,
             y_coords=y_coords,
             image_shape=noisy_matrix.shape,

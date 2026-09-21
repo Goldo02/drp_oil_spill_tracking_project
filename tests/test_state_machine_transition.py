@@ -21,6 +21,8 @@ def make_engine_shell():
     engine.closure_min_boundary_cells = 8
     engine.closure_min_enclosed_false_cells = 8
     engine.last_closure_enclosed_false_cells = 0
+    engine.transition_frame = None
+    engine._pending_lloyd_transition_frames = {}
     return engine
 
 
@@ -153,7 +155,7 @@ def test_loop_cell_ordering_backtracks_without_geometric_jumps():
     assert np.max(step_lengths) <= np.sqrt(2.0) * engine.resolution + 1e-12
 
 
-def test_transition_to_lloyd_state_loads_boundary_into_each_drone():
+def test_decentralized_transition_loads_boundary_only_into_triggering_drone():
     engine = make_engine_shell()
     engine.control_state = "mapping"
     engine.closed_boundary_points = np.empty((0, 2), dtype=float)
@@ -177,13 +179,55 @@ def test_transition_to_lloyd_state_loads_boundary_into_each_drone():
         Drone("D0", 0.0, -0.5, (4, 4), (-1.0, 1.0, -1.0, 1.0)),
         Drone("D1", 0.5, 0.0, (4, 4), (-1.0, 1.0, -1.0, 1.0)),
     ]
+    initial_positions = {
+        drone.drone_id: drone.position.copy()
+        for drone in engine.drones
+    }
 
-    engine._transition_to_lloyd_state(boundary)
+    engine._transition_drone_to_lloyd_state(engine.drones[0], boundary)
 
-    assert engine.control_state == "lloyd"
+    assert engine.control_state == "mapping"
     assert engine.transition_frame == 7
     np.testing.assert_allclose(engine.closed_boundary_points, boundary)
-    for drone in engine.drones:
-        assert drone.control_state == "lloyd"
-        np.testing.assert_allclose(drone.known_boundary_points, boundary)
-        assert set(drone.known_positions) == {"D0", "D1"}
+
+    switched = engine.drones[0]
+    waiting = engine.drones[1]
+
+    assert switched.control_state == "lloyd"
+    np.testing.assert_allclose(switched.known_boundary_points, boundary)
+    np.testing.assert_allclose(switched.position, initial_positions[switched.drone_id])
+    assert switched.boundary_s is not None
+    assert set(switched.known_positions) == {"D0"}
+    assert set(switched.known_boundary_arcs) == {"D0"}
+
+    assert waiting.control_state == "mapping"
+    assert waiting.known_boundary_points.shape == (0, 2)
+    np.testing.assert_allclose(waiting.position, initial_positions[waiting.drone_id])
+
+
+def test_decentralized_transition_waits_for_consensus_after_closure_detection():
+    engine = make_engine_shell()
+    engine.control_state = "mapping"
+    engine.closed_boundary_points = np.empty((0, 2), dtype=float)
+    engine.frame = 7
+    engine.verbose = False
+    engine.drones = [
+        Drone("D0", 0.0, -0.5, (12, 12), (-1.0, 1.0, -1.0, 1.0)),
+    ]
+    closed_grid = np.zeros((12, 12), dtype=float)
+    closed_grid[3:9, 3] = 1.0
+    closed_grid[3:9, 8] = 1.0
+    closed_grid[3, 3:9] = 1.0
+    closed_grid[8, 3:9] = 1.0
+    engine.drones[0].grid = closed_grid
+
+    engine._check_decentralized_mapping_transitions()
+
+    assert engine.drones[0].control_state == "mapping"
+    assert engine._pending_lloyd_transition_frames == {"D0": 7}
+
+    engine.frame = 8
+    engine._check_decentralized_mapping_transitions()
+
+    assert engine.drones[0].control_state == "lloyd"
+    assert engine._pending_lloyd_transition_frames == {}

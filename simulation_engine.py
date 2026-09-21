@@ -87,6 +87,7 @@ class SimulationEngine:
         self._current_measurement_trace = None
         self.control_state = "mapping"
         self.transition_frame = None
+        self._pending_lloyd_transition_frames = {}
         self.closed_boundary_points = np.empty((0, 2), dtype=float)
         self.boundary_controller = Controller(
             sim_map=self.sim_map,
@@ -270,6 +271,8 @@ class SimulationEngine:
         """Compute mapping/orbiting actions and apply them."""
 
         for drone in self.drones:
+            if hasattr(drone, "update_position_estimate"):
+                drone.update_position_estimate()
 
             action = drone.compute_action(
                 self.world_field,
@@ -342,14 +345,65 @@ class SimulationEngine:
                 if sensed_arcs[drone_id] is not None:
                     drone.known_boundary_arcs[drone_id] = float(sensed_arcs[drone_id])
 
-    def _apply_lloyd_actions(self):
+    def _lloyd_drones(self):
+        return [
+            drone for drone in self.drones
+            if getattr(drone, "control_state", "mapping") == "lloyd"
+        ]
+
+    def _mapping_drones(self):
+        return [
+            drone for drone in self.drones
+            if getattr(drone, "control_state", "mapping") != "lloyd"
+        ]
+
+    def _apply_lloyd_actions(self, active_drones=None):
         """Compute decentralized 1D Voronoi/Lloyd actions and apply them."""
+        active_drones = list(active_drones) if active_drones is not None else self.drones
+
+        for drone in active_drones:
+            drone.update_boundary_projection()
+
         self._exchange_positions_multihop()
 
         actions = {
             drone.drone_id: drone.compute_action()
-            for drone in self.drones
+            for drone in active_drones
         }
+
+        for drone in active_drones:
+            action = actions.get(drone.drone_id, np.zeros(2, dtype=float))
+            drone.action(
+                action,
+                bounds=(
+                    self.sim_map.xlim,
+                    self.sim_map.ylim,
+                ),
+            )
+            drone.update_boundary_projection()
+
+    def _apply_mixed_actions(self):
+        """Apply Lloyd control to switched drones and mapping control to the others."""
+        lloyd_drones = self._lloyd_drones()
+        mapping_drones = self._mapping_drones()
+
+        if lloyd_drones:
+            for drone in lloyd_drones:
+                drone.update_boundary_projection()
+            self._exchange_positions_multihop()
+
+        actions = {}
+        for drone in lloyd_drones:
+            actions[drone.drone_id] = drone.compute_action()
+
+        for drone in mapping_drones:
+            if hasattr(drone, "update_position_estimate"):
+                drone.update_position_estimate()
+            actions[drone.drone_id] = drone.compute_action(
+                self.world_field,
+                self.sim_map.x_coords,
+                self.sim_map.y_coords,
+            )
 
         for drone in self.drones:
             action = actions.get(drone.drone_id, np.zeros(2, dtype=float))
@@ -360,11 +414,15 @@ class SimulationEngine:
                     self.sim_map.ylim,
                 ),
             )
-            drone.project_to_boundary()
+            if getattr(drone, "control_state", "mapping") == "lloyd":
+                drone.update_boundary_projection()
 
     def _apply_actions(self):
-        if self.control_state == "lloyd":
-            self._apply_lloyd_actions()
+        lloyd_drones = self._lloyd_drones()
+        if lloyd_drones and len(lloyd_drones) == len(self.drones):
+            self._apply_lloyd_actions(active_drones=lloyd_drones)
+        elif lloyd_drones:
+            self._apply_mixed_actions()
         else:
             self._apply_mapping_actions()
 
@@ -383,43 +441,7 @@ class SimulationEngine:
                 yield ix + dx, iy + dy
 
     def _dfs_polygon_closure_check(self, grid):
-        """Use DFS over occupied boundary cells to detect one closed loop."""
-        cells = self._occupied_boundary_cells(grid)
-        if len(cells) < self.closure_min_boundary_cells:
-            self.last_closure_enclosed_false_cells = 0
-            return False, np.empty((0, 2), dtype=float)
-
-        adjacency = {
-            cell: [neighbor for neighbor in self._cell_neighbors(cell) if neighbor in cells]
-            for cell in cells
-        }
-        usable = {cell for cell, neighbors in adjacency.items() if len(neighbors) >= 2}
-        if len(usable) < self.closure_min_boundary_cells:
-            self.last_closure_enclosed_false_cells = 0
-            return False, np.empty((0, 2), dtype=float)
-
-        start = next(iter(usable))
-        stack = [start]
-        visited = set()
-        while stack:
-            cell = stack.pop()
-            if cell in visited or cell not in usable:
-                continue
-            visited.add(cell)
-            stack.extend(neighbor for neighbor in adjacency[cell] if neighbor in usable)
-
-        if len(visited) != len(usable):
-            self.last_closure_enclosed_false_cells = 0
-            return False, np.empty((0, 2), dtype=float)
-
-        has_open_endpoint = any(
-            sum(1 for neighbor in adjacency[cell] if neighbor in usable) < 2
-            for cell in usable
-        )
-        if has_open_endpoint:
-            self.last_closure_enclosed_false_cells = 0
-            return False, np.empty((0, 2), dtype=float)
-
+        """Detect closure by flood-filling free cells from the outside."""
         enclosed_false_cells = self._count_enclosed_false_cells(grid)
         self.last_closure_enclosed_false_cells = enclosed_false_cells
         if enclosed_false_cells < getattr(self, "closure_min_enclosed_false_cells", 0):
@@ -429,17 +451,6 @@ class SimulationEngine:
         if enclosed_contour.shape[0] >= self.closure_min_boundary_cells:
             return True, enclosed_contour
 
-        ordered_cells = self._order_loop_cells(visited, adjacency)
-        neighbor_counts = np.asarray(
-            [
-                sum(1 for neighbor in adjacency[cell] if neighbor in usable)
-                for cell in usable
-            ],
-            dtype=float,
-        )
-        if neighbor_counts.size and float(np.percentile(neighbor_counts, 90.0)) <= 4.0:
-            return True, self._cells_to_world_points(ordered_cells)
-
         centerline_points = self._ordered_centerline_points_from_grid(grid)
         if (
             centerline_points.shape[0] >= self.closure_min_boundary_cells
@@ -447,7 +458,7 @@ class SimulationEngine:
         ):
             return True, centerline_points
 
-        return True, self._cells_to_world_points(ordered_cells)
+        return False, np.empty((0, 2), dtype=float)
 
     def _enclosed_free_mask(self, grid):
         occupied = np.asarray(grid, dtype=float) > self.occupancy_threshold
@@ -459,17 +470,9 @@ class SimulationEngine:
         visited = np.zeros_like(free, dtype=bool)
         stack = []
 
-        for ix in range(nx):
-            for iy in (0, ny - 1):
-                if free[ix, iy] and not visited[ix, iy]:
-                    visited[ix, iy] = True
-                    stack.append((ix, iy))
-
-        for iy in range(ny):
-            for ix in (0, nx - 1):
-                if free[ix, iy] and not visited[ix, iy]:
-                    visited[ix, iy] = True
-                    stack.append((ix, iy))
+        if free[0, 0]:
+            visited[0, 0] = True
+            stack.append((0, 0))
 
         while stack:
             ix, iy = stack.pop()
@@ -665,48 +668,62 @@ class SimulationEngine:
             mean_grid = self.compute_mean_grid()
         return self._dfs_polygon_closure_check(mean_grid)
 
-    def _transition_to_lloyd_state(self, boundary_points):
+    def _transition_drone_to_lloyd_state(self, drone, boundary_points):
         boundary_points = np.asarray(boundary_points, dtype=float).reshape(-1, 2)
-        if self.control_state == "lloyd" or boundary_points.shape[0] < 3:
+        if (
+            getattr(drone, "control_state", "mapping") == "lloyd"
+            or boundary_points.shape[0] < 3
+        ):
             return
 
         self.closed_boundary_points = boundary_points.copy()
         self.boundary_controller.known_boundary_points = boundary_points.copy()
         self.boundary_controller.known_boundary_closed = True
         self.boundary_controller.known_boundary_ordered = True
-        self.control_state = "lloyd"
-        self.transition_frame = self.frame
 
-        known_boundary_arcs = {}
-        for drone in self.drones:
-            drone.control_state = "lloyd"
-            drone.set_known_boundary(
-                boundary_points,
-                known_boundary_closed=True,
-                already_ordered=True,
-            )
-            drone.pending_boundary_s = None
-            drone.pending_boundary_point = None
-            drone.project_to_boundary()
-            known_boundary_arcs[drone.drone_id] = float(drone.boundary_s)
+        if self.transition_frame is None:
+            self.transition_frame = self.frame
 
-        known_positions = {
-            drone.drone_id: np.array([drone.x, drone.y], dtype=float)
-            for drone in self.drones
-        }
+        self._pending_lloyd_transition_frames.pop(drone.drone_id, None)
+        drone.control_state = "lloyd"
+        drone.set_known_boundary(
+            boundary_points,
+            known_boundary_closed=True,
+            already_ordered=True,
+        )
+        drone.pending_boundary_s = None
+        drone.pending_boundary_point = None
+        drone.update_boundary_projection()
+        drone.known_boundary_arcs[drone.drone_id] = float(drone.boundary_s)
+        drone.known_positions[drone.drone_id] = np.array([drone.x, drone.y], dtype=float)
 
-        for drone in self.drones:
-            drone.known_positions = {
-                drone_id: position.copy()
-                for drone_id, position in known_positions.items()
-            }
-            drone.known_boundary_arcs = dict(known_boundary_arcs)
+        if len(self._lloyd_drones()) == len(self.drones):
+            self.control_state = "lloyd"
+
+    def _check_decentralized_mapping_transitions(self):
+        for drone in self._mapping_drones():
+            closed, boundary_points = self.is_mapped_polygon_closed(drone.grid)
+            pending_frame = self._pending_lloyd_transition_frames.get(drone.drone_id)
+
+            if closed and pending_frame is not None and self.frame > pending_frame:
+                self._transition_drone_to_lloyd_state(drone, boundary_points)
+            elif closed and pending_frame is None:
+                self._pending_lloyd_transition_frames[drone.drone_id] = self.frame
+            elif not closed and pending_frame is not None:
+                self._pending_lloyd_transition_frames.pop(drone.drone_id, None)
 
         if self.verbose:
-            print(
-                "  State transition: mapping -> lloyd "
-                f"(DFS closed loop with {boundary_points.shape[0]} boundary cells)"
-            )
+            transitioned = [
+                drone for drone in self.drones
+                if getattr(drone, "control_state", "mapping") == "lloyd"
+            ]
+            if transitioned:
+                ids = ", ".join(str(drone.drone_id) for drone in transitioned)
+                print(
+                    "  Decentralized transition status: "
+                    f"{len(transitioned)}/{len(self.drones)} in lloyd "
+                    f"({ids})"
+                )
 
     def get_visualization_data(self):
         """Return state required by the visualizer."""
@@ -761,15 +778,18 @@ class SimulationEngine:
 
         self.frame += 1
 
+        has_mapping_drones = bool(self._mapping_drones())
         measurement_frame = (
-            self.control_state == "mapping"
+            has_mapping_drones
             and (self.frame - 1) % self.measure_every == 0
         )
 
         if self.verbose:
 
-            if self.control_state == "lloyd":
+            if not has_mapping_drones:
                 frame_type = "lloyd"
+            elif self._lloyd_drones():
+                frame_type = "mixed"
             else:
                 frame_type = "measurement" if measurement_frame else "consensus"
 
@@ -793,7 +813,7 @@ class SimulationEngine:
                 self._print_sensor_status()
         # Consensus
 
-        if self.control_state == "mapping":
+        if has_mapping_drones:
             for round_idx in range(self.consensus_rounds):
 
                 self._exchange_consensus_messages()
@@ -812,10 +832,8 @@ class SimulationEngine:
         self.mean_grid_history.append(mean_grid.copy())
 
         self.latest_mean_grid = mean_grid
-        if self.control_state == "mapping":
-            closed, boundary_points = self.is_mapped_polygon_closed(mean_grid)
-            if closed:
-                self._transition_to_lloyd_state(boundary_points)
+        if has_mapping_drones:
+            self._check_decentralized_mapping_transitions()
         # Control
 
         self._apply_actions()

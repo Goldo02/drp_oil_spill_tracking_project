@@ -58,8 +58,10 @@ class Drone:
         self.last_oil_fraction = None
         self.last_camera_image = None
         self.last_camera_spacing = None
+        self.last_gps_position = np.array([self.x, self.y], dtype=float)
         self.last_control_mode = "idle"
         self.last_control_vector = np.zeros(2, dtype=float)
+        self.last_mapping_tangent = None
         self.control_state = "mapping"
         self.known_positions = {
             self.drone_id: np.array([self.x, self.y], dtype=float),
@@ -110,6 +112,9 @@ class Drone:
     def project_to_boundary(self):
         self.controller.project_to_boundary(self)
 
+    def update_boundary_projection(self):
+        self.controller.update_boundary_projection(self)
+
     def create_consensus_message(self):
         """
         Return the local map payload broadcast by this drone.
@@ -130,6 +135,11 @@ class Drone:
         """
         return self.gps.sense(self.position)
 
+    def update_position_estimate(self):
+        """Acquire and store the latest GPS-based position estimate."""
+        self.last_gps_position = np.asarray(self.get_gps_pos(), dtype=float)
+        return self.last_gps_position.copy()
+
     def sense(
         self,
         world_field,
@@ -148,12 +158,15 @@ class Drone:
             Detected edge points in global coordinates.
         """
 
+        position_estimate = self.update_position_estimate()
+
         measurement = self.camera.sense(
             world_field=world_field,
             x=self.x,
             y=self.y,
             x_coords=x_coords,
             y_coords=y_coords,
+            position_estimate=position_estimate,
         )
         if measurement is None:
             self._clear_sensing_state()
@@ -197,7 +210,7 @@ class Drone:
                 0.8 * previous_anchor + 0.2 * current_anchor
             )
 
-        distances = np.linalg.norm(edge_points - self.position, axis=1)
+        distances = np.linalg.norm(edge_points - self.last_gps_position, axis=1)
         nearest_idx = int(np.argmin(distances))
         nearest_point = edge_points[nearest_idx]
         self.last_edge_point = (float(nearest_point[0]), float(nearest_point[1]))
