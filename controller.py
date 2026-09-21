@@ -934,6 +934,55 @@ class DroneController(Controller):
             dtype=float,
         )
 
+    def _camera_field_estimate(self, drone):
+        image = getattr(drone, "last_camera_image", None)
+        if image is None:
+            return None
+
+        image = np.asarray(image, dtype=float)
+        if image.ndim != 2 or min(image.shape) < 3:
+            return None
+
+        spacing = getattr(drone, "last_camera_spacing", None)
+        if spacing is None:
+            dx = dy = self.resolution
+        else:
+            dx, dy = spacing
+            dx = max(abs(float(dx)), 1e-12)
+            dy = max(abs(float(dy)), 1e-12)
+
+        row = image.shape[0] // 2
+        col = image.shape[1] // 2
+        row = int(np.clip(row, 1, image.shape[0] - 2))
+        col = int(np.clip(col, 1, image.shape[1] - 2))
+
+        concentration = float(image[row, col])
+        patch = image[row - 1 : row + 2, col - 1 : col + 2]
+        sobel_x = np.array(
+            [
+                [-1.0, 0.0, 1.0],
+                [-2.0, 0.0, 2.0],
+                [-1.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        )
+        sobel_y = np.array(
+            [
+                [-1.0, -2.0, -1.0],
+                [0.0, 0.0, 0.0],
+                [1.0, 2.0, 1.0],
+            ],
+            dtype=float,
+        )
+        grad_x = float(np.sum(sobel_y * patch) / (8.0 * dx))
+        grad_y = float(np.sum(sobel_x * patch) / (8.0 * dy))
+        gradient = np.array([grad_x, grad_y], dtype=float)
+
+        if not np.all(np.isfinite(gradient)):
+            return None
+
+        return concentration, gradient
+
     def _exploration_action(self, drone):
         direction = getattr(drone, "exploration_direction", None)
         if direction is None:
@@ -964,9 +1013,12 @@ class DroneController(Controller):
         x_coords,
         y_coords,
     ):
-        position = np.array([drone.x, drone.y], dtype=float)
-        concentration = self._interpolate_field(world_field, position, x_coords, y_coords)
-        gradient = self._gradient(world_field, position, x_coords, y_coords)
+        del world_field, x_coords, y_coords
+        camera_estimate = self._camera_field_estimate(drone)
+        if camera_estimate is None:
+            return None
+
+        concentration, gradient = camera_estimate
         normal = self._normalize(gradient)
         if normal is None:
             return None

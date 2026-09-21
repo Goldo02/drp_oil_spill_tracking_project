@@ -4,7 +4,7 @@
   "coordinate_frame": "world",
   "units": "simulation_world_units",
   "shape": [
-    787,
+    300,
     2
   ],
   "dtype": "float64",

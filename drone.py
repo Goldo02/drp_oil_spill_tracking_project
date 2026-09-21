@@ -56,6 +56,8 @@ class Drone:
         self.last_boundary_anchor_point = None
         self.last_edge_count = 0
         self.last_oil_fraction = None
+        self.last_camera_image = None
+        self.last_camera_spacing = None
         self.last_control_mode = "idle"
         self.last_control_vector = np.zeros(2, dtype=float)
         self.control_state = "mapping"
@@ -155,7 +157,15 @@ class Drone:
         )
         if measurement is None:
             self._clear_sensing_state()
+            self.last_camera_image = None
+            self.last_camera_spacing = None
             return self.last_edge_points
+
+        if hasattr(measurement, "image"):
+            self.last_camera_image = np.asarray(measurement.image, dtype=float).copy()
+            dx = float(x_coords[1] - x_coords[0]) if len(x_coords) > 1 else 1.0
+            dy = float(y_coords[1] - y_coords[0]) if len(y_coords) > 1 else 1.0
+            self.last_camera_spacing = (abs(dx), abs(dy))
 
         if hasattr(measurement, "edge_points"):
             edge_points = np.asarray(measurement.edge_points, dtype=float)
