@@ -160,15 +160,22 @@ class SimulationEngine:
                 point_radius_cells=self.mapping_point_radius_cells,
             )
 
+    def _refresh_position_estimates(self):
+        """Refresh each drone's GPS-based position estimate."""
+        for drone in self.drones:
+            if hasattr(drone, "update_position_estimate"):
+                drone.update_position_estimate()
+
     def _get_neighbors(self, drone):
         if self.fully_connected:
             return [other for other in self.drones if other is not drone]
 
+        drone_position = Controller._estimated_position(drone)
         return [
             other
             for other in self.drones
             if other is not drone
-            and float(np.linalg.norm(drone.position - other.position))
+            and float(np.linalg.norm(drone_position - Controller._estimated_position(other)))
             <= self.communication_radius
         ]
 
@@ -290,9 +297,14 @@ class SimulationEngine:
 
     @staticmethod
     def _sensed_position(drone):
-        if hasattr(drone, "get_gps_pos"):
-            return np.asarray(drone.get_gps_pos(), dtype=float)
-        return np.asarray(drone.position, dtype=float)
+        estimate = getattr(drone, "last_gps_position", None)
+        if estimate is not None:
+            estimate = np.asarray(estimate, dtype=float)
+            if estimate.shape == (2,) and np.all(np.isfinite(estimate)):
+                return estimate.copy()
+        if hasattr(drone, "update_position_estimate"):
+            return np.asarray(drone.update_position_estimate(), dtype=float)
+        return Controller._estimated_position(drone)
 
     def _exchange_positions_multihop(self):
         sensed_positions = {
@@ -324,7 +336,12 @@ class SimulationEngine:
                     if i == j:
                         continue
                     in_range = getattr(self, "fully_connected", False) or (
-                        float(np.linalg.norm(drone_i.position - drone_j.position))
+                        float(
+                            np.linalg.norm(
+                                sensed_positions[drone_i.drone_id]
+                                - sensed_positions[drone_j.drone_id]
+                            )
+                        )
                         <= self.communication_radius
                     )
                     if in_range:
@@ -362,6 +379,8 @@ class SimulationEngine:
         active_drones = list(active_drones) if active_drones is not None else self.drones
 
         for drone in active_drones:
+            if hasattr(drone, "update_position_estimate"):
+                drone.update_position_estimate()
             drone.update_boundary_projection()
 
         self._exchange_positions_multihop()
@@ -380,6 +399,8 @@ class SimulationEngine:
                     self.sim_map.ylim,
                 ),
             )
+            if hasattr(drone, "update_position_estimate"):
+                drone.update_position_estimate()
             drone.update_boundary_projection()
 
     def _apply_mixed_actions(self):
@@ -389,6 +410,8 @@ class SimulationEngine:
 
         if lloyd_drones:
             for drone in lloyd_drones:
+                if hasattr(drone, "update_position_estimate"):
+                    drone.update_position_estimate()
                 drone.update_boundary_projection()
             self._exchange_positions_multihop()
 
@@ -415,6 +438,8 @@ class SimulationEngine:
                 ),
             )
             if getattr(drone, "control_state", "mapping") == "lloyd":
+                if hasattr(drone, "update_position_estimate"):
+                    drone.update_position_estimate()
                 drone.update_boundary_projection()
 
     def _apply_actions(self):
@@ -693,9 +718,11 @@ class SimulationEngine:
         )
         drone.pending_boundary_s = None
         drone.pending_boundary_point = None
+        if hasattr(drone, "update_position_estimate"):
+            drone.update_position_estimate()
         drone.update_boundary_projection()
         drone.known_boundary_arcs[drone.drone_id] = float(drone.boundary_s)
-        drone.known_positions[drone.drone_id] = np.array([drone.x, drone.y], dtype=float)
+        drone.known_positions[drone.drone_id] = Controller._estimated_position(drone)
 
         if len(self._lloyd_drones()) == len(self.drones):
             self.control_state = "lloyd"
@@ -797,6 +824,7 @@ class SimulationEngine:
         # Environment
 
         self._update_environment()
+        self._refresh_position_estimates()
         # Measurement
 
         if measurement_frame:

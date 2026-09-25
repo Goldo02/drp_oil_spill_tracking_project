@@ -48,6 +48,7 @@ class Drone:
         self.grid = np.zeros(self.grid_shape, dtype=float)
         self.gps = GPSSensor(noise_std=gps_noise)
         self.camera = CameraSensor(size=sensor_size, noise_std=camera_noise)
+        self.last_gps_position = np.asarray(self.get_gps_pos(), dtype=float)
 
         self.edge_detected = False
         self.last_edge_point = None
@@ -58,13 +59,12 @@ class Drone:
         self.last_oil_fraction = None
         self.last_camera_image = None
         self.last_camera_spacing = None
-        self.last_gps_position = np.array([self.x, self.y], dtype=float)
         self.last_control_mode = "idle"
         self.last_control_vector = np.zeros(2, dtype=float)
         self.last_mapping_tangent = None
         self.control_state = "mapping"
         self.known_positions = {
-            self.drone_id: np.array([self.x, self.y], dtype=float),
+            self.drone_id: self.last_gps_position.copy(),
         }
         self.known_boundary_arcs = {}
         self.known_boundary_points = np.empty((0, 2), dtype=float)
@@ -373,7 +373,7 @@ class Drone:
 
         self.x = float(np.clip(self.x, x_bounds[0], x_bounds[1]))
         self.y = float(np.clip(self.y, y_bounds[0], y_bounds[1]))
-        self.known_positions[self.drone_id] = self.position
+        self.known_positions[self.drone_id] = self.last_gps_position.copy()
 
         return command
 

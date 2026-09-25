@@ -122,6 +122,22 @@ class Controller:
         return int(np.argmin(dists))
 
     @staticmethod
+    def _estimated_position(drone):
+        estimate = getattr(drone, "last_gps_position", None)
+        if estimate is not None:
+            estimate = np.asarray(estimate, dtype=float)
+            if estimate.shape == (2,) and np.all(np.isfinite(estimate)):
+                return estimate.copy()
+
+        position = getattr(drone, "position", None)
+        if position is not None:
+            position = np.asarray(position, dtype=float)
+            if position.shape == (2,) and np.all(np.isfinite(position)):
+                return position.copy()
+
+        return np.array([drone.x, drone.y], dtype=float)
+
+    @staticmethod
     def _boundary_arc_lengths(boundary_points, is_closed=False):
         """Return cumulative arc-length coordinates for ordered boundary points."""
         boundary = np.asarray(boundary_points, dtype=float)
@@ -533,7 +549,7 @@ class Controller:
             boundary_s, projected, nearest_idx = self._arc_length_at_position(
                 boundary,
                 arc_lengths,
-                np.array([drone.x, drone.y], dtype=float),
+                self._estimated_position(drone),
                 total_length,
                 is_closed,
             )
@@ -565,10 +581,9 @@ class Controller:
         boundary_s, projected, nearest_idx = projection
         drone.x = float(projected[0])
         drone.y = float(projected[1])
-        drone.known_positions[drone.drone_id] = np.array(
-            [drone.x, drone.y],
-            dtype=float,
-        )
+        if hasattr(drone, "update_position_estimate"):
+            drone.update_position_estimate()
+        drone.known_positions[drone.drone_id] = self._estimated_position(drone)
         drone.boundary_index = int(nearest_idx)
         drone.boundary_s = float(boundary_s)
         if not hasattr(drone, "known_boundary_arcs"):
@@ -704,7 +719,7 @@ class Controller:
 
         # Compute center of mass for reference/logging purposes only (does not affect ordering)
         com = np.mean(occupied_points, axis=0)
-        cur_pos = np.array([current_drone.x, current_drone.y], dtype=float)
+        cur_pos = self._estimated_position(current_drone)
         cur_angle = float(np.arctan2(cur_pos[1] - com[1], cur_pos[0] - com[0]))
 
         res = {
@@ -773,7 +788,7 @@ class Controller:
             return np.zeros(2, dtype=float)
 
         max_speed = float(getattr(drone, 'max_speed', 0.12))
-        current_pos = np.array([drone.x, drone.y], dtype=float)
+        current_pos = self._estimated_position(drone)
 
         action = float(self.k_t) * (np.asarray(target, dtype=float) - current_pos)
         return self._clip_action(action, max_speed=max_speed)
@@ -836,17 +851,6 @@ class DroneController(Controller):
     def _random_direction():
         angle = np.random.uniform(0.0, 2.0 * np.pi)
         return np.array([np.cos(angle), np.sin(angle)], dtype=float)
-
-    @staticmethod
-    def _estimated_position(drone):
-        estimate = getattr(drone, "last_gps_position", None)
-        if estimate is None:
-            return np.array([drone.x, drone.y], dtype=float)
-
-        estimate = np.asarray(estimate, dtype=float)
-        if estimate.shape != (2,) or not np.all(np.isfinite(estimate)):
-            return np.array([drone.x, drone.y], dtype=float)
-        return estimate.copy()
 
     def set_known_boundary(
         self,
