@@ -4,13 +4,20 @@
   "coordinate_frame": "world",
   "units": "simulation_world_units",
   "shape": [
-    272,
+    239,
     2
   ],
   "dtype": "float64",
   "closed_boundary": true,
   "ordered_boundary": true,
   "occupancy_threshold": 0.6,
+  "oil_dynamics": {
+    "dynamic": true,
+    "drift_velocity": [
+      0.008586585755304812,
+      0.005125479984040178
+    ]
+  },
   "sim_map": {
     "xlim": [
       -5.0,

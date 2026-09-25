@@ -174,11 +174,16 @@ class CircleOilSpill(OilSpill):
         y0=0.0,
         radius=2.0,
         sigma=0.5,
+        drift_velocity=(0.0, 0.0),
     ):
         self.x0 = float(x0)
         self.y0 = float(y0)
         self.radius = float(radius)
         self.sigma = float(sigma)
+        self.drift_velocity = np.asarray(drift_velocity, dtype=float)
+
+        if self.drift_velocity.shape != (2,):
+            raise ValueError("drift_velocity must have shape (2,)")
 
         if self.radius <= 0:
             raise ValueError("radius must be positive")
@@ -204,8 +209,14 @@ class CircleOilSpill(OilSpill):
         )
 
     def update(self, dt):
-        """Static spill; extension point for future dynamics."""
-        del dt
+        """Translate the spill center according to the configured drift."""
+        displacement = self.drift_velocity * float(dt)
+        if float(np.linalg.norm(displacement)) <= 1e-12:
+            return
+
+        self.x0 += float(displacement[0])
+        self.y0 += float(displacement[1])
+        self._field = None
 
 
 class SmoothedPolygonOilSpill(OilSpill):
@@ -223,6 +234,7 @@ class SmoothedPolygonOilSpill(OilSpill):
         seed=None,
         continuous=False,
         boundary_samples=None,
+        drift_velocity=(0.0, 0.0),
     ):
         self.X = np.asarray(X, dtype=float)
         self.Y = np.asarray(Y, dtype=float)
@@ -237,6 +249,10 @@ class SmoothedPolygonOilSpill(OilSpill):
         self.smoothness = float(np.clip(smoothness, 0.0, 1.0))
 
         self.continuous = bool(continuous)
+        self.drift_velocity = np.asarray(drift_velocity, dtype=float)
+
+        if self.drift_velocity.shape != (2,):
+            raise ValueError("drift_velocity must have shape (2,)")
 
         self.boundary_samples = int(boundary_samples) if boundary_samples is not None else 500
 
@@ -390,5 +406,14 @@ class SmoothedPolygonOilSpill(OilSpill):
         return self._evaluate_field(X, Y)
 
     def update(self, dt):
-        """Static spill; extension point for future dynamics."""
-        del dt
+        """Translate the spill rigidly according to the configured drift."""
+        displacement = self.drift_velocity * float(dt)
+        if float(np.linalg.norm(displacement)) <= 1e-12:
+            return
+
+        self.x0 += float(displacement[0])
+        self.y0 += float(displacement[1])
+        self.vertices = self.vertices + displacement
+        self.boundary = self.boundary + displacement
+        self._path = Path(self.boundary, closed=True)
+        self._field = self._evaluate_field(self.X, self.Y)

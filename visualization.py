@@ -101,6 +101,7 @@ class Visualizer:
             alpha=0.8,
             vmin=0.0,
             vmax=1.0,
+            zorder=0,
         )
 
         self.contour = self.ax.contour(
@@ -111,6 +112,37 @@ class Visualizer:
             colors="black",
             alpha=0.5,
             linewidths=0.5,
+            zorder=1,
+        )
+
+    def _clear_environment_contours(self):
+        if self.contour is None:
+            return
+
+        try:
+            self.contour.remove()
+        except Exception:
+            pass
+
+        for collection in getattr(self.contour, "collections", []):
+            try:
+                collection.remove()
+            except Exception:
+                pass
+
+        self.contour = None
+
+    def _draw_environment_contours(self, world_field):
+        self._clear_environment_contours()
+        self.contour = self.ax.contour(
+            self.sim_map.X,
+            self.sim_map.Y,
+            world_field,
+            levels=[0.1, 0.5, 0.9],
+            colors="black",
+            alpha=0.5,
+            linewidths=0.5,
+            zorder=1,
         )
 
     def update_environment(self, world_field):
@@ -136,10 +168,13 @@ class Visualizer:
                 alpha=0.8,
                 vmin=0.0,
                 vmax=1.0,
+                zorder=0,
             )
+            self._draw_environment_contours(world_field)
             return
 
         self.img.set_data(world_field.T)
+        self._draw_environment_contours(world_field)
 
     def _remove_drone_artists(self, drone_id):
         """
