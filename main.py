@@ -245,37 +245,19 @@ def _mapped_boundary_points_from_consensus(engine):
     return _ordered_points_by_angle(points)
 
 
-def _model_boundary_points(spill):
-    if hasattr(spill, "boundary"):
-        points = np.asarray(spill.boundary, dtype=float)
-        if points.ndim == 2 and points.shape[1] == 2:
-            return points.copy()
-
-    if all(hasattr(spill, attr) for attr in ("x0", "y0", "radius")):
-        theta = np.linspace(0.0, 2.0 * np.pi, 720, endpoint=False)
-        return np.column_stack(
-            (
-                float(spill.x0) + float(spill.radius) * np.cos(theta),
-                float(spill.y0) + float(spill.radius) * np.sin(theta),
-            )
-        )
-
-    return np.empty((0, 2), dtype=float)
-
-
 def _save_oil_mapping(engine, sim_map, spill, output_path):
+    del spill
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     points = _mapped_boundary_points_from_consensus(engine)
     source = "consensus_mean_grid"
 
-    if points.shape[0] < 3:
-        points = _model_boundary_points(spill)
-        source = "oil_spill_model_boundary"
-
     points = np.asarray(points, dtype=float).reshape(-1, 2)
     if points.shape[0] < 3:
-        raise RuntimeError("Unable to export oil mapping: fewer than 3 boundary points.")
+        raise RuntimeError(
+            "Unable to export oil mapping: fewer than 3 sensor-derived "
+            "consensus boundary points."
+        )
 
     np.save(output_path, points)
 

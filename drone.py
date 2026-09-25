@@ -162,8 +162,8 @@ class Drone:
 
         measurement = self.camera.sense(
             world_field=world_field,
-            x=self.x,
-            y=self.y,
+            x=position_estimate[0],
+            y=position_estimate[1],
             x_coords=x_coords,
             y_coords=y_coords,
             position_estimate=position_estimate,

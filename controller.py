@@ -129,6 +129,16 @@ class Controller:
             if estimate.shape == (2,) and np.all(np.isfinite(estimate)):
                 return estimate.copy()
 
+        if hasattr(drone, "update_position_estimate"):
+            estimate = np.asarray(drone.update_position_estimate(), dtype=float)
+            if estimate.shape == (2,) and np.all(np.isfinite(estimate)):
+                return estimate.copy()
+
+        if hasattr(drone, "gps"):
+            raise ValueError(
+                "Instrumented drones must provide a finite GPS position estimate"
+            )
+
         position = getattr(drone, "position", None)
         if position is not None:
             position = np.asarray(position, dtype=float)
@@ -861,61 +871,6 @@ class DroneController(Controller):
         self.known_boundary_points = np.asarray(boundary_points, dtype=float).copy()
         self.known_boundary_closed = bool(known_boundary_closed)
         self.known_boundary_ordered = bool(already_ordered)
-
-    def _interpolate_field(
-        self,
-        world_field,
-        position,
-        x_coords,
-        y_coords,
-    ):
-        position = np.asarray(position, dtype=float)
-        x = float(np.clip(position[0], x_coords[0], x_coords[-1]))
-        y = float(np.clip(position[1], y_coords[0], y_coords[-1]))
-        i1 = int(np.searchsorted(x_coords, x, side="right"))
-        j1 = int(np.searchsorted(y_coords, y, side="right"))
-        i0 = max(0, min(i1 - 1, len(x_coords) - 1))
-        j0 = max(0, min(j1 - 1, len(y_coords) - 1))
-        i1 = max(0, min(i1, len(x_coords) - 1))
-        j1 = max(0, min(j1, len(y_coords) - 1))
-
-        wx = 0.0 if i0 == i1 else (x - x_coords[i0]) / (x_coords[i1] - x_coords[i0])
-        wy = 0.0 if j0 == j1 else (y - y_coords[j0]) / (y_coords[j1] - y_coords[j0])
-
-        q00 = world_field[i0, j0]
-        q10 = world_field[i1, j0]
-        q01 = world_field[i0, j1]
-        q11 = world_field[i1, j1]
-        return float(
-            (1 - wx) * (1 - wy) * q00
-            + wx * (1 - wy) * q10
-            + (1 - wx) * wy * q01
-            + wx * wy * q11
-        )
-
-    def _gradient(
-        self,
-        world_field,
-        position,
-        x_coords,
-        y_coords,
-    ):
-        dx = max(abs(float(x_coords[1] - x_coords[0])), self.resolution)
-        dy = max(abs(float(y_coords[1] - y_coords[0])), self.resolution)
-        position = np.asarray(position, dtype=float)
-
-        x_plus = self._interpolate_field(world_field, position + [dx, 0.0], x_coords, y_coords)
-        x_minus = self._interpolate_field(world_field, position - [dx, 0.0], x_coords, y_coords)
-        y_plus = self._interpolate_field(world_field, position + [0.0, dy], x_coords, y_coords)
-        y_minus = self._interpolate_field(world_field, position - [0.0, dy], x_coords, y_coords)
-
-        return np.array(
-            [
-                (x_plus - x_minus) / (2.0 * dx),
-                (y_plus - y_minus) / (2.0 * dy),
-            ],
-            dtype=float,
-        )
 
     def _camera_field_estimate(self, drone):
         image = getattr(drone, "last_camera_image", None)
