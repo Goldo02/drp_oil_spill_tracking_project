@@ -37,7 +37,7 @@ class SimulationEngine:
         measure_every=3,
         communication_radius_cells=205,
         fully_connected=False,
-        occupancy_threshold=0.5,
+        occupancy_threshold=0.6,
         temporal_alpha=0.05,
         consensus_rounds=10,
         dt=1.0,
@@ -127,6 +127,7 @@ class SimulationEngine:
             sensor_size=self.sensor_size,
             gps_noise=gps_noise,
             camera_noise=camera_noise,
+            occupancy_threshold=self.occupancy_threshold,
             controller=DroneController(
                 sim_map=self.sim_map,
                 communication_radius=self.communication_radius,
@@ -158,6 +159,9 @@ class SimulationEngine:
                 resolution=self.resolution,
                 alpha=None,
                 point_radius_cells=self.mapping_point_radius_cells,
+                occupancy_threshold=self.occupancy_threshold,
+                x_coords=self.sim_map.x_coords,
+                y_coords=self.sim_map.y_coords,
             )
 
     def _refresh_position_estimates(self):
@@ -193,6 +197,9 @@ class SimulationEngine:
             drone.consensus_step(
                 delivered[drone.drone_id],
                 own_grid=messages[drone.drone_id]["grid"],
+                own_signal_grid=messages[drone.drone_id]["signal_grid"],
+                own_information_grid=messages[drone.drone_id]["information_grid"],
+                occupancy_threshold=self.occupancy_threshold,
             )
 
     def _perform_consensus(self):
@@ -201,15 +208,42 @@ class SimulationEngine:
             self._exchange_consensus_messages()
 
     def compute_mean_grid(self):
-        """Return the mean occupancy grid."""
+        """Return the information-weighted mean occupancy probability grid."""
+
+        if not self.drones:
+            return np.full(self.grid_shape, 0.5, dtype=float)
+
+        mean_signal = np.mean(
+            [
+                np.asarray(drone.occupancy_signal_grid, dtype=float)
+                for drone in self.drones
+            ],
+            axis=0,
+        )
+        mean_information = self.compute_mean_information_grid()
+        return Drone.probability_from_signal(mean_signal, mean_information)
+
+    def compute_mean_information_grid(self):
+        """Return the mean amount of available map information per cell."""
 
         if not self.drones:
             return np.zeros(self.grid_shape, dtype=float)
 
         return np.mean(
-            [np.asarray(drone.grid, dtype=float) for drone in self.drones],
+            [np.asarray(drone.information_grid, dtype=float) for drone in self.drones],
             axis=0,
         )
+
+    def compute_mean_boundary_grid(self):
+        """Return the consensus boundary induced by the probability map."""
+
+        mean_grid = self.compute_mean_grid()
+        mean_information = self.compute_mean_information_grid()
+        return Drone.boundary_mask_from_probability(
+            mean_grid,
+            mean_information,
+            occupancy_threshold=self.occupancy_threshold,
+        ).astype(float)
 
     def compute_disagreement_error(self):
         """Return mean L2 disagreement from the global mean."""
@@ -452,7 +486,7 @@ class SimulationEngine:
             self._apply_mapping_actions()
 
     def _occupied_boundary_cells(self, grid):
-        occupied = np.asarray(grid, dtype=float) > self.occupancy_threshold
+        occupied = np.asarray(grid, dtype=float) >= self.occupancy_threshold
         cells = [tuple(cell) for cell in np.argwhere(occupied)]
         return set(cells)
 
@@ -486,7 +520,7 @@ class SimulationEngine:
         return False, np.empty((0, 2), dtype=float)
 
     def _enclosed_free_mask(self, grid):
-        occupied = np.asarray(grid, dtype=float) > self.occupancy_threshold
+        occupied = np.asarray(grid, dtype=float) >= self.occupancy_threshold
         free = ~occupied
         if free.size == 0:
             return np.zeros_like(free, dtype=bool)
@@ -562,7 +596,7 @@ class SimulationEngine:
 
     def _ordered_centerline_points_from_grid(self, grid):
         """Return a single ordered boundary centerline from occupied map cells."""
-        occupied_cells = np.argwhere(np.asarray(grid, dtype=float) > self.occupancy_threshold)
+        occupied_cells = np.argwhere(np.asarray(grid, dtype=float) >= self.occupancy_threshold)
         if occupied_cells.shape[0] < self.closure_min_boundary_cells:
             return np.empty((0, 2), dtype=float)
 
@@ -690,7 +724,7 @@ class SimulationEngine:
 
     def is_mapped_polygon_closed(self, mean_grid=None):
         if mean_grid is None:
-            mean_grid = self.compute_mean_grid()
+            mean_grid = self.compute_mean_boundary_grid()
         return self._dfs_polygon_closure_check(mean_grid)
 
     def _transition_drone_to_lloyd_state(self, drone, boundary_points):
@@ -729,7 +763,20 @@ class SimulationEngine:
 
     def _check_decentralized_mapping_transitions(self):
         for drone in self._mapping_drones():
-            closed, boundary_points = self.is_mapped_polygon_closed(drone.grid)
+            boundary_grid = getattr(drone, "boundary_grid", None)
+            if boundary_grid is None or not np.any(np.asarray(boundary_grid, dtype=float)):
+                information_grid = getattr(drone, "information_grid", None)
+                if information_grid is not None and not np.any(
+                    np.asarray(information_grid, dtype=float)
+                ):
+                    information_grid = None
+                boundary_grid = Drone.boundary_mask_from_probability(
+                    getattr(drone, "grid", np.zeros(self.grid_shape, dtype=float)),
+                    information_grid,
+                    occupancy_threshold=self.occupancy_threshold,
+                ).astype(float)
+
+            closed, boundary_points = self.is_mapped_polygon_closed(boundary_grid)
             pending_frame = self._pending_lloyd_transition_frames.get(drone.drone_id)
 
             if closed and pending_frame is not None and self.frame > pending_frame:
@@ -756,11 +803,19 @@ class SimulationEngine:
         """Return state required by the visualizer."""
 
         error, mean_grid = self.compute_disagreement_error()
+        mean_information_grid = self.compute_mean_information_grid()
+        mean_boundary_grid = Drone.boundary_mask_from_probability(
+            mean_grid,
+            mean_information_grid,
+            occupancy_threshold=self.occupancy_threshold,
+        ).astype(float)
 
         return {
             "frame": self.frame,
             "world_field": self.world_field.copy(),
             "mean_grid": mean_grid.copy(),
+            "mean_information_grid": mean_information_grid.copy(),
+            "mean_boundary_grid": mean_boundary_grid.copy(),
             "disagreement_error": error,
             "drones": self.drones,
             "communication_radius": self.communication_radius,
@@ -770,6 +825,9 @@ class SimulationEngine:
             "error_history": list(self.error_history),
             "closure_enclosed_false_cells": self.last_closure_enclosed_false_cells,
             "closure_min_enclosed_false_cells": self.closure_min_enclosed_false_cells,
+            "grid_bounds": self.grid_bounds,
+            "grid_resolution": self.resolution,
+            "occupancy_threshold": self.occupancy_threshold,
         }
 
     def _print_sensor_status(self):

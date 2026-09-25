@@ -21,7 +21,7 @@ class Controller:
         self,
         sim_map,
         communication_radius,
-        occupancy_threshold=0.5,
+        occupancy_threshold=0.6,
         k_t=1.0,
         **kwargs,
     ):
@@ -812,7 +812,7 @@ class DroneController(Controller):
         sim_map=None,
         communication_radius=0.0,
         fully_connected=False,
-        occupancy_threshold=0.5,
+        occupancy_threshold=0.6,
         resolution=0.1,
         known_boundary_points=None,
         known_boundary_closed=True,
@@ -1042,12 +1042,26 @@ class DroneController(Controller):
         return self._clip_action(action, max_speed=self.max_speed)
 
     def _edge_tracking_action(self, drone):
+        edge_points = getattr(drone, "last_mapped_boundary_points", None)
+        if edge_points is not None:
+            edge_points = np.asarray(edge_points, dtype=float)
+            if edge_points.size > 0:
+                return self._point_cloud_tracking_action(drone, edge_points)
+
         edge_points = getattr(drone, "last_edge_points", None)
         if edge_points is None:
             return None
         return self._point_cloud_tracking_action(drone, edge_points)
 
     def _has_local_edge_points(self, drone):
+        edge_points = getattr(drone, "last_mapped_boundary_points", None)
+        if edge_points is not None:
+            edge_points = np.asarray(edge_points, dtype=float)
+            if edge_points.size > 0:
+                edge_points = edge_points.reshape(-1, 2)
+                if np.any(np.all(np.isfinite(edge_points), axis=1)):
+                    return True
+
         edge_points = getattr(drone, "last_edge_points", None)
         if edge_points is None:
             return False
@@ -1092,11 +1106,15 @@ class DroneController(Controller):
         )
 
     def _grid_points(self, drone):
-        grid = np.asarray(getattr(drone, "grid", np.zeros((1, 1), dtype=float)), dtype=float)
+        boundary_grid = getattr(drone, "boundary_grid", None)
+        if boundary_grid is not None and np.any(np.asarray(boundary_grid, dtype=float)):
+            grid = np.asarray(boundary_grid, dtype=float)
+        else:
+            grid = np.asarray(getattr(drone, "grid", np.zeros((1, 1), dtype=float)), dtype=float)
         if grid.size == 0:
             return None
 
-        occupied = np.argwhere(grid > self.occupancy_threshold)
+        occupied = np.argwhere(grid >= self.occupancy_threshold)
         if occupied.size == 0:
             return None
 

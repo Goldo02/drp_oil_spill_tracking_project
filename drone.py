@@ -28,6 +28,7 @@ class Drone:
         gps_noise=0.03,
         camera_noise=0.03,
         max_speed=0.12,
+        occupancy_threshold=0.6,
         controller=None,
     ):
 
@@ -45,9 +46,16 @@ class Drone:
 
         self.Nx, self.Ny = self.grid_shape
 
-        self.grid = np.zeros(self.grid_shape, dtype=float)
+        self.grid = np.full(self.grid_shape, 0.5, dtype=float)
+        self.occupancy_signal_grid = np.zeros(self.grid_shape, dtype=float)
+        self.information_grid = np.zeros(self.grid_shape, dtype=float)
+        self.boundary_grid = np.zeros(self.grid_shape, dtype=float)
         self.gps = GPSSensor(noise_std=gps_noise)
-        self.camera = CameraSensor(size=sensor_size, noise_std=camera_noise)
+        self.camera = CameraSensor(
+            size=sensor_size,
+            noise_std=camera_noise,
+            occupancy_threshold=occupancy_threshold,
+        )
         self.last_gps_position = np.asarray(self.get_gps_pos(), dtype=float)
 
         self.edge_detected = False
@@ -59,6 +67,9 @@ class Drone:
         self.last_oil_fraction = None
         self.last_camera_image = None
         self.last_camera_spacing = None
+        self.last_camera_center_position = None
+        self.last_camera_source_bounds = None
+        self.last_mapped_boundary_points = np.empty((0, 2), dtype=float)
         self.last_control_mode = "idle"
         self.last_control_vector = np.zeros(2, dtype=float)
         self.last_mapping_tangent = None
@@ -122,6 +133,8 @@ class Drone:
         return {
             "sender_id": self.drone_id,
             "grid": np.asarray(self.grid, dtype=float).copy(),
+            "signal_grid": np.asarray(self.occupancy_signal_grid, dtype=float).copy(),
+            "information_grid": np.asarray(self.information_grid, dtype=float).copy(),
         }
 
     @property
@@ -172,6 +185,8 @@ class Drone:
             self._clear_sensing_state()
             self.last_camera_image = None
             self.last_camera_spacing = None
+            self.last_camera_center_position = None
+            self.last_camera_source_bounds = None
             return self.last_edge_points
 
         if hasattr(measurement, "image"):
@@ -179,6 +194,22 @@ class Drone:
             dx = float(x_coords[1] - x_coords[0]) if len(x_coords) > 1 else 1.0
             dy = float(y_coords[1] - y_coords[0]) if len(y_coords) > 1 else 1.0
             self.last_camera_spacing = (abs(dx), abs(dy))
+            x_coords_arr = np.asarray(x_coords, dtype=float)
+            y_coords_arr = np.asarray(y_coords, dtype=float)
+            i_center = int(round((position_estimate[0] - x_coords_arr[0]) / dx))
+            j_center = int(round((position_estimate[1] - y_coords_arr[0]) / dy))
+            i_center = int(np.clip(i_center, 0, len(x_coords_arr) - 1))
+            j_center = int(np.clip(j_center, 0, len(y_coords_arr) - 1))
+            self.last_camera_center_position = np.array(
+                [x_coords_arr[i_center], y_coords_arr[j_center]],
+                dtype=float,
+            )
+            self.last_camera_source_bounds = (
+                float(np.min(x_coords_arr)),
+                float(np.max(x_coords_arr)),
+                float(np.min(y_coords_arr)),
+                float(np.max(y_coords_arr)),
+            )
 
         if hasattr(measurement, "edge_points"):
             edge_points = np.asarray(measurement.edge_points, dtype=float)
@@ -233,56 +264,223 @@ class Drone:
         resolution,
         alpha=None,
         point_radius_cells=0,
+        occupancy_threshold=0.6,
+        x_coords=None,
+        y_coords=None,
     ):
         """
-        Fuse detected edge points into the local occupancy grid as a binary map.
+        Fuse the latest camera footprint into the local occupancy grid.
 
-        Temporal smoothing is intentionally disabled: occupancy is represented as
-        either 0 (empty) or 1 (occupied), without alpha-based blending.
+        The occupancy estimate is probabilistic.  Cells observed by the camera
+        receive a local binary oil/no-oil measurement, while never-observed
+        cells remain unknown through ``information_grid == 0``.
         """
+        del alpha, point_radius_cells, x_coords, y_coords
 
+        if self.last_camera_image is not None:
+            return self._update_grid_from_camera(
+                x_min=x_min,
+                y_min=y_min,
+                resolution=resolution,
+                occupancy_threshold=occupancy_threshold,
+            )
+
+        return self._update_grid_from_points(
+            edge_points=edge_points,
+            x_min=x_min,
+            y_min=y_min,
+            resolution=resolution,
+            occupancy_threshold=occupancy_threshold,
+        )
+
+    def _update_grid_from_points(
+        self,
+        edge_points,
+        x_min,
+        y_min,
+        resolution,
+        occupancy_threshold,
+    ):
+        """Fallback for legacy point-only measurements."""
         if edge_points is None:
             return 0
-
         points = np.asarray(edge_points, dtype=float)
 
         if points.size == 0:
             return 0
 
         points = points.reshape(-1, 2)
-        measurement_grid = np.zeros_like(self.grid)
         valid_updates = 0
-        radius = max(0, int(round(point_radius_cells)))
-        footprint = [
-            (dx, dy)
-            for dx in range(-radius, radius + 1)
-            for dy in range(-radius, radius + 1)
-            if dx * dx + dy * dy <= radius * radius
-        ]
 
         for x, y in points:
             ix = int((x - x_min) / resolution)
             iy = int((y - y_min) / resolution)
 
             if 0 <= ix < self.Nx and 0 <= iy < self.Ny:
-                for dx, dy in footprint:
-                    x2 = ix + dx
-                    y2 = iy + dy
-                    if 0 <= x2 < self.Nx and 0 <= y2 < self.Ny:
-                        measurement_grid[x2, y2] = 1.0
+                self.occupancy_signal_grid[ix, iy] = 1.0
+                self.information_grid[ix, iy] = 1.0
                 valid_updates += 1
 
         if valid_updates == 0:
             return 0
 
-        self.grid = (np.maximum(self.grid, measurement_grid) > 0.0).astype(float)
+        self._refresh_probability_grid(occupancy_threshold=occupancy_threshold)
 
         return valid_updates
+
+    def _update_grid_from_camera(
+        self,
+        x_min,
+        y_min,
+        resolution,
+        occupancy_threshold,
+    ):
+        image = np.asarray(self.last_camera_image, dtype=float)
+        if image.ndim != 2 or image.size == 0:
+            return 0
+
+        spacing = self.last_camera_spacing
+        center = self.last_camera_center_position
+        if spacing is None or center is None:
+            return 0
+
+        dx, dy = spacing
+        dx = max(abs(float(dx)), 1e-12)
+        dy = max(abs(float(dy)), 1e-12)
+        center = np.asarray(center, dtype=float)
+        if center.shape != (2,) or not np.all(np.isfinite(center)):
+            return 0
+
+        rows, cols = np.indices(image.shape)
+        center_row = (image.shape[0] - 1) / 2.0
+        center_col = (image.shape[1] - 1) / 2.0
+
+        world_x = center[0] + (rows.astype(float) - center_row) * dx
+        world_y = center[1] + (cols.astype(float) - center_col) * dy
+
+        valid = np.isfinite(image)
+        source_bounds = self.last_camera_source_bounds
+        if source_bounds is not None:
+            sx_min, sx_max, sy_min, sy_max = source_bounds
+            valid &= (
+                (world_x >= sx_min)
+                & (world_x <= sx_max)
+                & (world_y >= sy_min)
+                & (world_y <= sy_max)
+            )
+
+        ix = np.floor((world_x - float(x_min)) / float(resolution)).astype(int)
+        iy = np.floor((world_y - float(y_min)) / float(resolution)).astype(int)
+        valid &= (0 <= ix) & (ix < self.Nx) & (0 <= iy) & (iy < self.Ny)
+
+        if not np.any(valid):
+            return 0
+
+        flat_idx = ix[valid] * self.Ny + iy[valid]
+        oil_pixels = (image[valid] >= float(occupancy_threshold)).astype(float)
+
+        cell_count = np.bincount(flat_idx, minlength=self.Nx * self.Ny)
+        oil_count = np.bincount(
+            flat_idx,
+            weights=oil_pixels,
+            minlength=self.Nx * self.Ny,
+        )
+        observed = cell_count > 0
+        if not np.any(observed):
+            return 0
+
+        measurement = np.zeros(self.Nx * self.Ny, dtype=float)
+        measurement[observed] = oil_count[observed] / cell_count[observed]
+        measurement = measurement.reshape(self.grid_shape)
+        observed = observed.reshape(self.grid_shape)
+
+        self.occupancy_signal_grid[observed] = measurement[observed]
+        self.information_grid[observed] = 1.0
+        self._refresh_probability_grid(occupancy_threshold=occupancy_threshold)
+
+        return int(np.count_nonzero(observed))
+
+    @staticmethod
+    def probability_from_signal(
+        signal_grid,
+        information_grid,
+        unknown_probability=0.5,
+    ):
+        signal = np.asarray(signal_grid, dtype=float)
+        information = np.asarray(information_grid, dtype=float)
+        probability = np.full(signal.shape, float(unknown_probability), dtype=float)
+        valid = information > 1e-12
+        probability[valid] = signal[valid] / information[valid]
+        return np.clip(probability, 0.0, 1.0)
+
+    @staticmethod
+    def boundary_mask_from_probability(
+        probability_grid,
+        information_grid=None,
+        occupancy_threshold=0.6,
+        known_threshold=1e-12,
+    ):
+        probability = np.asarray(probability_grid, dtype=float)
+        if information_grid is None:
+            known = np.ones_like(probability, dtype=bool)
+        else:
+            known = np.asarray(information_grid, dtype=float) > float(known_threshold)
+
+        occupied = (probability >= float(occupancy_threshold)) & known
+        known_free = (probability < float(occupancy_threshold)) & known
+
+        padded_free = np.pad(known_free, 1, mode="constant", constant_values=False)
+        neighbor_free = np.zeros_like(known_free, dtype=bool)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                neighbor_free |= padded_free[
+                    1 + dx : 1 + dx + known_free.shape[0],
+                    1 + dy : 1 + dy + known_free.shape[1],
+                ]
+
+        return occupied & neighbor_free
+
+    def _grid_resolution(self):
+        x_resolution = (self.x_max - self.x_min) / max(int(self.Nx), 1)
+        y_resolution = (self.y_max - self.y_min) / max(int(self.Ny), 1)
+        return 0.5 * (abs(float(x_resolution)) + abs(float(y_resolution)))
+
+    def _boundary_points_from_mask(self, boundary_mask):
+        cells = np.argwhere(np.asarray(boundary_mask, dtype=bool))
+        if cells.size == 0:
+            return np.empty((0, 2), dtype=float)
+
+        resolution = self._grid_resolution()
+        return np.column_stack(
+            (
+                self.x_min + (cells[:, 0] + 0.5) * resolution,
+                self.y_min + (cells[:, 1] + 0.5) * resolution,
+            )
+        ).astype(float)
+
+    def _refresh_probability_grid(self, occupancy_threshold=0.6):
+        self.grid = self.probability_from_signal(
+            self.occupancy_signal_grid,
+            self.information_grid,
+        )
+        boundary_mask = self.boundary_mask_from_probability(
+            self.grid,
+            self.information_grid,
+            occupancy_threshold=occupancy_threshold,
+        )
+        self.boundary_grid = boundary_mask.astype(float)
+        self.last_mapped_boundary_points = self._boundary_points_from_mask(boundary_mask)
+        return self.grid
 
     def consensus_step(
         self,
         neighbor_messages,
         own_grid=None,
+        own_signal_grid=None,
+        own_information_grid=None,
+        occupancy_threshold=0.6,
     ):
         """
         Merge local occupancy with maps received from neighboring drones.
@@ -303,26 +501,56 @@ class Drone:
         """
 
         if own_grid is None:
-            base_grid = self.grid
-        else:
-            base_grid = np.asarray(own_grid, dtype=float)
+            own_grid = self.grid
+        if own_signal_grid is None or own_information_grid is None:
+            own_signal_grid, own_information_grid = self._signal_information_from_message(
+                {
+                    "grid": own_grid,
+                    "signal_grid": own_signal_grid,
+                    "information_grid": own_information_grid,
+                }
+            )
 
-        grids = [np.asarray(base_grid, dtype=float)]
+        signals = [np.asarray(own_signal_grid, dtype=float)]
+        information = [np.asarray(own_information_grid, dtype=float)]
 
         for message in neighbor_messages:
-            grid = message.get("grid")
-            if grid is None:
+            signal_grid, information_grid = self._signal_information_from_message(message)
+            if signal_grid is None or information_grid is None:
                 continue
 
-            grids.append(np.asarray(grid, dtype=float))
+            signals.append(signal_grid)
+            information.append(information_grid)
 
-        if len(grids) == 1:
-            self.grid = (base_grid > 0.0).astype(float)
+        if len(signals) == 1:
+            self.occupancy_signal_grid = signals[0].copy()
+            self.information_grid = information[0].copy()
+            self._refresh_probability_grid(occupancy_threshold=occupancy_threshold)
             return self.grid
 
-        self.grid = (np.maximum.reduce(grids) > 0.0).astype(float)
+        self.occupancy_signal_grid = np.mean(signals, axis=0)
+        self.information_grid = np.mean(information, axis=0)
+        self._refresh_probability_grid(occupancy_threshold=occupancy_threshold)
 
         return self.grid
+
+    def _signal_information_from_message(self, message):
+        signal_grid = message.get("signal_grid")
+        information_grid = message.get("information_grid")
+        if signal_grid is not None and information_grid is not None:
+            return (
+                np.asarray(signal_grid, dtype=float),
+                np.asarray(information_grid, dtype=float),
+            )
+
+        grid = message.get("grid")
+        if grid is None:
+            return None, None
+
+        grid = np.asarray(grid, dtype=float)
+        information_grid = (np.abs(grid - 0.5) > 1e-12).astype(float)
+        signal_grid = grid * information_grid
+        return signal_grid, information_grid
 
     def action(
         self,

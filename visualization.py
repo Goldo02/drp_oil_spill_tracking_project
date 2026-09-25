@@ -71,6 +71,7 @@ class Visualizer:
         self.control_arrows = {}
         self.centroid_markers = {}
         self.voronoi_map_artists = []
+        self.occupancy_boundary_artists = []
         self.ring_color_map = {}
         self.animation_frames = []
         self.animation_recording_enabled = False
@@ -199,6 +200,62 @@ class Visualizer:
                 except Exception:
                     pass
         self.voronoi_map_artists = []
+
+    def _clear_occupancy_boundary_artists(self):
+        """Remove the probabilistic occupancy-boundary overlay."""
+        for artist in self.occupancy_boundary_artists:
+            if artist is not None:
+                try:
+                    artist.remove()
+                except Exception:
+                    pass
+        self.occupancy_boundary_artists = []
+
+    @staticmethod
+    def _boundary_points_from_grid(boundary_grid, grid_bounds, grid_resolution):
+        boundary = np.asarray(boundary_grid, dtype=float) >= 0.5
+        cells = np.argwhere(boundary)
+        if cells.size == 0:
+            return np.empty((0, 2), dtype=float)
+
+        x_min, _, y_min, _ = grid_bounds
+        resolution = float(grid_resolution)
+        return np.column_stack(
+            (
+                float(x_min) + (cells[:, 0] + 0.5) * resolution,
+                float(y_min) + (cells[:, 1] + 0.5) * resolution,
+            )
+        ).astype(float)
+
+    def update_occupancy_boundary_overlay(self, simulation_data):
+        """Draw the boundary extracted from the average-consensus occupancy map."""
+        self._clear_occupancy_boundary_artists()
+
+        boundary_grid = simulation_data.get("mean_boundary_grid")
+        grid_bounds = simulation_data.get("grid_bounds")
+        grid_resolution = simulation_data.get("grid_resolution")
+        if boundary_grid is None or grid_bounds is None or grid_resolution is None:
+            return
+
+        points = self._boundary_points_from_grid(
+            boundary_grid,
+            grid_bounds,
+            grid_resolution,
+        )
+        if points.size == 0:
+            return
+
+        scatter = self.ax.scatter(
+            points[:, 0],
+            points[:, 1],
+            s=12,
+            c="#18a8ff",
+            marker="s",
+            edgecolors="none",
+            alpha=0.9,
+            zorder=4.5,
+        )
+        self.occupancy_boundary_artists.append(scatter)
 
     @staticmethod
     def _ring_data_from_drones(drones):
@@ -370,6 +427,7 @@ class Visualizer:
 
         if (
             getattr(drone, "control_state", "mapping") == "mapping"
+            and self.show_nls_points
             and
             getattr(drone, "edge_detected", False)
             and getattr(drone, "last_edge_point", None) is not None
@@ -515,6 +573,19 @@ class Visualizer:
             interpolation="nearest",
             aspect="auto",
         )
+        boundary_grid = simulation_data.get("mean_boundary_grid")
+        if boundary_grid is not None:
+            cells = np.argwhere(np.asarray(boundary_grid, dtype=float) >= 0.5)
+            if cells.size > 0:
+                self.side_ax.scatter(
+                    cells[:, 0],
+                    cells[:, 1],
+                    s=5,
+                    c="#18a8ff",
+                    marker="s",
+                    edgecolors="none",
+                    alpha=0.95,
+                )
         self.side_ax.set_title("Mean Occupancy Grid")
         self.side_ax.set_xlabel("Grid X")
         self.side_ax.set_ylabel("Grid Y")
@@ -756,8 +827,8 @@ class Visualizer:
         )
         return output_path
 
-    def _save_grid_plot(self, grid, title, output_path, alpha=1.0):
-        binary_grid = (np.asarray(grid, dtype=float) >= 0.5).astype(float)
+    def _save_grid_plot(self, grid, title, output_path, alpha=1.0, threshold=0.6):
+        binary_grid = (np.asarray(grid, dtype=float) >= float(threshold)).astype(float)
         fig, ax = plt.subplots(figsize=(8, 7))
         im = ax.imshow(
             binary_grid.T,
@@ -789,6 +860,7 @@ class Visualizer:
         directory="./tmp_output",
         filename_prefix="final_occupancy_grid_robot",
         alpha=1.0,
+        threshold=0.6,
     ):
         """Save the final local occupancy grid of every drone to PNG files."""
         if drones is None:
@@ -810,6 +882,7 @@ class Visualizer:
                 f"Final Occupancy Grid - Drone {drone.drone_id}",
                 output_path,
                 alpha=alpha,
+                threshold=threshold,
             )
 
         print(f"Per-drone final occupancy grids saved to {output_dir}.")
@@ -876,10 +949,17 @@ class Visualizer:
         filename="final_occupancy_grid.png",
         directory="./tmp_output",
         alpha=1.0,
+        threshold=0.6,
     ):
         """Genera e salva la griglia di occupazione finale unificata."""
         output_path = self._output_path(filename, directory)
-        self._save_grid_plot(final_grid, "Final Occupancy Grid", output_path, alpha=alpha)
+        self._save_grid_plot(
+            final_grid,
+            "Final Occupancy Grid",
+            output_path,
+            alpha=alpha,
+            threshold=threshold,
+        )
         print(f"Final occupancy grid saved to {output_path}.")
 
     def render(self, simulation_data, pause=None):
@@ -904,6 +984,7 @@ class Visualizer:
         if world_field is not None:
             self.update_environment(world_field)
 
+        self.update_occupancy_boundary_overlay(simulation_data)
         self.update_voronoi_map_overlay(drones)
 
         for drone in drones:

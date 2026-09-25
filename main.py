@@ -96,7 +96,7 @@ def _build_engine(
         measure_every=measure_every,
         communication_radius_cells=communication_radius_cells,
         fully_connected=fully_connected,
-        occupancy_threshold=0.5,
+        occupancy_threshold=0.6,
         temporal_alpha=0.05,
         consensus_rounds=10,
         dt=dt,
@@ -206,6 +206,7 @@ def _save_outputs(
         "final_occupancy_grid.png",
         directory=OUTPUT_DIR,
         alpha=1.0,
+        threshold=engine.occupancy_threshold,
     )
     if save_gif:
         visualizer.save_animation_as_gif(
@@ -217,6 +218,7 @@ def _save_outputs(
         engine.drones,
         directory=OUTPUT_DIR,
         alpha=1.0,
+        threshold=engine.occupancy_threshold,
     )
 
 
@@ -231,15 +233,21 @@ def _ordered_points_by_angle(points):
 
 
 def _mapped_boundary_points_from_consensus(engine):
-    mean_grid = np.asarray(engine.compute_mean_grid(), dtype=float)
-    occupied = np.argwhere(mean_grid > float(engine.occupancy_threshold))
-    if occupied.size == 0:
+    if hasattr(engine, "compute_mean_boundary_grid"):
+        boundary_grid = np.asarray(engine.compute_mean_boundary_grid(), dtype=float)
+    else:
+        mean_grid = np.asarray(engine.compute_mean_grid(), dtype=float)
+        occupied = mean_grid >= float(engine.occupancy_threshold)
+        boundary_grid = occupied.astype(float)
+
+    boundary_cells = np.argwhere(boundary_grid >= 0.5)
+    if boundary_cells.size == 0:
         return np.empty((0, 2), dtype=float)
 
     points = np.column_stack(
         (
-            engine.x_min + (occupied[:, 0] + 0.5) * engine.resolution,
-            engine.y_min + (occupied[:, 1] + 0.5) * engine.resolution,
+            engine.x_min + (boundary_cells[:, 0] + 0.5) * engine.resolution,
+            engine.y_min + (boundary_cells[:, 1] + 0.5) * engine.resolution,
         )
     )
     return _ordered_points_by_angle(points)
@@ -250,7 +258,7 @@ def _save_oil_mapping(engine, sim_map, spill, output_path):
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     points = _mapped_boundary_points_from_consensus(engine)
-    source = "consensus_mean_grid"
+    source = "information_weighted_average_consensus_boundary"
 
     points = np.asarray(points, dtype=float).reshape(-1, 2)
     if points.shape[0] < 3:

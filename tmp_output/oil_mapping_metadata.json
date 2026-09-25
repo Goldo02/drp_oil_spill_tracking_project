@@ -1,16 +1,16 @@
 {
   "data_file": "oil_mapping_data.npy",
-  "source": "consensus_mean_grid",
+  "source": "information_weighted_average_consensus_boundary",
   "coordinate_frame": "world",
   "units": "simulation_world_units",
   "shape": [
-    583,
+    272,
     2
   ],
   "dtype": "float64",
   "closed_boundary": true,
   "ordered_boundary": true,
-  "occupancy_threshold": 0.5,
+  "occupancy_threshold": 0.6,
   "sim_map": {
     "xlim": [
       -5.0,
