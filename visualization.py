@@ -60,6 +60,8 @@ class Visualizer:
 
         self.img = None
         self.contour = None
+        self.phase_text = None
+        self.side_colorbar = None
 
         if self.oil_spill is not None:
             self._draw_environment()
@@ -219,6 +221,36 @@ class Visualizer:
                     artist.remove()
 
             del self.centroid_markers[drone_id]
+
+    def update_phase_label(self, control_state):
+        labels = {
+            "mapping": "Phase: Mapping",
+            "dynamic_lloyd": "Phase: Dynamic Lloyd",
+            "boundary_patrol": "Phase: Boundary Patrol",
+            "lloyd": "Phase: Lloyd",
+        }
+        label = labels.get(str(control_state), f"Phase: {control_state}")
+        if self.phase_text is None:
+            self.phase_text = self.ax.text(
+                0.02,
+                0.98,
+                label,
+                transform=self.ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=10,
+                fontweight="bold",
+                color="black",
+                bbox={
+                    "boxstyle": "round,pad=0.25",
+                    "facecolor": "white",
+                    "edgecolor": "black",
+                    "alpha": 0.75,
+                },
+                zorder=10,
+            )
+        else:
+            self.phase_text.set_text(label)
 
     def _drone_color(self, drone_id):
         if drone_id not in self.ring_color_map:
@@ -425,7 +457,11 @@ class Visualizer:
         self.ax.add_patch(body)
         patches.append(body)
 
-        if getattr(drone, "control_state", "mapping") == "mapping" and hasattr(drone, "camera"):
+        if (
+            getattr(drone, "control_state", "mapping")
+            in ("mapping", "boundary_patrol")
+            and hasattr(drone, "camera")
+        ):
             dx = self.sim_map.dx
             dy = self.sim_map.dy
             sensor_size = getattr(drone.camera, "size", 1)
@@ -560,7 +596,11 @@ class Visualizer:
 
         centroid_artists = []
         target_centroid = getattr(drone, "target_centroid", None)
-        if getattr(drone, "control_state", "mapping") == "lloyd" and target_centroid is not None:
+        if (
+            getattr(drone, "control_state", "mapping")
+            in ("lloyd", "dynamic_lloyd", "boundary_patrol")
+            and target_centroid is not None
+        ):
             tc = np.asarray(target_centroid, dtype=float)
             if tc.shape == (2,) and np.all(np.isfinite(tc)):
                 marker = self.ax.scatter(
@@ -586,6 +626,13 @@ class Visualizer:
         self.centroid_markers[drone_id] = centroid_artists
 
     def _prepare_side_axis(self, mode):
+        if self.side_colorbar is not None:
+            try:
+                self.side_colorbar.remove()
+            except Exception:
+                pass
+            self.side_colorbar = None
+
         if self.side_mode != mode:
             self.side_ax.clear()
             self.side_mode = mode
@@ -599,7 +646,7 @@ class Visualizer:
             mean_grid = np.zeros((1, 1), dtype=float)
 
         mean_grid = np.asarray(mean_grid, dtype=float)
-        self.side_ax.imshow(
+        image = self.side_ax.imshow(
             mean_grid.T,
             origin="lower",
             cmap="Greys",
@@ -624,6 +671,14 @@ class Visualizer:
         self.side_ax.set_title("Mean Occupancy Grid")
         self.side_ax.set_xlabel("Grid X")
         self.side_ax.set_ylabel("Grid Y")
+        self.side_colorbar = self.fig.colorbar(
+            image,
+            ax=self.side_ax,
+            location="left",
+            fraction=0.046,
+            pad=0.08,
+        )
+        self.side_colorbar.set_label("Oil occupancy probability")
 
     def update_ring_partition(self, drones):
         self._prepare_side_axis("lloyd")
@@ -1015,6 +1070,8 @@ class Visualizer:
         world_field = simulation_data.get("world_field")
 
         drones = simulation_data.get("drones", [])
+        control_state = simulation_data.get("control_state", "mapping")
+        self.update_phase_label(control_state)
 
         if world_field is not None:
             self.update_environment(world_field)
@@ -1025,8 +1082,7 @@ class Visualizer:
         for drone in drones:
             self.update_drone(drone)
 
-        control_state = simulation_data.get("control_state", "mapping")
-        if control_state == "lloyd":
+        if control_state in ("lloyd", "dynamic_lloyd"):
             self.update_ring_partition(drones)
         else:
             self._render_mean_occupancy_panel(simulation_data)

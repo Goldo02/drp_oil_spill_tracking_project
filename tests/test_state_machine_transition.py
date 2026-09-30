@@ -23,6 +23,18 @@ def make_engine_shell():
     engine.last_closure_enclosed_false_cells = 0
     engine.transition_frame = None
     engine._pending_lloyd_transition_frames = {}
+    engine.dynamic_lloyd_ready_count = 0
+    engine.dynamic_lloyd_required_ready_count = 8
+    engine.dynamic_lloyd_arc_tolerance = 0.25
+    engine.patrol_forgetting_alpha = 0.995
+    engine.patrol_speed = 0.05
+    engine.patrol_min_speed = 0.01
+    engine.patrol_max_speed = 0.10
+    engine.patrol_spacing_gain = 0.08
+    engine.patrol_direction = 1.0
+    engine.patrol_reference_s = None
+    engine.patrol_ordered_ids = []
+    engine.patrol_start_frame = None
     return engine
 
 
@@ -224,10 +236,48 @@ def test_decentralized_transition_waits_for_consensus_after_closure_detection():
     engine._check_decentralized_mapping_transitions()
 
     assert engine.drones[0].control_state == "mapping"
-    assert engine._pending_lloyd_transition_frames == {"D0": 7}
+    assert engine._pending_lloyd_transition_frames == {"all": 7}
 
     engine.frame = 8
     engine._check_decentralized_mapping_transitions()
 
-    assert engine.drones[0].control_state == "lloyd"
+    assert engine.drones[0].control_state == "dynamic_lloyd"
+    assert engine.control_state == "dynamic_lloyd"
     assert engine._pending_lloyd_transition_frames == {}
+
+
+def test_patrol_targets_advance_along_ordered_boundary():
+    engine = make_engine_shell()
+    engine.dt = 1.0
+    engine.control_state = "boundary_patrol"
+    engine.frame = 10
+    boundary = np.array(
+        [
+            [-1.0, -1.0],
+            [1.0, -1.0],
+            [1.0, 1.0],
+            [-1.0, 1.0],
+        ],
+        dtype=float,
+    )
+    engine.closed_boundary_points = boundary
+    engine.drones = [
+        Drone("D0", -1.0, -1.0, (12, 12), (-1.0, 1.0, -1.0, 1.0), gps_noise=0.0),
+        Drone("D1", 1.0, -1.0, (12, 12), (-1.0, 1.0, -1.0, 1.0), gps_noise=0.0),
+        Drone("D2", 1.0, 1.0, (12, 12), (-1.0, 1.0, -1.0, 1.0), gps_noise=0.0),
+        Drone("D3", -1.0, 1.0, (12, 12), (-1.0, 1.0, -1.0, 1.0), gps_noise=0.0),
+    ]
+    engine._set_boundary_for_all_drones(boundary)
+    for drone in engine.drones:
+        drone.control_state = "boundary_patrol"
+    engine.patrol_ordered_ids = [drone.drone_id for drone in engine.drones]
+    engine.patrol_reference_s = 0.0
+
+    assert engine._update_patrol_targets()
+
+    targets = [drone.patrol_target_s for drone in engine.drones]
+    assert all(target is not None for target in targets)
+    assert targets[0] == pytest.approx(engine.patrol_speed)
+    for drone in engine.drones:
+        assert drone.target_centroid is not None
+        assert drone.last_ring_info is None

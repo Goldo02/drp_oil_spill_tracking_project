@@ -1,7 +1,8 @@
 import numpy as np
+import pytest
 
 from environment import SimulationMap, SmoothedPolygonOilSpill
-from main import _dynamic_drift_velocity
+from main import _dynamic_drift_velocity, _dynamic_expansion_speed
 
 
 def test_smoothed_polygon_drift_translates_geometry_and_field():
@@ -27,6 +28,38 @@ def test_smoothed_polygon_drift_translates_geometry_and_field():
     assert not np.allclose(spill.get_field(), initial_field)
 
 
+def test_smoothed_polygon_expansion_scales_geometry_and_field():
+    sim_map = SimulationMap(xlim=(-5.0, 5.0), ylim=(-5.0, 5.0), grid_size=80)
+    spill = SmoothedPolygonOilSpill(
+        sim_map.X,
+        sim_map.Y,
+        seed=7,
+        expansion_speed=0.2,
+    )
+
+    initial_center = np.array([spill.x0, spill.y0], dtype=float)
+    initial_vertices = spill.vertices.copy()
+    initial_boundary = spill.boundary.copy()
+    initial_radius = spill.radius
+    initial_field = spill.get_field()
+
+    spill.update(2.0)
+
+    expected_radius = initial_radius + 0.4
+    expected_scale = expected_radius / initial_radius
+    np.testing.assert_allclose([spill.x0, spill.y0], initial_center)
+    np.testing.assert_allclose(spill.radius, expected_radius)
+    np.testing.assert_allclose(
+        spill.vertices,
+        initial_center + (initial_vertices - initial_center) * expected_scale,
+    )
+    np.testing.assert_allclose(
+        spill.boundary,
+        initial_center + (initial_boundary - initial_center) * expected_scale,
+    )
+    assert not np.allclose(spill.get_field(), initial_field)
+
+
 def test_dynamic_drift_velocity_is_seeded_and_map_scaled():
     sim_map = SimulationMap(xlim=(-5.0, 5.0), ylim=(-5.0, 5.0), grid_size=20)
 
@@ -43,3 +76,11 @@ def test_dynamic_drift_velocity_is_seeded_and_map_scaled():
         fast_velocity / np.linalg.norm(fast_velocity),
         velocity_a / np.linalg.norm(velocity_a),
     )
+
+
+def test_dynamic_expansion_speed_validation():
+    assert _dynamic_expansion_speed(None) == 0.0
+    assert _dynamic_expansion_speed(0.02) == 0.02
+
+    with pytest.raises(ValueError, match="dynamic_expand"):
+        _dynamic_expansion_speed(-0.01)

@@ -84,6 +84,8 @@ class Drone:
         self.pending_boundary_s = None
         self.pending_boundary_point = None
         self.target_centroid = None
+        self.patrol_target_s = None
+        self.patrol_order_index = None
         self.last_ring_info = None
 
         self.exploration_direction = self._random_unit_direction()
@@ -473,6 +475,18 @@ class Drone:
         self.boundary_grid = boundary_mask.astype(float)
         self.last_mapped_boundary_points = self._boundary_points_from_mask(boundary_mask)
         return self.grid
+
+    def apply_forgetting(self, alpha, occupancy_threshold=0.6):
+        """Fade old map evidence toward uncertainty."""
+        alpha = float(np.clip(alpha, 0.0, 1.0))
+        if alpha >= 1.0:
+            return self.grid
+
+        probability = np.asarray(self.grid, dtype=float)
+        probability = alpha * probability + (1.0 - alpha) * 0.5
+        self.information_grid = alpha * np.asarray(self.information_grid, dtype=float)
+        self.occupancy_signal_grid = probability * self.information_grid
+        return self._refresh_probability_grid(occupancy_threshold=occupancy_threshold)
 
     def consensus_step(
         self,

@@ -175,12 +175,14 @@ class CircleOilSpill(OilSpill):
         radius=2.0,
         sigma=0.5,
         drift_velocity=(0.0, 0.0),
+        expansion_speed=0.0,
     ):
         self.x0 = float(x0)
         self.y0 = float(y0)
         self.radius = float(radius)
         self.sigma = float(sigma)
         self.drift_velocity = np.asarray(drift_velocity, dtype=float)
+        self.expansion_speed = float(expansion_speed)
 
         if self.drift_velocity.shape != (2,):
             raise ValueError("drift_velocity must have shape (2,)")
@@ -190,6 +192,9 @@ class CircleOilSpill(OilSpill):
 
         if self.sigma <= 0:
             raise ValueError("sigma must be positive")
+
+        if self.expansion_speed < 0.0:
+            raise ValueError("expansion_speed must be non-negative")
 
         self._field = None
 
@@ -209,13 +214,23 @@ class CircleOilSpill(OilSpill):
         )
 
     def update(self, dt):
-        """Translate the spill center according to the configured drift."""
-        displacement = self.drift_velocity * float(dt)
-        if float(np.linalg.norm(displacement)) <= 1e-12:
+        """Translate and expand the spill according to configured dynamics."""
+        dt = float(dt)
+        displacement = self.drift_velocity * dt
+        radius_delta = self.expansion_speed * dt
+
+        moved = float(np.linalg.norm(displacement)) > 1e-12
+        expanded = abs(radius_delta) > 1e-12
+        if not moved and not expanded:
             return
 
-        self.x0 += float(displacement[0])
-        self.y0 += float(displacement[1])
+        if moved:
+            self.x0 += float(displacement[0])
+            self.y0 += float(displacement[1])
+
+        if expanded:
+            self.radius += float(radius_delta)
+
         self._field = None
 
 
@@ -235,6 +250,7 @@ class SmoothedPolygonOilSpill(OilSpill):
         continuous=False,
         boundary_samples=None,
         drift_velocity=(0.0, 0.0),
+        expansion_speed=0.0,
     ):
         self.X = np.asarray(X, dtype=float)
         self.Y = np.asarray(Y, dtype=float)
@@ -250,9 +266,13 @@ class SmoothedPolygonOilSpill(OilSpill):
 
         self.continuous = bool(continuous)
         self.drift_velocity = np.asarray(drift_velocity, dtype=float)
+        self.expansion_speed = float(expansion_speed)
 
         if self.drift_velocity.shape != (2,):
             raise ValueError("drift_velocity must have shape (2,)")
+
+        if self.expansion_speed < 0.0:
+            raise ValueError("expansion_speed must be non-negative")
 
         self.boundary_samples = int(boundary_samples) if boundary_samples is not None else 500
 
@@ -406,14 +426,30 @@ class SmoothedPolygonOilSpill(OilSpill):
         return self._evaluate_field(X, Y)
 
     def update(self, dt):
-        """Translate the spill rigidly according to the configured drift."""
-        displacement = self.drift_velocity * float(dt)
-        if float(np.linalg.norm(displacement)) <= 1e-12:
+        """Translate and expand the spill according to configured dynamics."""
+        dt = float(dt)
+        displacement = self.drift_velocity * dt
+        radius_delta = self.expansion_speed * dt
+
+        moved = float(np.linalg.norm(displacement)) > 1e-12
+        expanded = abs(radius_delta) > 1e-12
+        if not moved and not expanded:
             return
 
-        self.x0 += float(displacement[0])
-        self.y0 += float(displacement[1])
-        self.vertices = self.vertices + displacement
-        self.boundary = self.boundary + displacement
+        if moved:
+            self.x0 += float(displacement[0])
+            self.y0 += float(displacement[1])
+            self.vertices = self.vertices + displacement
+            self.boundary = self.boundary + displacement
+
+        if expanded:
+            next_radius = self.radius + float(radius_delta)
+            scale = next_radius / max(self.radius, 1e-12)
+            center = np.array([self.x0, self.y0], dtype=float)
+            self.vertices = center + (self.vertices - center) * scale
+            self.boundary = center + (self.boundary - center) * scale
+            self.radius = next_radius
+            self.r0 *= scale
+
         self._path = Path(self.boundary, closed=True)
         self._field = self._evaluate_field(self.X, self.Y)

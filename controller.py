@@ -1179,7 +1179,8 @@ class DroneController(Controller):
 
     def _lloyd_action(self, drone):
         ring_info = self.compute_ring_ordering(drone, None)
-        drone.last_control_mode = "lloyd"
+        state = getattr(drone, "control_state", "mapping")
+        drone.last_control_mode = "dynamic_lloyd" if state == "dynamic_lloyd" else "lloyd"
         action = self._equidistant_action(
             drone,
             ring_info,
@@ -1192,6 +1193,20 @@ class DroneController(Controller):
             max_speed=getattr(drone, "max_speed", self.max_speed),
         )
 
+    def _patrol_action(self, drone):
+        target = getattr(drone, "target_centroid", None)
+        if target is None:
+            return self._lloyd_action(drone)
+
+        current_pos = self._estimated_position(drone)
+        target = np.asarray(target, dtype=float)
+        drone.last_control_mode = "boundary_patrol"
+        action = float(self.k_t) * (target - current_pos)
+        return self._clip_action(
+            action,
+            max_speed=getattr(drone, "max_speed", self.max_speed),
+        )
+
     def compute_action(
         self,
         drone,
@@ -1199,8 +1214,11 @@ class DroneController(Controller):
         x_coords=None,
         y_coords=None,
     ):
-        if getattr(drone, "control_state", "mapping") == "lloyd":
+        state = getattr(drone, "control_state", "mapping")
+        if state in ("lloyd", "dynamic_lloyd"):
             return self._lloyd_action(drone)
+        if state == "boundary_patrol":
+            return self._patrol_action(drone)
 
         if world_field is None or x_coords is None or y_coords is None:
             if self.known_boundary_points is not None and len(self.known_boundary_points) > 0:

@@ -89,6 +89,18 @@ class SimulationEngine:
         self.transition_frame = None
         self._pending_lloyd_transition_frames = {}
         self.closed_boundary_points = np.empty((0, 2), dtype=float)
+        self.dynamic_lloyd_ready_count = 0
+        self.dynamic_lloyd_required_ready_count = 8
+        self.dynamic_lloyd_arc_tolerance = 0.25
+        self.patrol_forgetting_alpha = 0.995
+        self.patrol_speed = 0.05
+        self.patrol_min_speed = 0.01
+        self.patrol_max_speed = 0.10
+        self.patrol_spacing_gain = 0.08
+        self.patrol_direction = 1.0
+        self.patrol_reference_s = None
+        self.patrol_ordered_ids = []
+        self.patrol_start_frame = None
         self.boundary_controller = Controller(
             sim_map=self.sim_map,
             communication_radius=self.communication_radius,
@@ -162,6 +174,16 @@ class SimulationEngine:
                 occupancy_threshold=self.occupancy_threshold,
                 x_coords=self.sim_map.x_coords,
                 y_coords=self.sim_map.y_coords,
+            )
+
+    def _apply_forgetting_if_needed(self):
+        if self.control_state != "boundary_patrol":
+            return
+
+        for drone in self.drones:
+            drone.apply_forgetting(
+                self.patrol_forgetting_alpha,
+                occupancy_threshold=self.occupancy_threshold,
             )
 
     def _refresh_position_estimates(self):
@@ -399,18 +421,26 @@ class SimulationEngine:
     def _lloyd_drones(self):
         return [
             drone for drone in self.drones
-            if getattr(drone, "control_state", "mapping") == "lloyd"
+            if getattr(drone, "control_state", "mapping")
+            in ("lloyd", "dynamic_lloyd")
         ]
 
     def _mapping_drones(self):
         return [
             drone for drone in self.drones
-            if getattr(drone, "control_state", "mapping") != "lloyd"
+            if getattr(drone, "control_state", "mapping") == "mapping"
+        ]
+
+    def _patrol_drones(self):
+        return [
+            drone for drone in self.drones
+            if getattr(drone, "control_state", "mapping") == "boundary_patrol"
         ]
 
     def _apply_lloyd_actions(self, active_drones=None):
         """Compute decentralized 1D Voronoi/Lloyd actions and apply them."""
         active_drones = list(active_drones) if active_drones is not None else self.drones
+        self._refresh_dynamic_boundary()
 
         for drone in active_drones:
             if hasattr(drone, "update_position_estimate"):
@@ -477,13 +507,145 @@ class SimulationEngine:
                 drone.update_boundary_projection()
 
     def _apply_actions(self):
-        lloyd_drones = self._lloyd_drones()
-        if lloyd_drones and len(lloyd_drones) == len(self.drones):
-            self._apply_lloyd_actions(active_drones=lloyd_drones)
-        elif lloyd_drones:
-            self._apply_mixed_actions()
+        if self.control_state == "mapping":
+            self._apply_mapping_actions()
+        elif self.control_state == "dynamic_lloyd":
+            self._apply_lloyd_actions(active_drones=self.drones)
+        elif self.control_state == "boundary_patrol":
+            self._apply_patrol_actions()
         else:
             self._apply_mapping_actions()
+
+    def _drone_by_id(self):
+        return {drone.drone_id: drone for drone in self.drones}
+
+    def _ensure_patrol_order(self):
+        if self.patrol_ordered_ids and set(self.patrol_ordered_ids) == {
+            drone.drone_id for drone in self.drones
+        }:
+            return
+
+        ordered = sorted(
+            self.drones,
+            key=lambda drone: float(getattr(drone, "boundary_s", 0.0) or 0.0),
+        )
+        self.patrol_ordered_ids = [drone.drone_id for drone in ordered]
+        if ordered:
+            self.patrol_reference_s = float(getattr(ordered[0], "boundary_s", 0.0) or 0.0)
+
+    def _update_patrol_targets(self):
+        boundary = np.asarray(self.closed_boundary_points, dtype=float)
+        if boundary.shape[0] < 3:
+            return False
+
+        arc_lengths, total_length = Controller._boundary_arc_lengths(
+            boundary,
+            is_closed=True,
+        )
+        if total_length <= 1e-12:
+            return False
+
+        self._ensure_patrol_order()
+        if self.patrol_reference_s is None:
+            self.patrol_reference_s = 0.0
+
+        self.patrol_reference_s = (
+            float(self.patrol_reference_s)
+            + float(self.patrol_direction) * float(self.patrol_speed) * float(self.dt)
+        ) % float(total_length)
+
+        drones_by_id = self._drone_by_id()
+        ordered = [
+            drones_by_id[drone_id]
+            for drone_id in self.patrol_ordered_ids
+            if drone_id in drones_by_id
+        ]
+        count = len(ordered)
+        if count == 0:
+            return False
+
+        actual_s = np.array(
+            [
+                float(getattr(drone, "boundary_s", 0.0) or 0.0) % float(total_length)
+                for drone in ordered
+            ],
+            dtype=float,
+        )
+        spacing = float(total_length) / float(count)
+        max_spacing_offset = 0.25 * spacing
+
+        for idx, drone in enumerate(ordered):
+            base_target_s = (
+                self.patrol_reference_s + idx * spacing
+            ) % float(total_length)
+
+            spacing_offset = 0.0
+            if count > 2:
+                prev_s = actual_s[(idx - 1) % count]
+                curr_s = actual_s[idx]
+                next_s = actual_s[(idx + 1) % count]
+                if self.patrol_direction >= 0.0:
+                    d_front = (next_s - curr_s) % float(total_length)
+                    d_back = (curr_s - prev_s) % float(total_length)
+                else:
+                    d_front = (curr_s - prev_s) % float(total_length)
+                    d_back = (next_s - curr_s) % float(total_length)
+
+                speed_i = self.patrol_speed + self.patrol_spacing_gain * (
+                    d_front - d_back
+                )
+                speed_i = float(
+                    np.clip(speed_i, self.patrol_min_speed, self.patrol_max_speed)
+                )
+                spacing_offset = (
+                    float(self.patrol_direction)
+                    * (speed_i - self.patrol_speed)
+                    * float(self.dt)
+                )
+                spacing_offset = float(
+                    np.clip(spacing_offset, -max_spacing_offset, max_spacing_offset)
+                )
+
+            target_s = (base_target_s + spacing_offset) % float(total_length)
+            target_point = Controller._point_at_arc_length(
+                boundary,
+                arc_lengths,
+                target_s,
+                total_length,
+                True,
+            )
+            drone.patrol_order_index = idx
+            drone.patrol_target_s = float(target_s)
+            drone.target_centroid = target_point
+
+        return True
+
+    def _apply_patrol_actions(self):
+        if not self._refresh_dynamic_boundary():
+            return self._apply_lloyd_actions(active_drones=self.drones)
+
+        for drone in self.drones:
+            if hasattr(drone, "update_position_estimate"):
+                drone.update_position_estimate()
+            drone.update_boundary_projection()
+
+        self._exchange_positions_multihop()
+        self._update_patrol_targets()
+
+        actions = {drone.drone_id: drone.compute_action() for drone in self.drones}
+
+        for drone in self.drones:
+            action = actions.get(drone.drone_id, np.zeros(2, dtype=float))
+            drone.action(
+                action,
+                bounds=(
+                    self.sim_map.xlim,
+                    self.sim_map.ylim,
+                ),
+            )
+            if hasattr(drone, "update_position_estimate"):
+                drone.update_position_estimate()
+            drone.update_boundary_projection()
 
     def _occupied_boundary_cells(self, grid):
         occupied = np.asarray(grid, dtype=float) >= self.occupancy_threshold
@@ -727,6 +889,126 @@ class SimulationEngine:
             mean_grid = self.compute_mean_boundary_grid()
         return self._dfs_polygon_closure_check(mean_grid)
 
+    def _set_boundary_for_all_drones(self, boundary_points):
+        boundary_points = np.asarray(boundary_points, dtype=float).reshape(-1, 2)
+        if boundary_points.shape[0] < 3:
+            return False
+
+        self.closed_boundary_points = boundary_points.copy()
+        self.boundary_controller.known_boundary_points = boundary_points.copy()
+        self.boundary_controller.known_boundary_closed = True
+        self.boundary_controller.known_boundary_ordered = True
+
+        for drone in self.drones:
+            drone.set_known_boundary(
+                boundary_points,
+                known_boundary_closed=True,
+                already_ordered=True,
+            )
+            if hasattr(drone, "update_position_estimate"):
+                drone.update_position_estimate()
+            drone.update_boundary_projection()
+        return True
+
+    def _refresh_dynamic_boundary(self):
+        boundary_grid = self.compute_mean_boundary_grid()
+        closed, boundary_points = self.is_mapped_polygon_closed(boundary_grid)
+        if not closed:
+            return False
+        return self._set_boundary_for_all_drones(boundary_points)
+
+    def _transition_all_to_dynamic_lloyd(self, boundary_points):
+        if not self._set_boundary_for_all_drones(boundary_points):
+            return
+
+        if self.transition_frame is None:
+            self.transition_frame = self.frame
+
+        self.control_state = "dynamic_lloyd"
+        self.dynamic_lloyd_ready_count = 0
+        self._pending_lloyd_transition_frames.clear()
+        self.patrol_reference_s = None
+        self.patrol_ordered_ids = []
+        for drone in self.drones:
+            drone.control_state = "dynamic_lloyd"
+            drone.patrol_target_s = None
+            drone.patrol_order_index = None
+            drone.known_positions[drone.drone_id] = Controller._estimated_position(drone)
+            if drone.boundary_s is not None:
+                drone.known_boundary_arcs[drone.drone_id] = float(drone.boundary_s)
+
+    @staticmethod
+    def _arc_distance(a, b, total_length):
+        if total_length <= 1e-12:
+            return abs(float(a) - float(b))
+        diff = abs((float(a) - float(b)) % float(total_length))
+        return float(min(diff, float(total_length) - diff))
+
+    def _update_dynamic_lloyd_completion(self):
+        if self.control_state != "dynamic_lloyd":
+            return
+        if not self.drones or self.closed_boundary_points.shape[0] < 3:
+            self.dynamic_lloyd_ready_count = 0
+            return
+
+        errors = []
+        for drone in self.drones:
+            ring_info = getattr(drone, "last_ring_info", None)
+            current = ring_info.get("current", {}) if isinstance(ring_info, dict) else {}
+            target_s = current.get("target_arc_length")
+            boundary_s = getattr(drone, "boundary_s", None)
+            total_length = ring_info.get("total_boundary_length", 0.0) if isinstance(ring_info, dict) else 0.0
+            if target_s is None or boundary_s is None or total_length <= 1e-12:
+                self.dynamic_lloyd_ready_count = 0
+                return
+            errors.append(self._arc_distance(boundary_s, target_s, total_length))
+
+        max_error = float(np.max(errors)) if errors else np.inf
+        if max_error <= self.dynamic_lloyd_arc_tolerance:
+            self.dynamic_lloyd_ready_count += 1
+        else:
+            self.dynamic_lloyd_ready_count = 0
+
+        if self.dynamic_lloyd_ready_count >= self.dynamic_lloyd_required_ready_count:
+            self._transition_all_to_patrol()
+
+    def _transition_all_to_patrol(self):
+        if not self._refresh_dynamic_boundary():
+            return
+
+        boundary = np.asarray(self.closed_boundary_points, dtype=float)
+        arc_lengths, total_length = Controller._boundary_arc_lengths(
+            boundary,
+            is_closed=True,
+        )
+        if total_length <= 1e-12:
+            return
+
+        for drone in self.drones:
+            if hasattr(drone, "update_position_estimate"):
+                drone.update_position_estimate()
+            drone.update_boundary_projection()
+
+        ordered = sorted(
+            self.drones,
+            key=lambda drone: float(getattr(drone, "boundary_s", 0.0) or 0.0),
+        )
+        self.patrol_ordered_ids = [drone.drone_id for drone in ordered]
+        self.patrol_reference_s = float(getattr(ordered[0], "boundary_s", 0.0) or 0.0)
+        self.patrol_start_frame = self.frame
+        self.control_state = "boundary_patrol"
+        for idx, drone in enumerate(ordered):
+            drone.control_state = "boundary_patrol"
+            drone.patrol_order_index = idx
+            drone.patrol_target_s = None
+            drone.target_centroid = Controller._point_at_arc_length(
+                boundary,
+                arc_lengths,
+                self.patrol_reference_s + idx * total_length / max(1, len(ordered)),
+                total_length,
+                True,
+            )
+
     def _transition_drone_to_lloyd_state(self, drone, boundary_points):
         boundary_points = np.asarray(boundary_points, dtype=float).reshape(-1, 2)
         if (
@@ -762,40 +1044,46 @@ class SimulationEngine:
             self.control_state = "lloyd"
 
     def _check_decentralized_mapping_transitions(self):
-        for drone in self._mapping_drones():
-            boundary_grid = getattr(drone, "boundary_grid", None)
-            if boundary_grid is None or not np.any(np.asarray(boundary_grid, dtype=float)):
-                information_grid = getattr(drone, "information_grid", None)
-                if information_grid is not None and not np.any(
-                    np.asarray(information_grid, dtype=float)
-                ):
-                    information_grid = None
+        if self.control_state != "mapping":
+            return
+
+        boundary_grid = self.compute_mean_boundary_grid()
+        if not np.any(np.asarray(boundary_grid, dtype=float)):
+            information_values = [
+                np.asarray(getattr(drone, "information_grid", []), dtype=float)
+                for drone in self.drones
+            ]
+            has_information = any(info.size > 0 and np.any(info) for info in information_values)
+            if not has_information and self.drones:
+                legacy_mean_grid = np.mean(
+                    [np.asarray(drone.grid, dtype=float) for drone in self.drones],
+                    axis=0,
+                )
                 boundary_grid = Drone.boundary_mask_from_probability(
-                    getattr(drone, "grid", np.zeros(self.grid_shape, dtype=float)),
-                    information_grid,
+                    legacy_mean_grid,
+                    None,
                     occupancy_threshold=self.occupancy_threshold,
                 ).astype(float)
+        closed, boundary_points = self.is_mapped_polygon_closed(boundary_grid)
+        pending_frame = self._pending_lloyd_transition_frames.get("all")
 
-            closed, boundary_points = self.is_mapped_polygon_closed(boundary_grid)
-            pending_frame = self._pending_lloyd_transition_frames.get(drone.drone_id)
-
-            if closed and pending_frame is not None and self.frame > pending_frame:
-                self._transition_drone_to_lloyd_state(drone, boundary_points)
-            elif closed and pending_frame is None:
-                self._pending_lloyd_transition_frames[drone.drone_id] = self.frame
-            elif not closed and pending_frame is not None:
-                self._pending_lloyd_transition_frames.pop(drone.drone_id, None)
+        if closed and pending_frame is not None and self.frame > pending_frame:
+            self._transition_all_to_dynamic_lloyd(boundary_points)
+        elif closed and pending_frame is None:
+            self._pending_lloyd_transition_frames["all"] = self.frame
+        elif not closed and pending_frame is not None:
+            self._pending_lloyd_transition_frames.pop("all", None)
 
         if self.verbose:
             transitioned = [
                 drone for drone in self.drones
-                if getattr(drone, "control_state", "mapping") == "lloyd"
+                if getattr(drone, "control_state", "mapping") == "dynamic_lloyd"
             ]
             if transitioned:
                 ids = ", ".join(str(drone.drone_id) for drone in transitioned)
                 print(
-                    "  Decentralized transition status: "
-                    f"{len(transitioned)}/{len(self.drones)} in lloyd "
+                  "  Decentralized transition status: "
+                    f"{len(transitioned)}/{len(self.drones)} in dynamic_lloyd "
                     f"({ids})"
                 )
 
@@ -863,26 +1151,30 @@ class SimulationEngine:
 
         self.frame += 1
 
-        has_mapping_drones = bool(self._mapping_drones())
+        mapping_phase = self.control_state == "mapping"
+        active_mapping_phase = self.control_state in (
+            "mapping",
+            "dynamic_lloyd",
+            "boundary_patrol",
+        )
         measurement_frame = (
-            has_mapping_drones
-            and (self.frame - 1) % self.measure_every == 0
+            ((self.frame - 1) % self.measure_every == 0)
+            if mapping_phase
+            else active_mapping_phase
         )
 
         if self.verbose:
-
-            if not has_mapping_drones:
-                frame_type = "lloyd"
-            elif self._lloyd_drones():
-                frame_type = "mixed"
-            else:
+            if self.control_state == "mapping":
                 frame_type = "measurement" if measurement_frame else "consensus"
+            else:
+                frame_type = self.control_state
 
             print(f"\nFrame {self.frame} " f"[{frame_type}]")
         # Environment
 
         self._update_environment()
         self._refresh_position_estimates()
+        self._apply_forgetting_if_needed()
         # Measurement
 
         if measurement_frame:
@@ -899,7 +1191,7 @@ class SimulationEngine:
                 self._print_sensor_status()
         # Consensus
 
-        if has_mapping_drones:
+        if active_mapping_phase:
             for round_idx in range(self.consensus_rounds):
 
                 self._exchange_consensus_messages()
@@ -918,11 +1210,14 @@ class SimulationEngine:
         self.mean_grid_history.append(mean_grid.copy())
 
         self.latest_mean_grid = mean_grid
-        if has_mapping_drones:
+        if self.control_state == "mapping":
             self._check_decentralized_mapping_transitions()
+        elif self.control_state in ("dynamic_lloyd", "boundary_patrol"):
+            self._refresh_dynamic_boundary()
         # Control
 
         self._apply_actions()
+        self._update_dynamic_lloyd_completion()
 
         if self.verbose:
 

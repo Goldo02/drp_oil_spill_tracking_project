@@ -49,14 +49,16 @@ def _build_environment(
     polygon_x0,
     polygon_y0,
     polygon_continuous,
-    dynamic_speed=None,
+    dynamic_move=None,
+    dynamic_expand=None,
 ):
     sim_map = SimulationMap(xlim=(-5.0, 5.0), ylim=(-5.0, 5.0), grid_size=500)
     drift_velocity = (
-        _dynamic_drift_velocity(sim_map, seed, speed=dynamic_speed)
-        if dynamic_speed is not None
+        _dynamic_drift_velocity(sim_map, seed, speed=dynamic_move)
+        if dynamic_move is not None
         else (0.0, 0.0)
     )
+    expansion_speed = _dynamic_expansion_speed(dynamic_expand)
 
     if oil_shape == "circle":
         spill = CircleOilSpill(
@@ -64,6 +66,7 @@ def _build_environment(
             y0=0.0,
             radius=2.0,
             drift_velocity=drift_velocity,
+            expansion_speed=expansion_speed,
         )
     else:
         spill = SmoothedPolygonOilSpill(
@@ -77,6 +80,7 @@ def _build_environment(
             seed=seed,
             continuous=polygon_continuous,
             drift_velocity=drift_velocity,
+            expansion_speed=expansion_speed,
         )
 
     return sim_map, spill
@@ -87,9 +91,20 @@ def _dynamic_drift_velocity(sim_map, seed, speed):
     angle = float(rng.uniform(0.0, 2.0 * np.pi))
     speed = float(speed)
     if speed < 0.0:
-        raise ValueError("dynamic speed must be non-negative")
+        raise ValueError("dynamic_move speed must be non-negative")
 
     return speed * np.array([np.cos(angle), np.sin(angle)], dtype=float)
+
+
+def _dynamic_expansion_speed(speed):
+    if speed is None:
+        return 0.0
+
+    speed = float(speed)
+    if speed < 0.0:
+        raise ValueError("dynamic_expand speed must be non-negative")
+
+    return speed
 
 
 def _communication_radius(sim_map, communication_radius_cells):
@@ -185,11 +200,13 @@ def _print_run_header(
 
     drift_velocity = np.asarray(getattr(spill, "drift_velocity", (0.0, 0.0)), dtype=float)
     drift_speed = float(np.linalg.norm(drift_velocity))
-    if drift_speed > 1e-12:
+    expansion_speed = float(getattr(spill, "expansion_speed", 0.0))
+    if drift_speed > 1e-12 or expansion_speed > 1e-12:
         print(
             "Oil dynamics: enabled "
-            f"(drift_velocity=({drift_velocity[0]:.5f}, {drift_velocity[1]:.5f}), "
-            f"speed={drift_speed:.5f})"
+            f"(move_velocity=({drift_velocity[0]:.5f}, {drift_velocity[1]:.5f}), "
+            f"move_speed={drift_speed:.5f}, "
+            f"expand_speed={expansion_speed:.5f})"
         )
     else:
         print("Oil dynamics: disabled")
@@ -317,6 +334,16 @@ def _save_oil_mapping(engine, sim_map, spill, output_path):
                     np.asarray(getattr(spill, "drift_velocity", (0.0, 0.0)), dtype=float)
                 )
                 > 1e-12
+                or float(getattr(spill, "expansion_speed", 0.0)) > 1e-12
+            ),
+            "move_velocity": list(
+                map(
+                    float,
+                    np.asarray(
+                        getattr(spill, "drift_velocity", (0.0, 0.0)),
+                        dtype=float,
+                    ),
+                )
             ),
             "drift_velocity": list(
                 map(
@@ -327,6 +354,12 @@ def _save_oil_mapping(engine, sim_map, spill, output_path):
                     ),
                 )
             ),
+            "move_speed": float(
+                np.linalg.norm(
+                    np.asarray(getattr(spill, "drift_velocity", (0.0, 0.0)), dtype=float)
+                )
+            ),
+            "expand_speed": float(getattr(spill, "expansion_speed", 0.0)),
         },
         "sim_map": {
             "xlim": list(map(float, sim_map.xlim)),
@@ -379,7 +412,8 @@ def run_simulation(
     polygon_x0=None,
     polygon_y0=None,
     polygon_continuous=False,
-    dynamic_speed=None,
+    dynamic_move=None,
+    dynamic_expand=None,
     dt=1.0,
     oil_mapping_output=OIL_MAPPING_DATA_PATH,
     closure_min_enclosed_false_cells=250,
@@ -401,7 +435,8 @@ def run_simulation(
         polygon_x0,
         polygon_y0,
         polygon_continuous,
-        dynamic_speed=dynamic_speed,
+        dynamic_move=dynamic_move,
+        dynamic_expand=dynamic_expand,
     )
     communication_radius = _communication_radius(sim_map, communication_radius_cells)
     engine = _build_engine(
@@ -492,12 +527,25 @@ def _build_parser():
     parser.add_argument("--polygon-y0", type=float, default=None)
     parser.add_argument("--polygon-continuous", action="store_true")
     parser.add_argument(
-        "--dynamic",
+        "--dynamic_move",
+        "--dynamic-move",
+        dest="dynamic_move",
         type=float,
         default=None,
         help=(
-            "Enable oil-spill drift with the given speed in world units per "
-            "simulation step. The drift direction is sampled once from the seed."
+            "Move the oil spill with the given speed in world units per "
+            "simulation step. The movement direction is sampled once from the seed."
+        ),
+    )
+    parser.add_argument(
+        "--dynamic_expand",
+        "--dynamic-expand",
+        dest="dynamic_expand",
+        type=float,
+        default=None,
+        help=(
+            "Expand the oil spill with the given radial speed in world units per "
+            "simulation step."
         ),
     )
     parser.add_argument("--fully-connected", action="store_true")
@@ -586,7 +634,8 @@ def main():
         polygon_x0=args.polygon_x0,
         polygon_y0=args.polygon_y0,
         polygon_continuous=args.polygon_continuous,
-        dynamic_speed=args.dynamic,
+        dynamic_move=args.dynamic_move,
+        dynamic_expand=args.dynamic_expand,
         dt=args.dt,
         oil_mapping_output=args.oil_mapping_output,
         closure_min_enclosed_false_cells=args.closure_min_enclosed_false_cells,
