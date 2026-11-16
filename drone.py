@@ -87,6 +87,16 @@ class Drone:
         self.patrol_target_s = None
         self.patrol_order_index = None
         self.last_ring_info = None
+        self.closure_detected = False
+        self.contour_quality = 0.0
+        self.contour_leader_id = str(drone_id)
+        self.contour_points = None
+        self.contour_epoch = -1
+        self.consecutive_closure_frames = 0
+        self._last_closure_frame = None
+        self.last_closure_enclosed_false_cells = 0
+        self.patrol_ready = False
+        self._patrol_ready_count = 0
 
         self.exploration_direction = self._random_unit_direction()
         self.controller = controller
@@ -101,12 +111,14 @@ class Drone:
         world_field=None,
         x_coords=None,
         y_coords=None,
+        dt=1.0,
     ):
         return self.controller.compute_action(
             self,
             world_field,
             x_coords,
             y_coords,
+            dt=dt,
         )
 
     def set_known_boundary(
@@ -137,6 +149,12 @@ class Drone:
             "grid": np.asarray(self.grid, dtype=float).copy(),
             "signal_grid": np.asarray(self.occupancy_signal_grid, dtype=float).copy(),
             "information_grid": np.asarray(self.information_grid, dtype=float).copy(),
+            "closure_detected": bool(self.closure_detected),
+            "contour_quality": float(self.contour_quality),
+            "contour_leader_id": str(self.contour_leader_id),
+            "contour_points": None if self.contour_points is None else self.contour_points.copy(),
+            "contour_epoch": int(self.contour_epoch),
+            "patrol_ready": bool(self.patrol_ready),
         }
 
     @property
@@ -495,6 +513,7 @@ class Drone:
         own_signal_grid=None,
         own_information_grid=None,
         occupancy_threshold=0.6,
+        frame=None,
     ):
         """
         Merge local occupancy with maps received from neighboring drones.
@@ -524,6 +543,11 @@ class Drone:
                     "information_grid": own_information_grid,
                 }
             )
+        local_probability = self.probability_from_signal(own_signal_grid, own_information_grid)
+        self._local_boundary_snapshot = self.boundary_mask_from_probability(
+            local_probability, own_information_grid, occupancy_threshold=occupancy_threshold
+        )
+        self._local_information_snapshot = np.asarray(own_information_grid, dtype=float).copy()
 
         signals = [np.asarray(own_signal_grid, dtype=float)]
         information = [np.asarray(own_information_grid, dtype=float)]
@@ -540,11 +564,15 @@ class Drone:
             self.occupancy_signal_grid = signals[0].copy()
             self.information_grid = information[0].copy()
             self._refresh_probability_grid(occupancy_threshold=occupancy_threshold)
-            return self.grid
+        else:
+            self.occupancy_signal_grid = np.mean(signals, axis=0)
+            self.information_grid = np.mean(information, axis=0)
+            self._refresh_probability_grid(occupancy_threshold=occupancy_threshold)
 
-        self.occupancy_signal_grid = np.mean(signals, axis=0)
-        self.information_grid = np.mean(information, axis=0)
-        self._refresh_probability_grid(occupancy_threshold=occupancy_threshold)
+        if hasattr(self.controller, "consensus_metadata_step"):
+            self.controller.consensus_metadata_step(self, neighbor_messages, frame=frame)
+        self._local_boundary_snapshot = None
+        self._local_information_snapshot = None
 
         return self.grid
 

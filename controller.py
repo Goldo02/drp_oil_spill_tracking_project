@@ -36,6 +36,113 @@ class Controller:
         self.k_t = float(k_t)
         self.constrain_to_boundary = bool(kwargs.get("constrain_to_boundary", True))
 
+    @staticmethod
+    def _local_contour_candidate(drone):
+        """Extract a closed contour from this drone's mapped boundary cells."""
+        if contourpy is None:
+            return np.empty((0, 2), dtype=float), 0
+        local_snapshot = getattr(drone, "_local_boundary_snapshot", None)
+        boundary = np.asarray(
+            local_snapshot if local_snapshot is not None else getattr(drone, "boundary_grid", []),
+            dtype=float,
+        ) >= 0.5
+        if boundary.ndim != 2 or not np.any(boundary):
+            return np.empty((0, 2), dtype=float), 0
+        nx, ny = boundary.shape
+        free = ~boundary
+        outside = np.zeros_like(free)
+        stack = [(ix, iy) for ix in range(nx) for iy in (0, ny - 1) if free[ix, iy]]
+        stack += [(ix, iy) for iy in range(ny) for ix in (0, nx - 1) if free[ix, iy]]
+        while stack:
+            ix, iy = stack.pop()
+            if outside[ix, iy] or not free[ix, iy]:
+                continue
+            outside[ix, iy] = True
+            for x2, y2 in ((ix-1, iy), (ix+1, iy), (ix, iy-1), (ix, iy+1)):
+                if 0 <= x2 < nx and 0 <= y2 < ny and free[x2, y2] and not outside[x2, y2]:
+                    stack.append((x2, y2))
+        enclosed = free & ~outside
+        enclosed_count = int(np.count_nonzero(enclosed))
+        if enclosed_count < int(getattr(drone, "closure_min_enclosed_false_cells", 1)):
+            return np.empty((0, 2), dtype=float), enclosed_count
+        bounds = drone.grid_bounds
+        dx = (bounds[1] - bounds[0]) / max(nx, 1)
+        dy = (bounds[3] - bounds[2]) / max(ny, 1)
+        xs = bounds[0] + (np.arange(nx) + 0.5) * dx
+        ys = bounds[2] + (np.arange(ny) + 0.5) * dy
+        generator = contourpy.contour_generator(x=xs, y=ys, z=enclosed.astype(float).T, name="serial")
+        lines = generator.lines(0.5)
+        lines = [np.asarray(line, dtype=float) for line in lines if len(line) >= 4]
+        if not lines:
+            return np.empty((0, 2), dtype=float), enclosed_count
+        points = max(lines, key=lambda line: float(np.sum(np.linalg.norm(np.diff(line, axis=0), axis=1))))
+        if np.linalg.norm(points[0] - points[-1]) < 1e-9:
+            points = points[:-1]
+        if points.shape[0] < 8:
+            return np.empty((0, 2), dtype=float), enclosed_count
+        return points.copy(), enclosed_count
+
+    def consensus_metadata_step(self, drone, neighbor_messages, frame=None):
+        """Update local contour and patrol proposals from local evidence/messages."""
+        neighbor_messages = list(neighbor_messages)
+        candidate, enclosed_count = self._local_contour_candidate(drone)
+        drone.last_closure_enclosed_false_cells = int(enclosed_count)
+        same_received_contour = any(
+            message.get("closure_detected")
+            and message.get("contour_points") is not None
+            and np.asarray(message["contour_points"]).shape == candidate.shape
+            and np.allclose(np.asarray(message["contour_points"], dtype=float), candidate, atol=0.25)
+            for message in neighbor_messages
+        ) if candidate.shape[0] >= 3 else False
+        if candidate.shape[0] >= 3 and not same_received_contour:
+            info = np.asarray(
+                getattr(drone, "_local_information_snapshot", None)
+                if getattr(drone, "_local_information_snapshot", None) is not None
+                else drone.information_grid,
+                dtype=float,
+            )
+            cells = np.rint((candidate - np.array([drone.x_min, drone.y_min])) /
+                            np.array([(drone.x_max-drone.x_min)/drone.Nx,
+                                      (drone.y_max-drone.y_min)/drone.Ny]) - 0.5).astype(int)
+            cells[:, 0] = np.clip(cells[:, 0], 0, drone.Nx - 1)
+            cells[:, 1] = np.clip(cells[:, 1], 0, drone.Ny - 1)
+            quality = float(np.mean(info[cells[:, 0], cells[:, 1]]))
+            epoch = int(frame) if frame is not None else int(drone.contour_epoch + 1)
+            proposal = (epoch, quality, str(drone.drone_id))
+            current = (int(drone.contour_epoch), float(drone.contour_quality), str(drone.contour_leader_id))
+            if proposal > current:
+                drone.contour_points = candidate
+                drone.contour_epoch, drone.contour_quality, drone.contour_leader_id = proposal
+                drone.closure_detected = True
+
+        for message in neighbor_messages:
+            points = message.get("contour_points")
+            if not message.get("closure_detected") or points is None:
+                continue
+            key = (int(message.get("contour_epoch", -1)),
+                   float(message.get("contour_quality", 0.0)),
+                   str(message.get("contour_leader_id", message.get("sender_id", ""))))
+            own_key = (int(drone.contour_epoch), float(drone.contour_quality), str(drone.contour_leader_id))
+            if key > own_key:
+                drone.contour_points = np.asarray(points, dtype=float).copy()
+                drone.contour_epoch, drone.contour_quality, drone.contour_leader_id = key
+                drone.closure_detected = True
+            if message.get("patrol_ready"):
+                drone.patrol_ready = True
+
+        drone.closure_detected = bool(drone.contour_points is not None and len(drone.contour_points) >= 3)
+        previous_frame = getattr(drone, "_last_closure_frame", None)
+        count_frame = frame if frame is not None else (0 if previous_frame is None else previous_frame + 1)
+        if drone._last_closure_frame != count_frame:
+            drone.consecutive_closure_frames = drone.consecutive_closure_frames + 1 if drone.closure_detected else 0
+            drone._last_closure_frame = count_frame
+        if drone.closure_detected and drone.consecutive_closure_frames >= 2:
+            drone.set_known_boundary(drone.contour_points, True, True)
+            drone.control_state = "dynamic_lloyd"
+            drone.update_boundary_projection()
+        if drone.patrol_ready and drone.closure_detected:
+            drone.control_state = "boundary_patrol"
+
     # ------------------------------------------------------------------
     # 1D VORONOI / MULTI-SOURCE SHORTEST PATH
     # ------------------------------------------------------------------
@@ -1181,6 +1288,20 @@ class DroneController(Controller):
         ring_info = self.compute_ring_ordering(drone, None)
         state = getattr(drone, "control_state", "mapping")
         drone.last_control_mode = "dynamic_lloyd" if state == "dynamic_lloyd" else "lloyd"
+        if state == "dynamic_lloyd" and isinstance(ring_info, dict):
+            errors = []
+            for entry in ring_info.get("ring", []):
+                errors.append(self._arc_distance_local(
+                    entry["seed_arc_length"], entry["target_arc_length"],
+                    ring_info["total_boundary_length"],
+                ))
+            if errors and max(errors) <= 0.25:
+                drone._patrol_ready_count += 1
+            else:
+                drone._patrol_ready_count = 0
+            if drone._patrol_ready_count >= 8:
+                drone.patrol_ready = True
+                drone.control_state = "boundary_patrol"
         action = self._equidistant_action(
             drone,
             ring_info,
@@ -1193,13 +1314,28 @@ class DroneController(Controller):
             max_speed=getattr(drone, "max_speed", self.max_speed),
         )
 
-    def _patrol_action(self, drone):
-        target = getattr(drone, "target_centroid", None)
-        if target is None:
-            return self._lloyd_action(drone)
+    @staticmethod
+    def _arc_distance_local(a, b, length):
+        if length <= 1e-12:
+            return abs(float(a) - float(b))
+        delta = abs((float(a) - float(b)) % float(length))
+        return min(delta, float(length) - delta)
 
+    def _patrol_action(self, drone, dt=1.0):
+        boundary = np.asarray(self.known_boundary_points, dtype=float)
+        if boundary.shape[0] < 3:
+            return self._lloyd_action(drone)
+        arc_lengths, length = self._boundary_arc_lengths(boundary, is_closed=True)
+        if length <= 1e-12:
+            return np.zeros(2, dtype=float)
+        current_s = float(getattr(drone, "boundary_s", 0.0) or 0.0) % length
+        arcs = getattr(drone, "known_boundary_arcs", {})
+        speed = self._platooning_speed(current_s, arcs, drone.drone_id, length)
+        target_s = (current_s + speed * float(dt)) % length
+        target = self._point_at_arc_length(boundary, arc_lengths, target_s, length, True)
+        drone.patrol_target_s = target_s
+        drone.target_centroid = target
         current_pos = self._estimated_position(drone)
-        target = np.asarray(target, dtype=float)
         drone.last_control_mode = "boundary_patrol"
         action = float(self.k_t) * (target - current_pos)
         return self._clip_action(
@@ -1207,20 +1343,35 @@ class DroneController(Controller):
             max_speed=getattr(drone, "max_speed", self.max_speed),
         )
 
+    @staticmethod
+    def _platooning_speed(current_s, known_arcs, drone_id, length):
+        known = [(float(s) % length, str(did)) for did, s in known_arcs.items()
+                 if did != drone_id]
+        if not known:
+            return 0.05
+        positions = sorted([(float(current_s) % length, str(drone_id))] + known)
+        idx = next(i for i, value in enumerate(positions) if value[1] == str(drone_id))
+        prev_s = positions[(idx - 1) % len(positions)][0]
+        next_s = positions[(idx + 1) % len(positions)][0]
+        d_front = (next_s - float(current_s)) % length
+        d_back = (float(current_s) - prev_s) % length
+        return float(np.clip(0.05 + 0.08 * (d_front - d_back), 0.01, 0.10))
+
     def compute_action(
         self,
         drone,
         world_field=None,
         x_coords=None,
         y_coords=None,
+        dt=1.0,
     ):
         state = getattr(drone, "control_state", "mapping")
         if state in ("lloyd", "dynamic_lloyd"):
             return self._lloyd_action(drone)
         if state == "boundary_patrol":
-            return self._patrol_action(drone)
+            return self._patrol_action(drone, dt=dt)
 
-        if world_field is None or x_coords is None or y_coords is None:
+        if x_coords is None or y_coords is None:
             if self.known_boundary_points is not None and len(self.known_boundary_points) > 0:
                 return self._lloyd_action(drone)
             return self._clip_action(self._exploration_action(drone), max_speed=self.max_speed)

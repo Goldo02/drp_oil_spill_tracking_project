@@ -86,7 +86,7 @@ python main.py --help
 | [edge_detection.py](edge_detection.py) | Soglia, filtraggio ed estrazione del bordo | `detect_edges`, `extract_edge_points` |
 | [drone.py](drone.py) | Stato del robot, mappe, messaggi e movimento | `Drone.sense`, `update_grid`, `consensus_step`, `action` |
 | [controller.py](controller.py) | Esplorazione, tracking, Voronoi e Lloyd | `DroneController`, `Controller.compute_ring_ordering` |
-| [simulation_engine.py](simulation_engine.py) | Scheduling, consegna dei messaggi, transizioni e diagnostica | `SimulationEngine.step` |
+| [simulation_engine.py](simulation_engine.py) | Ambiente, router radio locale e diagnostica | `SimulationEngine.step` |
 | [visualization.py](visualization.py) | Figure, pannelli e GIF | `Visualizer.render` |
 | [tests/](tests/) | Verifiche delle componenti | Sei moduli di test e `conftest.py` |
 
@@ -98,20 +98,19 @@ flowchart TD
     M --> C[Messaggi e consenso]
     C --> M
     M --> A[Esplorazione o inseguimento del bordo]
-    C --> G[Aggregazione nel SimulationEngine]
-    G --> B[Verifica di chiusura e contorno comune]
-    B --> L[Voronoi e target Lloyd]
-    B --> T[Target di pattugliamento]
+    C --> B[Max-Consensus locale su chiusura e contorno]
+    B --> L[Voronoi e target Lloyd locali]
+    B --> T[Platooning locale su anello]
     A --> U[Comando di movimento]
     L --> U
     T --> U
     U --> S
-    G --> V[Diagnostica, figure ed esportazione]
+    M --> V[Diagnostica aggregata, figure ed esportazione]
 ```
 
 Ogni `Drone` possiede un proprio `DroneController`, sensori e copie indipendenti delle mappe. I messaggi sono copie dei dati del mittente: il consenso non legge direttamente la mappa mutabile di un vicino durante l'aggiornamento.
 
-**Distinzione importante:** tutto viene eseguito in un unico processo Python. Il consenso è formulato attraverso scambi locali, ma il motore dispone di tutti i robot. Nella pipeline principale usa una mappa aggregata globale per riconoscere la chiusura, distribuisce un contorno comune a tutti e coordina il pattugliamento. È una simulazione con componenti distribuite e coordinamento centrale, non un'implementazione interamente decentralizzata.
+La simulazione gira in un unico processo Python: non avvia processi o nodi indipendenti. `SimulationEngine` vede tutti i droni e implementa centralmente il simulatore fisico e il router radio. Per ogni round costruisce snapshot dei messaggi e li consegna solo ai vicini del grafo; gli scambi multi-hop delle posizioni sono simulati iterando sullo stesso grafo. Le transizioni di fase, la scelta del contorno, i target Lloyd e la velocità di pattuglia sono invece calcolati dai singoli `DroneController` usando stato locale e messaggi ricevuti. Le mappe aggregate e lo stato riepilogativo dell'engine sono diagnostici: non vengono forniti ai controllori e non decidono le transizioni. La modalità `fully_connected` configura esplicitamente un grafo radio completo.
 
 ## 3. Coordinate, griglie e unità
 
@@ -334,7 +333,7 @@ Non sono modellati latenza, perdita di pacchetti, capacità del canale o interfe
 
 ### 7.2 Messaggi sincroni
 
-`create_consensus_message()` copia `sender_id`, `grid`, `signal_grid` e `information_grid`. Prima di aggiornare un qualsiasi drone, il motore acquisisce tutti i messaggi e determina le consegne.
+`create_consensus_message()` copia `sender_id`, `grid`, `signal_grid`, `information_grid` e i metadati di chiusura/contorno/pattuglia. Prima di aggiornare i droni, il router acquisisce gli snapshot e consegna ciascuno solo ai vicini radio raggiungibili.
 
 Ogni round usa uno snapshot comune: l'ultimo robot nel ciclo non può utilizzare il risultato appena aggiornato del primo. È un aggiornamento sincrono di tipo Jacobi.
 
@@ -372,9 +371,15 @@ Pertanto “average consensus” non significa necessariamente media aritmetica 
 
 Con grafo disconnesso, componenti diverse possono mantenere mappe differenti. Un successivo contatto può diffondere informazioni accumulate in precedenza.
 
-### 7.5 Mappa aggregata e disaccordo
+### 7.5 Max-Consensus su contorno e transizioni
 
-`compute_mean_grid()` calcola:
+Ogni drone rileva una chiusura dalla propria `boundary_grid`, derivata dalla mappa locale e da `information_grid`. La proposta porta `closure_detected`, `contour_points`, `contour_quality`, `contour_leader_id` e `contour_epoch`. I droni confrontano `(contour_epoch, contour_quality, contour_leader_id)` e propagano il massimo nei round successivi. L'epoch più recente diffonde gli aggiornamenti del bordo; qualità e ID risolvono i pareggi in modo deterministico.
+
+La transizione a `dynamic_lloyd` avviene localmente dopo due frame consecutivi con una chiusura valida. In modo analogo `patrol_ready` viene diffuso via consenso. Componenti disconnesse possono scegliere contorni e fasi differenti finché i messaggi non possono raggiungerle.
+
+### 7.6 Mappa aggregata e disaccordo
+
+`compute_mean_grid()` calcola solo per diagnostica:
 
 $$
 \bar P(c)=\frac{\sum_i S_i(c)}{\sum_i I_i(c)},
@@ -382,7 +387,7 @@ $$
 
 con valore `0.5` in assenza di informazione significativa. Non coincide in generale con la media aritmetica delle $P_i$.
 
-La metrica registrata è:
+La metrica registrata, anch'essa solo diagnostica, è:
 
 $$
 E=\frac1N\sum_{i=1}^N\|P_i-\bar P\|_F.
@@ -425,48 +430,38 @@ La norma di $e_n$ è limitata a `0.07`. Il punto di anticipazione è cercato int
 
 Esiste un ripiego basato sul gradiente Sobel dell'immagine e sull'errore rispetto alla soglia. Nel flusso ordinario il tracking viene però tentato in presenza di punti utilizzabili; il ripiego serve soprattutto quando il comando dalla nuvola non può essere costruito.
 
-Il campo globale viene passato all'interfaccia del controllo in mapping, ma `_boundary_tracking_action()` lo scarta: usa camera memorizzata e punti di mappa. Un argomento presente nella firma non implica che la ground truth sia usata direttamente per guidare il robot.
+Il controllore mapping usa solo la camera memorizzata, la posizione GPS e i punti della mappa locale o ricevuti via consenso. L'engine non passa il campo vero al controllore; il campo è usato da sensori e visualizzatore.
 
 ## 9. Chiusura e macchina a stati
 
 ```mermaid
 stateDiagram-v2
     [*] --> mapping
-    mapping --> dynamic_lloyd: Chiusura globale confermata in un frame successivo
-    dynamic_lloyd --> boundary_patrol: Errore in arco entro 0.25 per 8 controlli e bordo valido
+    mapping --> dynamic_lloyd: Chiusura locale valida per 2 frame
+    dynamic_lloyd --> boundary_patrol: Errore locale <= 0.25 per 8 controlli
     boundary_patrol --> boundary_patrol: Nuove misure, consenso e target aggiornati
 ```
 
-Questa è la pipeline selezionata da `SimulationEngine.step()`. `dynamic_lloyd` viene usato anche con macchia statica: il nome riguarda l'aggiornamento del contorno durante il controllo.
+Ogni drone esegue la propria macchina a stati. `dynamic_lloyd` viene usato anche con macchia statica: il nome riguarda l'aggiornamento del contorno durante il controllo.
 
 ### 9.1 Verifica della chiusura
 
-Il motore costruisce il bordo della mappa globale aggregata e chiama `_dfs_polygon_closure_check()`:
+Il controllore di ciascun drone costruisce il bordo dalla propria `P_i` e dalla propria informazione `I_i`, quindi verifica localmente che la maschera racchiuda una regione ed estrae una polilinea ordinata con ContourPy:
 
-1. Considera barriera le celle di bordo sopra soglia.
-2. Esegue flood fill con vicini a 4 dalla cella `(0, 0)`.
-3. Considera racchiuse le celle non di bordo che il flood fill non raggiunge.
-4. Richiede almeno `250` celle racchiuse, valore configurabile.
-5. Estrae il contorno con ContourPy e sceglie la linea più lunga.
-6. Richiede almeno `24` punti e segmenti, inclusa la chiusura, non più lunghi di `3 × resolution = 0.3`.
+1. Considera barriera la `boundary_grid` locale del drone.
+2. Esegue flood fill con connettività 4 partendo dalle celle libere sul perimetro della griglia.
+3. Considera racchiuse le celle non raggiunte dal flood fill e richiede almeno il valore configurato da `--closure-min-enclosed-false-cells`.
+4. Estrae con ContourPy la linea più lunga e richiede almeno 8 punti.
 
-Con risoluzione `0.1`, 250 celle corrispondono a circa `2.5` unità quadrate. È un filtro contro piccole chiusure spurie, non una stima dell'area reale totale.
+Con risoluzione `0.1`, 250 celle corrispondono a circa `2.5` unità quadrate. È un filtro locale contro piccole chiusure spurie, non una stima dell'area reale totale.
 
 `enclosed_false_cells` indica celle false **nella maschera del bordo**: possono essere l'interno della macchia. Non significa “acqua libera dentro il petrolio”.
 
-Se l'estrazione principale non riesce, si tenta una linea costruita raggruppando i punti per angolo rispetto al centro e mediando ogni gruppo. Il ripiego è meno generale per geometrie molto concave.
-
-Il flood fill parte dal solo `(0, 0)`, assumendo che rappresenti l'esterno accessibile; non viene inizializzato da tutto il perimetro. La mappa standard è più ampia dell'ambiente, ma questa assunzione va rivalutata cambiando dominio.
+Le celle sul perimetro inizializzano tutte il flood fill, perciò il rilevamento non dipende da un singolo angolo scelto come esterno. Geometrie concave o più contorni possono comunque richiedere un filtro topologico più robusto.
 
 ### 9.2 Conferma e transizione
 
-Alla prima chiusura viene memorizzato `_pending_lloyd_transition_frames["all"]`. Se il bordo resta chiuso in un frame successivo, tutti i droni passano a `dynamic_lloyd`; se la chiusura scompare, la candidatura è cancellata.
-
-Fra le verifiche passa almeno un nuovo blocco di consenso, ma non necessariamente una nuova acquisizione della camera. Il contorno viene copiato nei controllori di tutti i robot.
-
-Successivamente il motore tenta di aggiornarlo dalla mappa globale. Se non trova una nuova chiusura valida resta disponibile l'ultimo contorno accettato. Non esiste un ritorno generale a mapping dopo la perdita del bordo.
-
-Sono presenti funzioni per lo stato `lloyd` e transizioni di singoli droni, coperte da alcuni test. Non sono la sequenza principale: `_check_decentralized_mapping_transitions()`, nonostante il nome, esegue una verifica globale e una transizione collettiva.
+Un drone conferma localmente `closure_detected` per due frame consecutivi prima di passare a `dynamic_lloyd`. La proposta viene diffusa con Max-Consensus usando epoch, qualità e ID del leader; solo i messaggi ricevuti localmente possono aggiornare il controllore. Componenti radio separate possono quindi transitare in frame diversi. Se in seguito non si rileva un aggiornamento, ciascun drone conserva l'ultima polilinea valida.
 
 ## 10. Voronoi geodetico e Lloyd
 
@@ -478,7 +473,7 @@ La posizione GPS viene proiettata sul segmento più vicino, ottenendo `boundary_
 
 ### 10.2 Scambio multi-hop
 
-Prima del calcolo dei target, ogni drone inizializza le conoscenze con posizione e arco correnti. Il motore simula fino a `N` round di inoltro ai vicini.
+Prima del calcolo dei target, ogni drone inizializza le conoscenze con posizione e arco correnti. L'engine, che conosce l'intero grafo per simulare la radio, esegue fino a `N` round sincroni di inoltro: a ogni round ciascun drone riceve solo le conoscenze dei vicini raggiungibili. Non invia direttamente a un controller la lista globale dei droni.
 
 Su un grafo connesso l'informazione può attraversare più archi nello stesso passo simulato; su un grafo disconnesso resta nella componente. Le conoscenze sono ricostruite a ogni scambio e la posizione corrente del robot non viene sovrascritta da copie ricevute.
 
@@ -535,35 +530,28 @@ Il riferimento teorico è una copertura a densità uniforme che riduce le distan
 
 ### 10.5 Completamento di Lloyd
 
-Il motore verifica il massimo errore curvilineo fra proiezione e target. Se non supera `0.25` per `8` controlli consecutivi, tenta il passaggio a patrol richiedendo di nuovo un bordo chiuso valido.
+Ogni controller verifica il massimo errore curvilineo fra proiezione e target per i droni noti nella propria componente. Se non supera `0.25` per `8` controlli consecutivi e il contorno è valido, il drone imposta `patrol_ready`; il flag si propaga via Max-Consensus.
 
 Il criterio riguarda la coordinata lungo l'arco: non misura direttamente distanza normale del drone dal contorno o accuratezza della mappa rispetto al campo vero.
 
 ## 11. Pattugliamento e dimenticanza
 
-### 11.1 Target mobili
+### 11.1 Platooning locale sull'anello
 
-Il motore ordina globalmente i robot sul bordo e fa avanzare un riferimento comune con velocità `0.05`:
-
-$$
-s_{ref}\leftarrow(s_{ref}+v_{patrol}dt)\bmod L.
-$$
-
-Il target base del robot con indice $i$ è:
+Ogni drone ordina localmente i valori `boundary_s` noti nella propria componente e identifica i vicini precedente e successivo. Calcola i gap:
 
 $$
-s_i^{base}=(s_{ref}+iL/N)\bmod L.
+d_{front,i}=(s_{next}-s_i)\bmod L,\qquad d_{back,i}=(s_i-s_{prev})\bmod L.
 $$
 
-Con più di due droni viene aggiunta una correzione basata sui gap anteriore e posteriore:
+La velocità locale e il target sono:
 
 $$
-v_i=\operatorname{clip}\left(0.05+0.08(d_{front}-d_{back}),0.01,0.10\right).
+v_i=\operatorname{clip}(0.05+0.08(d_{front,i}-d_{back,i}),0.01,0.10),\qquad
+s_i^{target}=(s_i+v_i\,dt)\bmod L.
 $$
 
-La differenza rispetto alla velocità base modifica il target. L'offset è limitato a un quarto della spaziatura `L/N`. Il comando fisico resta proporzionale all'errore cartesiano e saturato alla velocità massima.
-
-L'ordine viene mantenuto finché l'insieme dei robot resta uguale. I target dipendono da dati globali del motore, anche se continua lo scambio multi-hop delle posizioni.
+Se il drone non conosce altri robot usa `v_i=0.05`. Il target viene interpolato sulla polilinea e inseguito con un controllo proporzionale saturato alla velocità massima. Non vengono creati clock, ordini o target globali.
 
 ### 11.2 Forgetting
 
@@ -589,26 +577,24 @@ Nelle fasi precedenti non si applica questo forgetting. `temporal_alpha` del cos
 1. Incrementa il frame e decide se acquisire la camera.
 2. Aggiorna la macchia e ricostruisce il campo.
 3. Aggiorna le stime GPS.
-4. Applica forgetting, solo in boundary_patrol.
+4. Applica forgetting ai droni in boundary_patrol.
 5. Se previsto, acquisisce camera/GPS e aggiorna le mappe.
 6. Esegue i round sincroni di consenso e registra le tracce.
 7. Salva disaccordo e mappa aggregata del frame.
-8. Verifica la transizione o aggiorna il contorno comune.
-9. Calcola i comandi e muove i droni.
-10. Verifica il completamento di Lloyd.
+8. Ogni drone aggiorna localmente la proposta e il proprio stato.
+9. Scambia posizioni d'arco localmente e calcola i comandi onboard.
+10. Registra gli stati locali nei riepiloghi dell'engine.
 ```
 
-In mapping, con `measure_every = 3`, le camere acquisiscono ai frame `1, 4, 7, …`. In `dynamic_lloyd` e `boundary_patrol` acquisiscono a ogni frame.
+Se tutti i droni sono in mapping e `measure_every = 3`, le camere acquisiscono ai frame `1, 4, 7, …`. È una scelta di orchestrazione globale dell'engine: quando almeno un drone è transitato a Lloyd o patrol, tutte le camere acquisiscono a ogni frame, così ogni controller può aggiornare la propria mappa e il proprio contorno. Questa schedulazione è centralizzata; non modifica direttamente stati o target dei droni.
 
-**I 10 round di consenso vengono eseguiti a ogni frame attivo**, compresi quelli senza nuove immagini. Fra due misure in mapping possono quindi esserci 30 round. Alcune stringhe della console parlano di round “per measurement”, ma il ciclo li applica per frame.
+I round di consenso vengono eseguiti a ogni frame con droni, anche senza una nuova immagine. Il comando CLI configura 3 round per frame: in mapping, con `--measure-every 3`, fra due acquisizioni si eseguono quindi 9 round. Il costruttore di `SimulationEngine`, usato direttamente da Python senza specificare `consensus_rounds`, ne configura invece 10. Il riepilogo iniziale della CLI li chiama round “per measurement”, ma il ciclo li applica per frame.
 
 La diagnostica precede il movimento. Una figura renderizzata dopo `step()` combina le mappe disponibili con le posizioni successive al comando. La stampa di progresso in `main.py` usa inoltre un contatore esterno che parte da zero, diverso da `engine.frame`.
 
 ### Nota su `dt`
 
-`Drone.action()` implementa `p ← p + u × dt`, ma i metodi del motore non gli passano `self.dt`. Il movimento dei droni usa quindi il default `dt = 1.0`, mentre macchia e riferimento patrol usano il `dt` configurato.
-
-**Per esperimenti coerenti con l'implementazione attuale mantenere `--dt 1.0`.** Modificarlo non riscalerebbe uniformemente tutte le dinamiche. La velocità della macchia viene moltiplicata per `dt`, anche se l'help CLI la descrive come velocità per passo.
+`Drone.action()` e i controllori ricevono `self.dt`; il movimento dei droni, il target curvilineo del patrol e l'aggiornamento della macchia usano lo stesso passo temporale. `dt` è espresso in unità di tempo simulate per chiamata a `step()`.
 
 ## 13. Parametri e configurazione
 
@@ -636,7 +622,7 @@ I default seguenti si riferiscono a `python main.py`.
 | `--measure-every` | `3` | Intervallo camera nella sola fase mapping |
 | `--show-nls-points` | Disattivata | Visualizza i punti di bordo rilevati |
 | `--show-2d-voronoi` | Disattivata | Colora gli archi assegnati in fase Lloyd |
-| `--dt` | `1.0` | Passo per ambiente e riferimento patrol; vedere la limitazione sopra |
+| `--dt` | `1.0` | Passo temporale usato da ambiente, movimento dei droni e riferimento patrol |
 | `--closure-min-enclosed-false-cells` | `250` | Area minima racchiusa per la chiusura |
 | `--mapping-point-radius-cells` | `1` | Esposto ma ignorato da `Drone.update_grid()` |
 | `--oil-mapping-output` | `./tmp_output/oil_mapping_data.npy` | File dei punti esportati |
@@ -655,13 +641,13 @@ Gli FPS non cambiano il passo della simulazione. I parametri `polygon-*` non con
 | Mappa robot | `200 × 200`, passo `0.1`, `[-10, 10]²` | `main._build_engine` |
 | Camera | `120 × 120` | `main._build_engine` |
 | Soglia | `0.6` | `main._build_engine` |
-| Round consenso | `10` per frame | `main._build_engine` |
+| Round consenso | `3` per frame nella CLI; `10` nel default del costruttore Python | `main._build_engine`; `SimulationEngine.__init__` |
 | Rumore GPS/camera | `0.03` / `0.03` | `main._add_drones` |
 | Velocità massima | `0.12` | `Drone` e `DroneController` |
 | Velocità esplorazione | `0.08` | `DroneController.__init__` |
-| Minimo punti bordo | `24` | `SimulationEngine.__init__` |
-| Criterio Lloyd | `0.25`, per `8` controlli | `SimulationEngine.__init__` |
-| Velocità patrol | `0.05` | `SimulationEngine.__init__` |
+| Minimo punti ContourPy | `8` | `Controller._local_contour_candidate` |
+| Criterio Lloyd | `0.25`, per `8` controlli | `DroneController._lloyd_action` |
+| Velocità patrol | `0.05` nominale, clip `0.01–0.10` | `DroneController._platooning_speed` |
 | Forgetting patrol | `0.995` | `SimulationEngine.__init__` |
 
 Non esistono flag CLI per questi valori. Per studi parametrici si può costruire il motore da Python:
@@ -773,9 +759,7 @@ Per eseguire la suite:
 python -m pytest -q
 ```
 
-Durante la redazione del README è stato eseguito `python3 -m pytest -q -p no:cacheprovider`: **32 test superati**, con 14 avvisi di deprecazione relativi all'integrazione Matplotlib/Pyparsing. Non sono state eseguite campagne comparative o validate statisticamente le prestazioni della missione completa.
-
-Ambiente verificato: Python `3.12.3`, NumPy `1.26.4`, SciPy `1.17.1`, Matplotlib `3.9.2`, ContourPy `1.3.3`, Pillow `11.0.0`, pytest `9.1.1`. Sono versioni osservate, non requisiti minimi o una garanzia per ogni altra combinazione.
+Non sono documentati qui risultati di esecuzione della suite né versioni verificate delle dipendenze.
 
 | Modulo | Proprietà controllate |
 | --- | --- |
@@ -824,8 +808,8 @@ Sono protocolli proposti, non esecuzioni di cui qui si attestano risultati o com
 | Domanda | Metrica | Disponibilità |
 | --- | --- | --- |
 | I robot concordano? | `E` e tracce per drone | Già calcolate |
-| Quando viene riconosciuta la chiusura? | `transition_frame` | Nell'oggetto motore |
-| Quando inizia patrol? | `patrol_start_frame` | Nell'oggetto motore |
+| Quando transita il primo drone? | `transition_frame` | Primo passaggio locale a Lloyd o patrol, registrato dall'engine |
+| Quando entra in patrol il primo drone? | `patrol_start_frame` | Primo passaggio locale a patrol, registrato dall'engine |
 | Quanta area è stata osservata? | Celle con informazione sopra una soglia scelta | Da calcolare dagli array |
 | La regione occupata è corretta? | IoU, precision/recall rispetto al campo sogliato | Da implementare |
 | Il contorno è corretto? | Distanza media simmetrica o Hausdorff | Da implementare |
@@ -855,15 +839,15 @@ Riportare numero di seed, media, dispersione, budget di frame e casi non complet
 
 ### 17.1 Limiti implementativi
 
-- **Coordinamento globale:** chiusura, contorno comune, completamento e target patrol dipendono dal motore. Anche componenti radio separate possono ricevere il contorno attraverso questa logica.
-- **Comunicazione ideale:** non si penalizzano griglie complete, ritardi o multi-hop. Un messaggio contiene tre matrici `float64` da `200 × 200`, circa `960000` byte grezzi senza overhead: è una stima della dimensione dei dati, non traffico misurato.
+- **Comunicazione ideale:** non si penalizzano ritardi, perdite o capacità del canale. Il router consegna ai vicini entro il raggio (o sul grafo completo configurato); round simulati inoltrano i messaggi multi-hop.
+- **Rilevamento locale:** una chiusura richiede evidenza sufficiente nella mappa del singolo drone; rumore, osservazioni parziali e cambi topologici possono ritardare la transizione o produrre una proposta non adatta.
 - **Memoria:** le quattro matrici principali richiedono circa `1.28 MB` decimali per drone. `mean_grid_history` conserva circa `160 MB` per 500 frame con mappe `200 × 200` in `float64`. Snapshot, grafici e GIF aggiungono memoria; disabilitare la GIF non disabilita questa cronologia.
 - **Fusione semplificata:** sovrascrittura delle celle osservate, pesi uniformi sui vicini e nessuna gestione esplicita delle correlazioni delle informazioni inoltrate.
 - **Esplorazione incompleta:** direzione persistente e clipping non garantiscono l'incontro con la macchia o la copertura del contorno.
-- **Robot idealizzati:** nessun modello di accelerazione, orientamento, quota, inerzia, consumo, ostacoli o collision avoidance; `dt` non viene propagato uniformemente.
+- **Robot idealizzati:** nessun modello di accelerazione, orientamento, quota, inerzia, consumo, ostacoli o collision avoidance.
 - **Sensori idealizzati:** GPS senza bias persistente e camera senza prospettiva, illuminazione od occlusioni; la posizione GPS determina anche il campionamento.
-- **Contorno singolo:** viene privilegiata una linea chiusa lunga. Più macchie, buchi e cambi di topologia non hanno una gestione generale.
-- **Riferimento precedente:** se non è ricostruibile una nuova chiusura, può restare in uso il vecchio contorno, senza una strategia completa di recupero.
+- **Contorno singolo:** viene propagata una proposta di polilinea chiusa. Più macchie, buchi e cambi di topologia non hanno una gestione generale.
+- **Platooning:** i gap si basano sui robot noti nella componente locale; reti disconnesse possono avere temporaneamente viste diverse dell'anello.
 - **Export geometrico:** ordinamento angolare e flag non validati possono non bastare per usare i punti come poligono affidabile.
 - **Parametri inattivi:** `mapping_point_radius_cells` e `temporal_alpha` non producono gli effetti suggeriti dalle interfacce.
 - **Riproducibilità degli artefatti:** metadati incompleti e nomi riutilizzati fra esecuzioni richiedono una registrazione esterna della configurazione.
@@ -872,7 +856,7 @@ Un round sulle griglie ha costo proporzionale al numero di celle e ai vicinati d
 
 ### 17.2 Estensioni possibili
 
-Le estensioni più dirette sono: passare `dt` a tutte le azioni; separare camera fisica ed errore di localizzazione; introdurre pianificazione esplorativa; rendere locali chiusura e aggiornamento del bordo; simulare ritardi e perdite; scambiare sole celle modificate; confrontare pesi di consenso che preservano la media uniforme; gestire l'invecchiamento dell'informazione anche prima di patrol; validare topologia e ordine del contorno esportato.
+Le estensioni più dirette sono: separare camera fisica ed errore di localizzazione; introdurre pianificazione esplorativa; simulare ritardi e perdite; scambiare sole celle modificate; confrontare pesi di consenso che preservano la media uniforme; gestire l'invecchiamento dell'informazione anche prima di patrol; validare topologia e ordine del contorno esportato.
 
 Per una valutazione scientifica servono inoltre salvataggio delle matrici complete, configurazioni per esperimento, metriche rispetto alla ground truth e campagne su più seed. Sono proposte, non funzionalità già implementate.
 
@@ -884,9 +868,9 @@ Per una valutazione scientifica servono inoltre salvataggio delle matrici comple
 | GIF lenta o memoria elevata | Usare `--no-save-gif`; lo stride riduce i frame conservati, ma il rendering viene comunque richiesto |
 | Export con meno di tre punti | Non ci sono abbastanza punti dal bordo aggregato; controllare durata, geometria, camera e osservazioni |
 | Il drone resta al limite della mappa | L'esplorazione persiste nella direzione e il movimento è limitato dal dominio |
-| Nessun passaggio a Lloyd | Bordo incompleto, informazione insufficiente sui due lati o criteri di area/continuità non soddisfatti |
+| Nessun passaggio a Lloyd | Il drone non dispone ancora di una chiusura valida nella mappa locale per due frame |
 | Disaccordo quasi nullo ma mappa incompleta | Consenso raggiunto anche su celle sconosciute: verificare `information_grid` |
-| Risultati inattesi cambiando `dt` | Ambiente e movimento del drone non usano lo stesso passo configurato |
+| Risultati inattesi cambiando `dt` | Le velocità di ambiente e robot vengono moltiplicate per il nuovo passo temporale |
 | Modificare il raggio dei punti non cambia la mappa | `mapping_point_radius_cells` è ignorato dall'aggiornamento corrente |
 
 ## 18. Struttura del report universitario
@@ -894,7 +878,7 @@ Per una valutazione scientifica servono inoltre salvataggio delle matrici comple
 Una struttura coerente con il progetto:
 
 1. **Problema e obiettivo:** ricostruire e monitorare un fenomeno esteso da osservazioni locali.
-2. **Ipotesi:** piano 2D, frame globale comune, sensori rumorosi, campo sintetico, comunicazioni ideali e operazioni globali.
+2. **Ipotesi:** piano 2D, frame globale comune, sensori rumorosi, campo sintetico e comunicazioni radio ideali.
 3. **Architettura:** moduli, stato locale, dati scambiati e responsabilità del simulatore.
 4. **Percezione e mappatura:** camera, soglia, coordinate, matrici `S/I/P`, incertezza e bordo.
 5. **Fusione distribuita:** consenso, condizioni del caso statico, connettività e differenza fra accordo e accuratezza.
@@ -911,7 +895,7 @@ Domande utili per preparare l'esposizione:
 - Quando il consenso preserva la media aritmetica e quando introduce pesi diversi?
 - Perché usare una distanza geodetica per coprire un bordo?
 - Che differenza c'è fra centro in coordinata d'arco e baricentro cartesiano?
-- Quali decisioni sono locali e quali dipendono dal motore globale?
+- Quali funzioni locali svolgono i controller e quali responsabilità restano al motore fisico/router?
 - Perché `E ≈ 0` non dimostra una ricostruzione corretta?
 - Che cosa accade con bordo aperto, grafo disconnesso o macchia fuori dal dominio?
 

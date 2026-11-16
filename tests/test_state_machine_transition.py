@@ -1,283 +1,113 @@
 import numpy as np
 import pytest
 
-from controller import Controller
+from controller import DroneController
 from drone import Drone
 from simulation_engine import SimulationEngine
 
 
-def make_engine_shell():
+def make_drone(drone_id, x=0.0):
+    controller = DroneController(communication_radius=2.0, resolution=0.1)
+    drone = Drone(drone_id, x, 0.0, (32, 32), (-1.6, 1.6, -1.6, 1.6),
+                  gps_noise=0.0, controller=controller)
+    drone.closure_min_enclosed_false_cells = 8
+    return drone
+
+
+def square_boundary(drone):
+    mask = np.zeros(drone.grid_shape, dtype=bool)
+    mask[8:24, 8] = mask[8:24, 23] = True
+    mask[8, 8:24] = mask[23, 8:24] = True
+    drone.boundary_grid = mask.astype(float)
+    drone.information_grid[:] = 1.0
+    drone.occupancy_signal_grid[:] = 0.0
+    drone.occupancy_signal_grid[mask] = 1.0
+    drone.grid[:] = drone.occupancy_signal_grid
+
+
+def send_round(group, frame):
+    messages = {drone.drone_id: drone.create_consensus_message() for drone in group}
+    for drone in group:
+        drone.consensus_step(
+            [messages[other.drone_id] for other in group if other is not drone],
+            frame=frame,
+        )
+
+
+def test_local_closure_is_shared_by_max_consensus_and_transitions_without_engine():
+    d0, d1 = make_drone("D0"), make_drone("D1", 0.2)
+    square_boundary(d0)
+
+    send_round([d0, d1], frame=1)
+    assert d0.closure_detected and not d1.closure_detected
+
+    send_round([d0, d1], frame=2)
+    assert d0.closure_detected and d1.closure_detected
+    assert d1.contour_leader_id == "D0"
+    np.testing.assert_allclose(d1.contour_points, d0.contour_points)
+    assert d0.control_state == "dynamic_lloyd"
+    assert d1.control_state == "mapping"
+
+    send_round([d0, d1], frame=3)
+    assert d0.control_state == d1.control_state == "dynamic_lloyd"
+    assert d0.consecutive_closure_frames >= 2
+    assert d1.consecutive_closure_frames == 2
+
+
+def test_disconnected_components_evolve_independently_then_sync_when_connected():
+    a, b, c = (make_drone("A", 0.0), make_drone("B", 0.2), make_drone("C", 5.0))
+    for drone, leader, quality, epoch in ((a, "A", 0.2, 1), (b, "B", 0.9, 2), (c, "C", 0.5, 4)):
+        drone.closure_detected = True
+        drone.contour_points = np.array([[0., 0.], [1., 0.], [1., 1.]]) + ord(leader) * 0.001
+        drone.contour_leader_id = leader
+        drone.contour_quality = quality
+        drone.contour_epoch = epoch
+
     engine = object.__new__(SimulationEngine)
-    engine.x_min = -1.0
-    engine.y_min = -1.0
-    engine.resolution = 0.1
-    engine.occupancy_threshold = 0.5
-    engine.grid_shape = (12, 12)
-    engine.boundary_controller = Controller(
-        sim_map=None,
-        communication_radius=0.0,
-        occupancy_threshold=engine.occupancy_threshold,
-    )
-    engine.closure_min_boundary_cells = 8
-    engine.closure_min_enclosed_false_cells = 8
-    engine.last_closure_enclosed_false_cells = 0
-    engine.transition_frame = None
-    engine._pending_lloyd_transition_frames = {}
-    engine.dynamic_lloyd_ready_count = 0
-    engine.dynamic_lloyd_required_ready_count = 8
-    engine.dynamic_lloyd_arc_tolerance = 0.25
-    engine.patrol_forgetting_alpha = 0.995
-    engine.patrol_speed = 0.05
-    engine.patrol_min_speed = 0.01
-    engine.patrol_max_speed = 0.10
-    engine.patrol_spacing_gain = 0.08
-    engine.patrol_direction = 1.0
-    engine.patrol_reference_s = None
-    engine.patrol_ordered_ids = []
-    engine.patrol_start_frame = None
-    return engine
+    engine.drones = [a, b, c]
+    engine.fully_connected = False
+    engine.communication_radius = 1.0
+    engine.occupancy_threshold = 0.6
+    engine.frame = 1
+    engine._exchange_consensus_messages()
+    assert a.contour_leader_id == b.contour_leader_id == "B"
+    assert c.contour_leader_id == "C"
+    c.x = 0.4
+    c.last_gps_position = c.position.copy()
+    engine.frame = 2
+    engine._exchange_consensus_messages()
+    assert a.contour_leader_id == b.contour_leader_id == c.contour_leader_id == "C"
+    np.testing.assert_allclose(a.contour_points, c.contour_points)
 
 
-def test_dfs_polygon_closure_detects_closed_loop_not_open_chain():
-    engine = make_engine_shell()
-    closed_grid = np.zeros((12, 12), dtype=float)
-    closed_grid[3:9, 3] = 1.0
-    closed_grid[3:9, 8] = 1.0
-    closed_grid[3, 3:9] = 1.0
-    closed_grid[8, 3:9] = 1.0
+def test_local_platooning_feedback_reduces_ring_gap_imbalance():
+    length = 20.0
+    positions = np.array([0.0, 3.0, 11.0])
+    identifiers = ["A", "B", "C"]
+    controller = DroneController()
 
-    is_closed, points = engine.is_mapped_polygon_closed(closed_grid)
+    def gap_spread(values):
+        ordered = np.sort(values)
+        gaps = np.diff(np.r_[ordered, ordered[0] + length])
+        return float(np.std(gaps))
 
-    assert is_closed
-    assert points.shape[0] >= engine.closure_min_boundary_cells
-
-    open_grid = closed_grid.copy()
-    open_grid[3:6, 8] = 0.0
-
-    is_closed, points = engine.is_mapped_polygon_closed(open_grid)
-
-    assert not is_closed
-    assert points.shape == (0, 2)
-
-
-def test_dfs_polygon_closure_requires_minimum_enclosed_false_area():
-    engine = make_engine_shell()
-    engine.closure_min_enclosed_false_cells = 5
-
-    small_loop = np.zeros((8, 8), dtype=float)
-    small_loop[2:5, 2] = 1.0
-    small_loop[2:5, 4] = 1.0
-    small_loop[2, 2:5] = 1.0
-    small_loop[4, 2:5] = 1.0
-
-    is_closed, points = engine.is_mapped_polygon_closed(small_loop)
-
-    assert not is_closed
-    assert points.shape == (0, 2)
-    assert engine.last_closure_enclosed_false_cells == 1
+    initial_spread = gap_spread(positions)
+    for _ in range(300):
+        arcs = {did: float(s) for did, s in zip(identifiers, positions)}
+        speeds = np.array([
+            controller._platooning_speed(positions[i], arcs, identifiers[i], length)
+            for i in range(len(positions))
+        ])
+        positions = (positions + speeds * 1.0) % length
+    assert gap_spread(positions) < initial_spread
 
 
-def test_closed_boundary_points_are_ordered_by_neighbor_trace():
-    engine = make_engine_shell()
-    closed_grid = np.zeros((12, 12), dtype=float)
-    closed_grid[3:9, 3] = 1.0
-    closed_grid[3:9, 8] = 1.0
-    closed_grid[3, 3:9] = 1.0
-    closed_grid[8, 3:9] = 1.0
-
-    is_closed, points = engine.is_mapped_polygon_closed(closed_grid)
-
-    assert is_closed
-    step_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
-    assert np.max(step_lengths) <= np.sqrt(2.0) * engine.resolution + 1e-12
-
-
-def test_thick_occupied_boundary_collapses_to_single_centerline():
-    engine = make_engine_shell()
-    engine.x_min = 0.0
-    engine.y_min = 0.0
-    engine.grid_shape = (80, 80)
-    engine.closure_min_boundary_cells = 24
-
-    grid_x, grid_y = np.indices(engine.grid_shape)
-    center_cell = np.array([40.0, 40.0])
-    radius_cells = np.sqrt(
-        (grid_x - center_cell[0]) ** 2 + (grid_y - center_cell[1]) ** 2
-    )
-    thick_ring = ((radius_cells >= 18.0) & (radius_cells <= 22.0)).astype(float)
-
-    centerline = engine._ordered_centerline_points_from_grid(thick_ring)
-
-    assert centerline.shape[0] >= engine.closure_min_boundary_cells
-
-    center_world = (center_cell + 0.5) * engine.resolution
-    radii = np.linalg.norm(centerline - center_world.reshape(1, 2), axis=1)
-
-    assert np.mean(radii) == pytest.approx(2.0, abs=0.15)
-    assert np.std(radii) < 0.2
-    assert centerline.shape[0] < np.count_nonzero(thick_ring)
-
-
-def test_enclosed_free_region_contour_has_no_long_jumps():
-    engine = make_engine_shell()
-    engine.x_min = 0.0
-    engine.y_min = 0.0
-    engine.grid_shape = (40, 40)
-    engine.closure_min_boundary_cells = 16
-
-    grid = np.zeros(engine.grid_shape, dtype=float)
-    grid[10:30, 10] = 1.0
-    grid[10:30, 29] = 1.0
-    grid[10, 10:30] = 1.0
-    grid[29, 10:30] = 1.0
-
-    contour = engine._ordered_enclosed_contour_points_from_grid(grid)
-
-    if contour.size == 0:
-        pytest.skip("contourpy is not available")
-
-    step_lengths = np.linalg.norm(np.roll(contour, -1, axis=0) - contour, axis=1)
-    assert contour.shape[0] >= engine.closure_min_boundary_cells
-    assert np.max(step_lengths) <= engine.resolution + 1e-12
-
-
-def test_loop_cell_ordering_backtracks_without_geometric_jumps():
-    engine = make_engine_shell()
-    cells = {
-        (1, 1),
-        (2, 1),
-        (3, 1),
-        (3, 2),
-        (3, 3),
-        (2, 3),
-        (1, 3),
-        (1, 2),
-        (2, 2),
-    }
-    adjacency = {
-        cell: [neighbor for neighbor in engine._cell_neighbors(cell) if neighbor in cells]
-        for cell in cells
-    }
-
-    ordered = engine._order_loop_cells(cells, adjacency)
-    points = engine._cells_to_world_points(ordered)
-    step_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
-
-    assert set(ordered) == cells
-    assert np.max(step_lengths) <= np.sqrt(2.0) * engine.resolution + 1e-12
-
-
-def test_decentralized_transition_loads_boundary_only_into_triggering_drone():
-    engine = make_engine_shell()
-    engine.control_state = "mapping"
-    engine.closed_boundary_points = np.empty((0, 2), dtype=float)
-    engine.boundary_controller = Controller(
-        sim_map=None,
-        communication_radius=10.0,
-    )
-    engine.frame = 7
-    engine.verbose = False
-
-    boundary = np.array(
-        [
-            [-1.0, -1.0],
-            [1.0, -1.0],
-            [1.0, 1.0],
-            [-1.0, 1.0],
-        ],
-        dtype=float,
-    )
-    engine.drones = [
-        Drone("D0", 0.0, -0.5, (4, 4), (-1.0, 1.0, -1.0, 1.0)),
-        Drone("D1", 0.5, 0.0, (4, 4), (-1.0, 1.0, -1.0, 1.0)),
-    ]
-    initial_positions = {
-        drone.drone_id: drone.position.copy()
-        for drone in engine.drones
-    }
-
-    engine._transition_drone_to_lloyd_state(engine.drones[0], boundary)
-
-    assert engine.control_state == "mapping"
-    assert engine.transition_frame == 7
-    np.testing.assert_allclose(engine.closed_boundary_points, boundary)
-
-    switched = engine.drones[0]
-    waiting = engine.drones[1]
-
-    assert switched.control_state == "lloyd"
-    np.testing.assert_allclose(switched.known_boundary_points, boundary)
-    np.testing.assert_allclose(switched.position, initial_positions[switched.drone_id])
-    assert switched.boundary_s is not None
-    assert set(switched.known_positions) == {"D0"}
-    assert set(switched.known_boundary_arcs) == {"D0"}
-
-    assert waiting.control_state == "mapping"
-    assert waiting.known_boundary_points.shape == (0, 2)
-    np.testing.assert_allclose(waiting.position, initial_positions[waiting.drone_id])
-
-
-def test_decentralized_transition_waits_for_consensus_after_closure_detection():
-    engine = make_engine_shell()
-    engine.control_state = "mapping"
-    engine.closed_boundary_points = np.empty((0, 2), dtype=float)
-    engine.frame = 7
-    engine.verbose = False
-    engine.drones = [
-        Drone("D0", 0.0, -0.5, (12, 12), (-1.0, 1.0, -1.0, 1.0)),
-    ]
-    closed_grid = np.zeros((12, 12), dtype=float)
-    closed_grid[3:9, 3] = 1.0
-    closed_grid[3:9, 8] = 1.0
-    closed_grid[3, 3:9] = 1.0
-    closed_grid[8, 3:9] = 1.0
-    engine.drones[0].grid = closed_grid
-
-    engine._check_decentralized_mapping_transitions()
-
-    assert engine.drones[0].control_state == "mapping"
-    assert engine._pending_lloyd_transition_frames == {"all": 7}
-
-    engine.frame = 8
-    engine._check_decentralized_mapping_transitions()
-
-    assert engine.drones[0].control_state == "dynamic_lloyd"
-    assert engine.control_state == "dynamic_lloyd"
-    assert engine._pending_lloyd_transition_frames == {}
-
-
-def test_patrol_targets_advance_along_ordered_boundary():
-    engine = make_engine_shell()
-    engine.dt = 1.0
-    engine.control_state = "boundary_patrol"
-    engine.frame = 10
-    boundary = np.array(
-        [
-            [-1.0, -1.0],
-            [1.0, -1.0],
-            [1.0, 1.0],
-            [-1.0, 1.0],
-        ],
-        dtype=float,
-    )
-    engine.closed_boundary_points = boundary
-    engine.drones = [
-        Drone("D0", -1.0, -1.0, (12, 12), (-1.0, 1.0, -1.0, 1.0), gps_noise=0.0),
-        Drone("D1", 1.0, -1.0, (12, 12), (-1.0, 1.0, -1.0, 1.0), gps_noise=0.0),
-        Drone("D2", 1.0, 1.0, (12, 12), (-1.0, 1.0, -1.0, 1.0), gps_noise=0.0),
-        Drone("D3", -1.0, 1.0, (12, 12), (-1.0, 1.0, -1.0, 1.0), gps_noise=0.0),
-    ]
-    engine._set_boundary_for_all_drones(boundary)
-    for drone in engine.drones:
-        drone.control_state = "boundary_patrol"
-    engine.patrol_ordered_ids = [drone.drone_id for drone in engine.drones]
-    engine.patrol_reference_s = 0.0
-
-    assert engine._update_patrol_targets()
-
-    targets = [drone.patrol_target_s for drone in engine.drones]
-    assert all(target is not None for target in targets)
-    assert targets[0] == pytest.approx(engine.patrol_speed)
-    for drone in engine.drones:
-        assert drone.target_centroid is not None
-        assert drone.last_ring_info is None
+def test_isolated_patrol_drone_moves_at_nominal_speed():
+    drone = make_drone("solo")
+    drone.control_state = "boundary_patrol"
+    drone.set_known_boundary(np.array([[0., 0.], [2., 0.], [2., 2.], [0., 2.]]))
+    drone.boundary_s = 0.0
+    drone.known_boundary_arcs = {"solo": 0.0}
+    drone.last_gps_position = np.array([0., 0.])
+    drone.controller._patrol_action(drone, dt=2.0)
+    assert drone.patrol_target_s == pytest.approx(0.1)
