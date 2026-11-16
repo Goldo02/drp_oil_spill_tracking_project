@@ -118,10 +118,10 @@ Esistono due discretizzazioni differenti:
 
 | Oggetto | Estensione predefinita | Dimensione | Passo |
 | --- | --- | --- | --- |
-| Campo dell'ambiente | `[-5, 5] × [-5, 5]` | `500 × 500` | `10 / 499 ≈ 0.02004` |
+| Campo dell'ambiente | `[-7, 7] × [-7, 7]` | `500 × 500` | `14 / 499 ≈ 0.02806` |
 | Mappa di ogni robot | `[-10, 10] × [-10, 10]` | `200 × 200` | `0.1` |
 
-La prima descrive il campo osservabile; la seconda memorizza le stime. I droni sono inizializzati uniformemente nel dominio dell'ambiente e il loro movimento viene limitato a `[-5, 5]²`. Una parte della mappa più ampia può restare sconosciuta.
+La prima descrive il campo osservabile; la seconda memorizza le stime. I droni sono inizializzati uniformemente nel dominio dell'ambiente e il loro movimento viene limitato a `[-7, 7]²`. Una parte della mappa più ampia può restare sconosciuta.
 
 Le coordinate sono in **unità del mondo simulato**. Non è definita una conversione in metri, né un modello di quota o ottica. La camera usa una finestra di `120 × 120` campioni del campo: il lato è circa `2.4` unità; la distanza fra primo e ultimo centro di pixel è `119 × dx`.
 
@@ -148,7 +148,7 @@ $$
 R_c=n_{\text{celle}}\frac{|dx|+|dy|}{2}.
 $$
 
-Il default CLI di `250` celle corrisponde a circa `5.01` unità. La funzione Python `run_simulation()` e il costruttore del motore hanno invece default `205`, pari a circa `4.11`. Per confrontare CLI e API impostarlo esplicitamente.
+Il default CLI di `250` celle corrisponde a circa `7.01` unità. La funzione Python `run_simulation()` e il costruttore del motore hanno invece default `205`, pari a circa `5.75`. Per confrontare CLI e API impostarlo esplicitamente.
 
 ## 4. Modello della macchia
 
@@ -637,7 +637,7 @@ Gli FPS non cambiano il passo della simulazione. I parametri `polygon-*` non con
 
 | Parametro | Valore principale | Dove intervenire |
 | --- | --- | --- |
-| Ambiente | `500 × 500`, `[-5, 5]²` | `main._build_environment` |
+| Ambiente | `500 × 500`, `[-7, 7]²` | `main._build_environment` |
 | Mappa robot | `200 × 200`, passo `0.1`, `[-10, 10]²` | `main._build_engine` |
 | Camera | `120 × 120` | `main._build_engine` |
 | Soglia | `0.6` | `main._build_engine` |
@@ -673,8 +673,8 @@ engine = SimulationEngine(
 for i in range(5):
     engine.add_drone(
         f"D{i}",
-        x=np.random.uniform(-5, 5),
-        y=np.random.uniform(-5, 5),
+        x=np.random.uniform(*world.xlim),
+        y=np.random.uniform(*world.ylim),
         gps_noise=0.03,
         camera_noise=0.03,
     )

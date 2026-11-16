@@ -24,6 +24,7 @@ class Visualizer:
         show_communication_radius=False,
         show_nls_points=False,
         show_2d_voronoi=False,
+        show_debug_window=True,
     ):
         plt.ion()
 
@@ -37,16 +38,26 @@ class Visualizer:
 
         self.show_nls_points = show_nls_points
         self.show_2d_voronoi = bool(show_2d_voronoi)
+        self.show_debug_window = bool(show_debug_window)
 
         self.fig, (self.ax, self.side_ax) = plt.subplots(
             1,
             2,
-            figsize=(16, 7),
+            figsize=(15, 8),
             gridspec_kw={"width_ratios": [1.25, 1.0]},
         )
+        self.debug_fig = None
+        self.debug_axes = []
+        if self.show_debug_window:
+            self.debug_fig = plt.figure(figsize=(12, 8))
         self.ax.set_xlim(sim_map.xlim)
         self.ax.set_ylim(sim_map.ylim)
         self.ax.set_aspect("equal")
+        # Keep the world view as the only panel in the main figure. The
+        # aggregate/mean occupancy grid is intentionally shown nowhere here.
+        self.side_ax.set_visible(False)
+        self.fig.subplots_adjust(left=0.04, right=0.98, bottom=0.07, top=0.93)
+        self.ax.set_position([0.08, 0.08, 0.84, 0.84])
         self.side_mode = None
 
         if self.show_communication_radius:
@@ -1082,13 +1093,12 @@ class Visualizer:
         for drone in drones:
             self.update_drone(drone)
 
-        if control_state in ("lloyd", "dynamic_lloyd"):
-            self.update_ring_partition(drones)
-        else:
-            self._render_mean_occupancy_panel(simulation_data)
+        self._render_drone_debug(simulation_data, drones)
 
         self.fig.canvas.draw_idle()
         self.fig.canvas.flush_events()
+        if self.debug_fig is not None:
+            self.debug_fig.canvas.flush_events()
         self._capture_animation_frame()
 
         pause_time = pause if isinstance(pause, (int, float)) else 0.001
@@ -1100,3 +1110,54 @@ class Visualizer:
         Close the visualization window.
         """
         plt.close(self.fig)
+        if self.debug_fig is not None:
+            plt.close(self.debug_fig)
+
+    def _render_drone_debug(self, simulation_data, drones):
+        """Show each drone's local grid, or its local Lloyd partition."""
+        if self.debug_fig is None:
+            return
+        self.debug_fig.clear()
+        count = max(1, len(drones))
+        columns = min(3, count)
+        rows = int(np.ceil(count / columns))
+        state = simulation_data.get("control_state", "mapping")
+        self.debug_axes = []
+        for index, drone in enumerate(drones):
+            ax = self.debug_fig.add_subplot(rows, columns, index + 1)
+            self.debug_axes.append(ax)
+            if state in ("lloyd", "dynamic_lloyd") or getattr(drone, "control_state", "mapping") == "dynamic_lloyd":
+                ring = getattr(drone, "last_ring_info", None) or {}
+                length = float(ring.get("total_boundary_length", 0.0))
+                entries = ring.get("ring", [])
+                ax.set_title(f"{drone.drone_id}: partizione Lloyd locale")
+                ax.set_yticks([])
+                ax.set_xlabel("Arco del contorno")
+                if length > 0 and entries:
+                    ax.set_xlim(0, length)
+                    for entry in entries:
+                        color = self._drone_color(entry.get("drone_id", drone.drone_id))
+                        start = float(entry.get("cell_start_arc_length", 0.0)) % length
+                        span = float(entry.get("cell_arc_length", 0.0))
+                        end = start + span
+                        if end <= length:
+                            ax.plot([start, end], [0, 0], lw=8, color=color)
+                        else:
+                            ax.plot([start, length], [0, 0], lw=8, color=color)
+                            ax.plot([0, end - length], [0, 0], lw=8, color=color)
+                        seed = float(entry.get("seed_arc_length", start)) % length
+                        target = float(entry.get("target_arc_length", seed)) % length
+                        ax.scatter([seed], [0.18], color=color, marker="o")
+                        ax.scatter([target], [0], color=color, marker="*")
+                        ax.text(seed, 0.27, str(entry.get("drone_id", "")), ha="center")
+                else:
+                    ax.text(0.5, 0.5, "Partizione locale non disponibile", ha="center", transform=ax.transAxes)
+            else:
+                grid = np.asarray(drone.grid, dtype=float)
+                ax.imshow(grid.T, origin="lower", cmap="Greys", vmin=0, vmax=1, interpolation="nearest")
+                ax.set_title(f"{drone.drone_id}: occupancy locale ({drone.control_state})")
+                ax.set_xlabel("Grid X")
+                ax.set_ylabel("Grid Y")
+        self.debug_fig.suptitle(f"Debug per drone — frame {simulation_data.get('frame', 0)}")
+        self.debug_fig.tight_layout()
+        self.debug_fig.canvas.draw_idle()

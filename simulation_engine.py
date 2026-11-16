@@ -33,7 +33,7 @@ class SimulationEngine:
         fully_connected=False,
         occupancy_threshold=0.6,
         temporal_alpha=0.05,
-        consensus_rounds=10,
+        consensus_rounds=3,
         dt=1.0,
         verbose=True,
         closure_min_enclosed_false_cells=250,

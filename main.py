@@ -52,7 +52,7 @@ def _build_environment(
     dynamic_move=None,
     dynamic_expand=None,
 ):
-    sim_map = SimulationMap(xlim=(-5.0, 5.0), ylim=(-5.0, 5.0), grid_size=500)
+    sim_map = SimulationMap(xlim=(-7.0, 7.0), ylim=(-7.0, 7.0), grid_size=500)
     drift_velocity = (
         _dynamic_drift_velocity(sim_map, seed, speed=dynamic_move)
         if dynamic_move is not None
@@ -161,6 +161,7 @@ def _build_visualizer(
     fully_connected,
     show_nls_points,
     show_2d_voronoi,
+    show_debug_window=True,
 ):
     return Visualizer(
         sim_map=sim_map,
@@ -169,6 +170,7 @@ def _build_visualizer(
         show_communication_radius=not fully_connected,
         show_nls_points=show_nls_points,
         show_2d_voronoi=show_2d_voronoi,
+        show_debug_window=show_debug_window,
     )
 
 
@@ -406,6 +408,7 @@ def run_simulation(
     measure_every=3,
     show_nls_points=False,
     show_2d_voronoi=False,
+    show_debug_window=True,
     polygon_vertices=36,
     polygon_r0=2.5,
     polygon_smoothness=0.2,
@@ -458,6 +461,7 @@ def run_simulation(
         fully_connected,
         show_nls_points,
         show_2d_voronoi,
+        show_debug_window=show_debug_window,
     )
 
     if visualize:
@@ -512,6 +516,8 @@ def _build_parser():
         description="Distributed oil spill occupancy grid mapping simulation"
     )
     parser.add_argument("--visualize", action="store_true")
+    parser.add_argument("--debug-window", action=argparse.BooleanOptionalAction, default=True,
+                        help="Show per-drone debug window with --visualize (default: enabled).")
     parser.add_argument("--frames", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-drones", type=int, default=5)
@@ -619,6 +625,7 @@ def main():
     args = _build_parser().parse_args()
     run_simulation(
         visualize=args.visualize,
+        show_debug_window=args.debug_window,
         max_frames=args.frames,
         seed=args.seed,
         num_drones=args.num_drones,

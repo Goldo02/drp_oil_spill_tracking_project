@@ -71,8 +71,8 @@ class SimulationMap:
 
     def __init__(
         self,
-        xlim=(-5.0, 5.0),
-        ylim=(-5.0, 5.0),
+        xlim=(-7.0, 7.0),
+        ylim=(-7.0, 7.0),
         grid_size=500,
     ):
         self.xlim = tuple(xlim)
