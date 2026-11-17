@@ -631,6 +631,7 @@ I default seguenti si riferiscono a `python main.py`.
 | `--gif-fps` | `10.0` | Velocità di riproduzione |
 | `--gif-frame-stride` | `1` | Registra un frame ogni N render |
 
+Quando la finestra debug è abilitata, viene salvata anche `simulation_debug_animation.gif` in `tmp_output`.
 Gli FPS non cambiano il passo della simulazione. I parametri `polygon-*` non configurano il cerchio. Il codice valida o limita alcuni valori ma non tutti: un numero nullo di robot o frame non garantisce un'esportazione valida.
 
 ### 13.2 Valori configurati nel codice
@@ -701,6 +702,7 @@ L'esecuzione standard scrive in `tmp_output`, relativa alla directory di lavoro:
 | `final_occupancy_grid.png` | Mappa aggregata finale sogliata |
 | `final_occupancy_grid_robot_D0.png`, ecc. | Mappe locali finali sogliate |
 | `simulation_animation.gif` | Animazione, se abilitata |
+| `simulation_debug_animation.gif` | Animazione delle griglie locali o partizioni Lloyd dei droni, se la finestra debug è abilitata |
 | `oil_mapping_data.npy` | Array `(N, 2)` dei punti di bordo in coordinate mondo |
 | `oil_mapping_metadata.json` | Provenienza, coordinate, griglie e dinamica |
 
@@ -710,7 +712,7 @@ Le immagini già presenti nel repository, incluse quelle nella directory princip
 
 ### 14.2 Visualizzatore e mappe
 
-Il pannello principale mostra il campo reale simulato, i robot e le sovrapposizioni delle stime. La ground truth è disponibile al lettore della figura; ciò non significa che venga usata direttamente dal controllore locale.
+Il pannello principale mostra il campo reale simulato, i robot e le sovrapposizioni delle stime, senza un'etichetta di fase. La finestra debug indica la fase corrente nel titolo del pannello di ogni drone. La ground truth è disponibile al lettore della figura; ciò non significa che venga usata direttamente dal controllore locale.
 
 Il pannello laterale mostra la probabilità aggregata in mapping e patrol. Durante Lloyd mostra la partizione del bordo e i target. `--show-2d-voronoi` colora gli archi sul piano, non celle bidimensionali su tutta la superficie.
 

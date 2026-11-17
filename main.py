@@ -266,6 +266,11 @@ def _save_outputs(
             directory=OUTPUT_DIR,
             fps=gif_fps,
         )
+        if visualizer.debug_fig is not None:
+            visualizer.save_debug_animation_as_gif(
+                directory=OUTPUT_DIR,
+                fps=gif_fps,
+            )
     visualizer.save_final_occupancy_grid_per_robot(
         engine.drones,
         directory=OUTPUT_DIR,

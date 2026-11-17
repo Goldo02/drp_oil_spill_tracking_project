@@ -4,7 +4,7 @@
   "coordinate_frame": "world",
   "units": "simulation_world_units",
   "shape": [
-    245,
+    306,
     2
   ],
   "dtype": "float64",
@@ -13,23 +13,29 @@
   "occupancy_threshold": 0.6,
   "oil_dynamics": {
     "dynamic": true,
+    "move_velocity": [
+      0.00686926860424385,
+      0.004100383987232142
+    ],
     "drift_velocity": [
-      -5.180199905106501e-05,
-      0.009999865826744593
-    ]
+      0.00686926860424385,
+      0.004100383987232142
+    ],
+    "move_speed": 0.008,
+    "expand_speed": 0.008
   },
   "sim_map": {
     "xlim": [
-      -5.0,
-      5.0
+      -7.0,
+      7.0
     ],
     "ylim": [
-      -5.0,
-      5.0
+      -7.0,
+      7.0
     ],
     "grid_size": 500,
-    "dx": 0.020040080160320883,
-    "dy": 0.020040080160320883
+    "dx": 0.028056112224448704,
+    "dy": 0.028056112224448704
   },
   "mapping_grid": {
     "bounds": [

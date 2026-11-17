@@ -71,7 +71,6 @@ class Visualizer:
 
         self.img = None
         self.contour = None
-        self.phase_text = None
         self.side_colorbar = None
 
         if self.oil_spill is not None:
@@ -87,6 +86,7 @@ class Visualizer:
         self.occupancy_boundary_artists = []
         self.ring_color_map = {}
         self.animation_frames = []
+        self.debug_animation_frames = []
         self.animation_recording_enabled = False
         self.animation_frame_stride = 1
         self.animation_render_count = 0
@@ -232,36 +232,6 @@ class Visualizer:
                     artist.remove()
 
             del self.centroid_markers[drone_id]
-
-    def update_phase_label(self, control_state):
-        labels = {
-            "mapping": "Phase: Mapping",
-            "dynamic_lloyd": "Phase: Dynamic Lloyd",
-            "boundary_patrol": "Phase: Boundary Patrol",
-            "lloyd": "Phase: Lloyd",
-        }
-        label = labels.get(str(control_state), f"Phase: {control_state}")
-        if self.phase_text is None:
-            self.phase_text = self.ax.text(
-                0.02,
-                0.98,
-                label,
-                transform=self.ax.transAxes,
-                ha="left",
-                va="top",
-                fontsize=10,
-                fontweight="bold",
-                color="black",
-                bbox={
-                    "boxstyle": "round,pad=0.25",
-                    "facecolor": "white",
-                    "edgecolor": "black",
-                    "alpha": 0.75,
-                },
-                zorder=10,
-            )
-        else:
-            self.phase_text.set_text(label)
 
     def _drone_color(self, drone_id):
         if drone_id not in self.ring_color_map:
@@ -837,6 +807,7 @@ class Visualizer:
             :meth:`render`. A value of 1 records every rendered state.
         """
         self.animation_frames = []
+        self.debug_animation_frames = []
         self.animation_recording_enabled = True
         self.animation_frame_stride = max(1, int(frame_stride))
         self.animation_render_count = 0
@@ -848,6 +819,7 @@ class Visualizer:
     def clear_animation_frames(self):
         """Discard all frames currently buffered for GIF export."""
         self.animation_frames = []
+        self.debug_animation_frames = []
         self.animation_render_count = 0
 
     def _capture_animation_frame(self):
@@ -863,6 +835,11 @@ class Visualizer:
         rgba = np.asarray(self.fig.canvas.buffer_rgba())
         rgb = np.asarray(rgba[:, :, :3], dtype=np.uint8).copy()
         self.animation_frames.append(rgb)
+        if self.debug_fig is not None:
+            self.debug_fig.canvas.draw()
+            debug_rgba = np.asarray(self.debug_fig.canvas.buffer_rgba())
+            debug_rgb = np.asarray(debug_rgba[:, :, :3], dtype=np.uint8).copy()
+            self.debug_animation_frames.append(debug_rgb)
         self.animation_render_count += 1
 
     def save_animation_as_gif(
@@ -897,7 +874,26 @@ class Visualizer:
         str
             Absolute output path of the saved GIF.
         """
-        if not self.animation_frames:
+        return self._save_frames_as_gif(
+            self.animation_frames, filename, directory, fps, loop
+        )
+
+    def save_debug_animation_as_gif(
+        self,
+        filename="simulation_debug_animation.gif",
+        directory="./tmp_output",
+        fps=10,
+        loop=0,
+    ):
+        """Save the per-drone debug window history as a GIF."""
+        if self.debug_fig is None:
+            raise RuntimeError("The debug window is disabled; no debug GIF is available.")
+        return self._save_frames_as_gif(
+            self.debug_animation_frames, filename, directory, fps, loop
+        )
+
+    def _save_frames_as_gif(self, frames, filename, directory, fps, loop):
+        if not frames:
             raise RuntimeError(
                 "No animation frames were recorded. Call "
                 "start_animation_recording() before rendering simulation frames."
@@ -913,7 +909,7 @@ class Visualizer:
 
         output_path = self._output_path(filename, directory)
         duration_ms = int(round(1000.0 / max(float(fps), 1e-9)))
-        images = [Image.fromarray(frame) for frame in self.animation_frames]
+        images = [Image.fromarray(frame) for frame in frames]
         images[0].save(
             output_path,
             save_all=True,
@@ -1081,8 +1077,6 @@ class Visualizer:
         world_field = simulation_data.get("world_field")
 
         drones = simulation_data.get("drones", [])
-        control_state = simulation_data.get("control_state", "mapping")
-        self.update_phase_label(control_state)
 
         if world_field is not None:
             self.update_environment(world_field)
@@ -1121,16 +1115,23 @@ class Visualizer:
         count = max(1, len(drones))
         columns = min(3, count)
         rows = int(np.ceil(count / columns))
-        state = simulation_data.get("control_state", "mapping")
+        phase_labels = {
+            "mapping": "Mapping",
+            "dynamic_lloyd": "Dynamic Lloyd",
+            "boundary_patrol": "Boundary Patrol",
+            "lloyd": "Lloyd",
+        }
         self.debug_axes = []
         for index, drone in enumerate(drones):
             ax = self.debug_fig.add_subplot(rows, columns, index + 1)
             self.debug_axes.append(ax)
-            if state in ("lloyd", "dynamic_lloyd") or getattr(drone, "control_state", "mapping") == "dynamic_lloyd":
+            drone_state = str(getattr(drone, "control_state", "mapping"))
+            phase_label = phase_labels.get(drone_state, drone_state)
+            if drone_state in ("lloyd", "dynamic_lloyd"):
                 ring = getattr(drone, "last_ring_info", None) or {}
                 length = float(ring.get("total_boundary_length", 0.0))
                 entries = ring.get("ring", [])
-                ax.set_title(f"{drone.drone_id}: partizione Lloyd locale")
+                ax.set_title(f"{drone.drone_id}: {phase_label} — partizione locale")
                 ax.set_yticks([])
                 ax.set_xlabel("Arco del contorno")
                 if length > 0 and entries:
@@ -1155,7 +1156,7 @@ class Visualizer:
             else:
                 grid = np.asarray(drone.grid, dtype=float)
                 ax.imshow(grid.T, origin="lower", cmap="Greys", vmin=0, vmax=1, interpolation="nearest")
-                ax.set_title(f"{drone.drone_id}: occupancy locale ({drone.control_state})")
+                ax.set_title(f"{drone.drone_id}: {phase_label} — occupancy locale")
                 ax.set_xlabel("Grid X")
                 ax.set_ylabel("Grid Y")
         self.debug_fig.suptitle(f"Debug per drone — frame {simulation_data.get('frame', 0)}")
