@@ -4,7 +4,7 @@
   "coordinate_frame": "world",
   "units": "simulation_world_units",
   "shape": [
-    306,
+    348,
     2
   ],
   "dtype": "float64",
@@ -14,12 +14,12 @@
   "oil_dynamics": {
     "dynamic": true,
     "move_velocity": [
-      0.00686926860424385,
-      0.004100383987232142
+      -0.005653460056431912,
+      -0.005660246407209573
     ],
     "drift_velocity": [
-      0.00686926860424385,
-      0.004100383987232142
+      -0.005653460056431912,
+      -0.005660246407209573
     ],
     "move_speed": 0.008,
     "expand_speed": 0.008

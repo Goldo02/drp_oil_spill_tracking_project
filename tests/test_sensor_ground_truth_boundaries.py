@@ -45,7 +45,7 @@ class DummyMap:
     dy = 0.1
 
 
-def test_drone_camera_request_is_centered_on_gps_estimate():
+def test_drone_camera_samples_at_real_position_and_localizes_with_gps_estimate():
     drone = Drone(
         drone_id="D0",
         x=0.0,
@@ -66,8 +66,8 @@ def test_drone_camera_request_is_centered_on_gps_estimate():
     )
 
     assert camera.calls
-    assert camera.calls[0]["x"] == pytest.approx(0.75)
-    assert camera.calls[0]["y"] == pytest.approx(-0.25)
+    assert camera.calls[0]["x"] == pytest.approx(0.0)
+    assert camera.calls[0]["y"] == pytest.approx(0.0)
     np.testing.assert_allclose(
         camera.calls[0]["position_estimate"],
         [0.75, -0.25],

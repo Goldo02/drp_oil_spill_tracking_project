@@ -192,11 +192,12 @@ class Drone:
         """
 
         position_estimate = self.update_position_estimate()
+        real_position = self.position
 
         measurement = self.camera.sense(
             world_field=world_field,
-            x=position_estimate[0],
-            y=position_estimate[1],
+            x=real_position[0],
+            y=real_position[1],
             x_coords=x_coords,
             y_coords=y_coords,
             position_estimate=position_estimate,
@@ -631,18 +632,41 @@ class Drone:
 
         command = self._clip_command(command, self.max_speed)
 
-        self.last_control_vector = command.copy()
-        self.x += command[0] * float(dt)
-        self.y += command[1] * float(dt)
-
         if bounds is None:
             x_bounds = (self.x_min, self.x_max)
             y_bounds = (self.y_min, self.y_max)
         else:
             x_bounds, y_bounds = bounds
 
-        self.x = float(np.clip(self.x, x_bounds[0], x_bounds[1]))
-        self.y = float(np.clip(self.y, y_bounds[0], y_bounds[1]))
+        dt = float(dt)
+        positions = np.array([self.x, self.y], dtype=float)
+        axis_bounds = (x_bounds, y_bounds)
+        for axis, (lower, upper) in enumerate(axis_bounds):
+            span = float(upper) - float(lower)
+            if span <= 0.0:
+                positions[axis] = float(lower)
+                command[axis] = 0.0
+                continue
+
+            proposed = positions[axis] + command[axis] * dt
+            if proposed < lower or proposed > upper:
+                # Reflect overshoot at the wall; modulo also handles a step
+                # large enough to cross the domain more than once.
+                phase = (proposed - float(lower)) % (2.0 * span)
+                if phase <= span:
+                    positions[axis] = float(lower) + phase
+                else:
+                    positions[axis] = float(upper) - (phase - span)
+                command[axis] *= -1.0
+                if axis == 0:
+                    self.exploration_direction[0] *= -1.0
+                else:
+                    self.exploration_direction[1] *= -1.0
+            else:
+                positions[axis] = proposed
+
+        self.x, self.y = map(float, positions)
+        self.last_control_vector = command.copy()
         self.known_positions[self.drone_id] = self.last_gps_position.copy()
 
         return command

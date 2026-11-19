@@ -144,13 +144,20 @@ def _build_engine(
 
 
 def _add_drones(engine, sim_map, num_drones):
-    for i in range(num_drones):
-        engine.add_drone(
+    drone_count = max(0, int(num_drones))
+    heading_offset = np.random.uniform(0.0, 2.0 * np.pi)
+    heading_spacing = 2.0 * np.pi / max(drone_count, 1)
+    for i in range(drone_count):
+        drone = engine.add_drone(
             drone_id=f"D{i}",
             x=np.random.uniform(*sim_map.xlim),
             y=np.random.uniform(*sim_map.ylim),
             gps_noise=0.03,
             camera_noise=0.03,
+        )
+        heading = heading_offset + i * heading_spacing
+        drone.exploration_direction = np.array(
+            [np.cos(heading), np.sin(heading)], dtype=float
         )
 
 

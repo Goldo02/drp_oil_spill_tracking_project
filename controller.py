@@ -937,7 +937,7 @@ class DroneController(Controller):
         self.resolution = float(resolution)
 
         self.max_speed = 0.12
-        self.exploration_speed = 0.08
+        self.exploration_speed = 0.12
         self.k_n = 0.9
         self.boundary_lock_gain = 0.8
         self.edge_tracking_gain = 0.85
@@ -1160,15 +1160,8 @@ class DroneController(Controller):
             return None
         return self._point_cloud_tracking_action(drone, edge_points)
 
-    def _has_local_edge_points(self, drone):
-        edge_points = getattr(drone, "last_mapped_boundary_points", None)
-        if edge_points is not None:
-            edge_points = np.asarray(edge_points, dtype=float)
-            if edge_points.size > 0:
-                edge_points = edge_points.reshape(-1, 2)
-                if np.any(np.all(np.isfinite(edge_points), axis=1)):
-                    return True
-
+    def _has_local_sensor_edge_points(self, drone):
+        """Return whether this drone's latest camera measurement saw an edge."""
         edge_points = getattr(drone, "last_edge_points", None)
         if edge_points is None:
             return False
@@ -1260,10 +1253,12 @@ class DroneController(Controller):
     ):
         target = self._grid_target(drone)
         if target is not None:
-            if self._has_local_edge_points(drone):
+            if self._has_local_sensor_edge_points(drone):
                 drone.last_control_mode = "boundary_tracking"
                 action = self._boundary_tracking_action(drone, world_field, x_coords, y_coords)
             else:
+                # The target may come from a neighbor's map after consensus.
+                # Seek it directly until this drone's own camera sees the edge.
                 action = None
 
             if action is None:
